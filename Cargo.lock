@@ -3010,13 +3010,21 @@ dependencies = [
 name = "wonton-sync"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "base64",
+ "ed25519-dalek",
  "reqwest",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror",
  "tokio",
+ "uuid",
+ "wonton-crypto",
  "wonton-objects",
+ "wonton-server",
  "wonton-shared",
+ "wonton-vcs",
 ]
 
 [[package]]
