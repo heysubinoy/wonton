@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local editor/OS cruft
+.DS_Store
+.idea/
+.vscode/
+
+# Never accidentally commit materialized secrets (wonton export output, local .env testing)
+.env
+.env.*
+!.env.example
