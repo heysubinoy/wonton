@@ -14,5 +14,15 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+hex.workspace = true
+# Access-control / transport plumbing only — NOT value cryptography (PLAN.md §12.7):
+getrandom = "0.2"          # CSPRNG bytes for session / machine bearer tokens
+blake2 = "0.10"            # hash bearer tokens before storing (like a password hash)
+ed25519-dalek = "2"        # verify a login challenge signature against a stored PUBLIC key
+base64 = "0.22"            # base64 transport encoding of opaque binary DTO fields
+uuid = { version = "1", features = ["v4"] }  # primary keys for sessions/challenges/machines
 wonton-objects = { version = "0.1.0", path = "../objects" }
 wonton-shared = { version = "0.1.0", path = "../shared" }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }  # ServiceExt::oneshot for route-level tests
