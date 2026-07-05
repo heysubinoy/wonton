@@ -1,0 +1,13 @@
+[package]
+name = "wonton-vcs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+wonton-crypto = { version = "0.1.0", path = "../crypto" }
+wonton-objects = { version = "0.1.0", path = "../objects" }
+wonton-shared = { version = "0.1.0", path = "../shared" }

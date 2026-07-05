@@ -1,0 +1,15 @@
+[package]
+name = "wonton-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+wonton-objects = { version = "0.1.0", path = "../objects" }
+wonton-shared = { version = "0.1.0", path = "../shared" }

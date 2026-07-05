@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cli",
+    "crates/crypto",
+    "crates/objects",
+    "crates/vcs",
+    "crates/sync",
+    "crates/server",
+    "crates/shared",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/wonton"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+subtle = "2"
+hex = "0.4"
+rand_core = { version = "0.6", features = ["std"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

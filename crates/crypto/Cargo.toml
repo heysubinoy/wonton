@@ -1,0 +1,29 @@
+[package]
+name = "wonton-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+argon2 = "0.5.3"
+blake2 = "0.10.6"
+chacha20poly1305 = "0.11.0"
+# `seal` enables the libsodium `crypto_box_seal` anonymous-sender sealed-box construction
+# used to wrap DEKs for a recipient's X25519 public key (PLAN.md §4.1/§4.4). It is NOT a
+# default feature of crypto_box, so it must be enabled explicitly. This adds a feature, not a
+# new crate or a version change.
+crypto_box = { version = "0.9.1", features = ["seal"] }
+ed25519-dalek = "2.2.0"
+hex.workspace = true
+# `getrandom` is what exposes `rand_core::OsRng`; requested explicitly here rather than
+# relying on Cargo feature unification from crypto_box so the CSPRNG is guaranteed present.
+rand_core = { workspace = true, features = ["getrandom"] }
+# serde is used only to derive (De)Serialize on the *public/ciphertext* wire structs
+# (`Argon2Params`, `WrappedPrivateKey`, `PublicIdentity`, `EncryptedValue`, `SealedDek`) so
+# `wonton-shared`/`wonton-vcs` can persist and transmit them. Secret-holding types
+# (`Dek`, `UnlockKey`, `UnlockedIdentity`) deliberately do NOT derive serde.
+serde = { workspace = true }
+subtle.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
