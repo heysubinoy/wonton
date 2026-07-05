@@ -8,6 +8,11 @@ repository.workspace = true
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+# `uuid` is required (not optional gold-plating): `wonton_objects::CommitFields.author_id`
+# is a `uuid::Uuid`, and Phase 2 derives a deterministic placeholder id from the identity's
+# public key via `Uuid::new_v5` (see `author_id_from_identity`). `v4` is used only by tests
+# for unique temp-dir names. Matches the `uuid` version already used by `wonton-objects`.
+uuid = { version = "1.23.4", features = ["v4", "v5"] }
 wonton-crypto = { version = "0.1.0", path = "../crypto" }
 wonton-objects = { version = "0.1.0", path = "../objects" }
 wonton-shared = { version = "0.1.0", path = "../shared" }
