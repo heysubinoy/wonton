@@ -75,6 +75,27 @@ pub struct LoginCompleteResponse {
     pub expires_at: i64,
 }
 
+/// `POST /auth/register` request. No authentication required — this *is* the auth bootstrap
+/// (like any signup endpoint). The caller must have already run `wonton_crypto::generate_identity`
+/// locally; this route just persists the public identity + opaque wrapped private key blob.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterRequest {
+    pub username: String,
+    /// base64 of the 32-byte Ed25519 public key.
+    pub ed25519_pubkey: String,
+    /// base64 of the 32-byte X25519 public key.
+    pub x25519_pubkey: String,
+    /// base64 of the `WrappedPrivateKey` ciphertext blob (opaque to the server).
+    pub wrapped_privkey: String,
+    pub argon2_params: Argon2ParamsDto,
+}
+
+/// `POST /auth/register` response: the server-assigned user id (UUID).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterResponse {
+    pub user_id: String,
+}
+
 /// `POST /auth/machine/token` request (CI/server identities, §10).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineTokenRequest {
@@ -102,6 +123,33 @@ pub struct MachineTokenResponse {
 pub struct EnvSummary {
     pub name: String,
     pub role: Role,
+}
+
+/// `POST /stores` request: create a new store. Requires any valid token (there is no
+/// store-level ownership in this schema — only per-environment `env_members`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateStoreRequest {
+    pub name: String,
+}
+
+/// `POST /stores` response: the server-assigned store id (UUID).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateStoreResponse {
+    pub store_id: String,
+}
+
+/// `POST /stores/:store/envs` request: create a new environment inside a store. The creating
+/// actor is made an `admin` member of the new environment in the same transaction (the
+/// access-control bootstrap).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateEnvRequest {
+    pub name: String,
+}
+
+/// `POST /stores/:store/envs` response: the server-assigned environment id (UUID).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateEnvResponse {
+    pub env_id: String,
 }
 
 // ---------------------------------------------------------------------------------------

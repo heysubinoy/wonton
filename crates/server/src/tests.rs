@@ -171,6 +171,182 @@ fn object_upload_body(kind: &str, content: &[u8]) -> Value {
     })
 }
 
+// ---- Provisioning: register / create store / create env ----------------------------------
+
+fn register_body(username: &str) -> Value {
+    json!({
+        "username": username,
+        "ed25519_pubkey": STANDARD.encode([1u8; 32]),
+        "x25519_pubkey": STANDARD.encode([2u8; 32]),
+        "wrapped_privkey": STANDARD.encode(b"opaque-wrapped-privkey"),
+        "argon2_params": {
+            "salt": STANDARD.encode([3u8; 16]),
+            "m_cost_kib": 19456,
+            "t_cost": 2,
+            "p_cost": 1,
+        },
+    })
+}
+
+#[tokio::test]
+async fn register_creates_user_and_rejects_duplicate_username() {
+    let pool = test_pool().await;
+    let router = build_router(pool);
+
+    let (status, body) = send_json(&router, "POST", "/auth/register", None, Some(register_body("alice"))).await;
+    assert_eq!(status, StatusCode::OK);
+    let user_id = body["user_id"].as_str().unwrap().to_string();
+    assert!(!user_id.is_empty());
+
+    // A different username is fine.
+    let (status, _) = send_json(&router, "POST", "/auth/register", None, Some(register_body("bob"))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Re-registering the same username is a 409.
+    let (status, _) = send_json(&router, "POST", "/auth/register", None, Some(register_body("alice"))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // The registered user is real enough to log in against (start returns the stored blob).
+    let (status, start) = send_json(
+        &router,
+        "POST",
+        "/auth/login/start",
+        None,
+        Some(json!({ "username": "alice" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(start["wrapped_privkey"], json!(STANDARD.encode(b"opaque-wrapped-privkey")));
+}
+
+#[tokio::test]
+async fn create_store_succeeds_and_rejects_duplicate_name() {
+    let pool = test_pool().await;
+    let user_id = seed_user(&pool, "alice", &[1u8; 32], &[2u8; 32]).await;
+    let token = seed_session(&pool, &user_id, now_unix() + 3600).await;
+    let router = build_router(pool);
+
+    let (status, body) = send_json(
+        &router,
+        "POST",
+        "/stores",
+        Some(&token),
+        Some(json!({ "name": "acme/backend" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body["store_id"].as_str().unwrap().is_empty());
+
+    // Duplicate name -> 409.
+    let (status, _) = send_json(
+        &router,
+        "POST",
+        "/stores",
+        Some(&token),
+        Some(json!({ "name": "acme/backend" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Unauthenticated -> 401.
+    let (status, _) = send_json(
+        &router,
+        "POST",
+        "/stores",
+        None,
+        Some(json!({ "name": "other" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn create_env_bootstraps_creator_as_admin_and_rejects_duplicate_and_unknown_store() {
+    let pool = test_pool().await;
+    let user_id = seed_user(&pool, "alice", &[1u8; 32], &[2u8; 32]).await;
+    let token = seed_session(&pool, &user_id, now_unix() + 3600).await;
+    let router = build_router(pool);
+
+    // Create the store first.
+    let (status, _) = send_json(
+        &router,
+        "POST",
+        "/stores",
+        Some(&token),
+        Some(json!({ "name": "acme" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 404 when the store doesn't exist.
+    let (status, _) = send_json(
+        &router,
+        "POST",
+        "/stores/ghost/envs",
+        Some(&token),
+        Some(json!({ "name": "dev" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Create the environment.
+    let (status, body) = send_json(
+        &router,
+        "POST",
+        "/stores/acme/envs",
+        Some(&token),
+        Some(json!({ "name": "dev" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body["env_id"].as_str().unwrap().is_empty());
+
+    // Duplicate env name in the same store -> 409.
+    let (status, _) = send_json(
+        &router,
+        "POST",
+        "/stores/acme/envs",
+        Some(&token),
+        Some(json!({ "name": "dev" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // The creator is now an admin member: the env shows up for them via GET with role "admin",
+    // which it could not if `create_env` had failed to insert the bootstrap membership row.
+    let (status, envs) = send_json(&router, "GET", "/stores/acme/envs", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(envs[0]["name"], json!("dev"));
+    assert_eq!(envs[0]["role"], json!("admin"));
+}
+
+#[tokio::test]
+async fn create_env_creator_can_grant_a_key_proving_admin_membership() {
+    // A tighter proof than the membership listing: the creator can immediately call the
+    // existing writer+-gated grant-key route on the env they just created, which requires a
+    // real membership row (403 otherwise). This is the exact bootstrap PLAN.md §8.2 depends on.
+    let pool = test_pool().await;
+    let user_id = seed_user(&pool, "alice", &[1u8; 32], &[2u8; 32]).await;
+    let token = seed_session(&pool, &user_id, now_unix() + 3600).await;
+    let router = build_router(pool);
+
+    let (status, _) = send_json(&router, "POST", "/stores", Some(&token), Some(json!({ "name": "acme" }))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send_json(&router, "POST", "/stores/acme/envs", Some(&token), Some(json!({ "name": "prod" }))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Grant the creator (a real user row) their own wrapped DEK on the new env.
+    let (status, _) = send_json(
+        &router,
+        "POST",
+        "/envs/acme/prod/keys",
+        Some(&token),
+        Some(json!({ "user_id": user_id, "dek_version": 1, "sealed_box": STANDARD.encode(b"sealed") })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
 // ---- Objects ----------------------------------------------------------------------------
 
 #[tokio::test]

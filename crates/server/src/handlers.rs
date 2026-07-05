@@ -28,7 +28,11 @@ use wonton_shared::{
 
 use crate::auth::{hash_token, mint_nonce, mint_token};
 use crate::error::ApiError;
-use crate::{authorize_env, now_unix, parse_role, role_str, Actor, AppState};
+use crate::{authorize_env, now_unix, parse_role, role_str, Actor, ActorKind, AppState};
+use wonton_shared::{
+    CreateEnvRequest, CreateEnvResponse, CreateStoreRequest, CreateStoreResponse, RegisterRequest,
+    RegisterResponse,
+};
 
 /// Login challenges expire quickly — they only need to survive one client sign-and-return.
 const CHALLENGE_TTL_SECS: i64 = 120;
@@ -191,6 +195,60 @@ pub async fn machine_token(
     }))
 }
 
+/// `POST /auth/register` — no auth. This *is* the auth bootstrap (like any signup endpoint):
+/// it persists a new user's public identity + opaque wrapped private key. The client must have
+/// already run `wonton_crypto::generate_identity` locally; the server only stores the results.
+pub async fn register(
+    State(st): State<AppState>,
+    Json(req): Json<RegisterRequest>,
+) -> Result<Json<RegisterResponse>, ApiError> {
+    let ed = STANDARD
+        .decode(&req.ed25519_pubkey)
+        .map_err(|_| ApiError::BadRequest("ed25519_pubkey not base64".into()))?;
+    let x = STANDARD
+        .decode(&req.x25519_pubkey)
+        .map_err(|_| ApiError::BadRequest("x25519_pubkey not base64".into()))?;
+    let wrapped = STANDARD
+        .decode(&req.wrapped_privkey)
+        .map_err(|_| ApiError::BadRequest("wrapped_privkey not base64".into()))?;
+    let salt = STANDARD
+        .decode(&req.argon2_params.salt)
+        .map_err(|_| ApiError::BadRequest("argon2 salt not base64".into()))?;
+
+    // Explicit pre-check so a taken username is a clean 409 rather than a raw UNIQUE-violation
+    // 500. (A race between check and insert would surface as the insert's own error; acceptable
+    // for this phase — usernames are provisioned rarely.)
+    let existing = sqlx::query("SELECT 1 AS one FROM users WHERE username = ?")
+        .bind(&req.username)
+        .fetch_optional(&st.pool)
+        .await?;
+    if existing.is_some() {
+        return Err(ApiError::Conflict("username"));
+    }
+
+    let user_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO users \
+         (id, username, ed25519_pubkey, x25519_pubkey, wrapped_privkey, argon2_salt, \
+          argon2_m_cost_kib, argon2_t_cost, argon2_p_cost, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&user_id)
+    .bind(&req.username)
+    .bind(ed)
+    .bind(x)
+    .bind(wrapped)
+    .bind(salt)
+    .bind(req.argon2_params.m_cost_kib as i64)
+    .bind(req.argon2_params.t_cost as i64)
+    .bind(req.argon2_params.p_cost as i64)
+    .bind(now_unix())
+    .execute(&st.pool)
+    .await?;
+
+    Ok(Json(RegisterResponse { user_id }))
+}
+
 /// Verify an Ed25519 signature over `msg` against a 32-byte public key. Any malformed input or
 /// verification failure collapses to 401 — the server never reveals *why* auth failed.
 fn verify_ed25519(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> Result<(), ApiError> {
@@ -231,6 +289,93 @@ pub async fn list_envs(
         })
         .collect();
     Ok(Json(out))
+}
+
+/// `POST /stores` — create a store. Any authenticated actor may create one; there is no
+/// store-level ownership in this schema (access control is per-environment via `env_members`).
+/// 409 if the name is already taken.
+pub async fn create_store(
+    State(st): State<AppState>,
+    _actor: Actor,
+    Json(req): Json<CreateStoreRequest>,
+) -> Result<Json<CreateStoreResponse>, ApiError> {
+    let existing = sqlx::query("SELECT 1 AS one FROM stores WHERE name = ?")
+        .bind(&req.name)
+        .fetch_optional(&st.pool)
+        .await?;
+    if existing.is_some() {
+        return Err(ApiError::Conflict("store"));
+    }
+
+    let store_id = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO stores (id, name, created_at) VALUES (?, ?, ?)")
+        .bind(&store_id)
+        .bind(&req.name)
+        .bind(now_unix())
+        .execute(&st.pool)
+        .await?;
+    Ok(Json(CreateStoreResponse { store_id }))
+}
+
+/// `POST /stores/:store/envs` — create an environment inside a store, and make the creating
+/// actor its first `admin` member in the *same transaction* (all-or-nothing). This is the
+/// access-control bootstrap: whoever creates an environment becomes its first admin, so they
+/// can then grant themselves the DEK they generate client-side and invite others. 404 if the
+/// store doesn't exist; 409 if an env with that name already exists in the store.
+///
+/// Only human users can hold `env_members` rows (`env_members.user_id` references `users`), so
+/// a machine identity creating an environment is rejected with 400 — see PROGRESS.md open items
+/// (machine identities creating environments isn't supported yet).
+pub async fn create_env(
+    State(st): State<AppState>,
+    actor: Actor,
+    Path(store): Path<String>,
+    Json(req): Json<CreateEnvRequest>,
+) -> Result<Json<CreateEnvResponse>, ApiError> {
+    if actor.kind == ActorKind::Machine {
+        return Err(ApiError::BadRequest(
+            "machine identities cannot create environments (no env_members row can reference a \
+             machine identity)"
+                .into(),
+        ));
+    }
+
+    let store_row = sqlx::query("SELECT id FROM stores WHERE name = ?")
+        .bind(&store)
+        .fetch_optional(&st.pool)
+        .await?
+        .ok_or(ApiError::NotFound("store"))?;
+    let store_id: String = store_row.get("id");
+
+    let mut tx = st.pool.begin().await?;
+    let duplicate = sqlx::query("SELECT 1 AS one FROM environments WHERE store_id = ? AND name = ?")
+        .bind(&store_id)
+        .bind(&req.name)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if duplicate.is_some() {
+        return Err(ApiError::Conflict("environment"));
+    }
+
+    let env_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO environments (id, store_id, name, active_dek_version, created_at) \
+         VALUES (?, ?, ?, 1, ?)",
+    )
+    .bind(&env_id)
+    .bind(&store_id)
+    .bind(&req.name)
+    .bind(now_unix())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("INSERT INTO env_members (env_id, user_id, role) VALUES (?, ?, 'admin')")
+        .bind(&env_id)
+        .bind(&actor.id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    Ok(Json(CreateEnvResponse { env_id }))
 }
 
 // ---- Objects --------------------------------------------------------------------------

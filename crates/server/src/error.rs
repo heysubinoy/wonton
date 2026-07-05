@@ -4,7 +4,8 @@
 //! Status-code discipline (per this phase's spec): a caller must be able to tell apart
 //! - 401 Unauthorized — "you don't exist to me" (no/invalid/expired token),
 //! - 403 Forbidden — "you exist but your role can't do this",
-//! - 404 Not Found — "the thing (env/object/ref) doesn't exist".
+//! - 404 Not Found — "the thing (env/object/ref/store) doesn't exist",
+//! - 409 Conflict — "the name (username/store/env) is already taken".
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -17,6 +18,8 @@ pub enum ApiError {
     NotFound(&'static str),
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("{0} already exists")]
+    Conflict(&'static str),
     #[error("unauthorized")]
     Unauthorized,
     #[error("forbidden")]
@@ -30,6 +33,7 @@ impl ApiError {
         match self {
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::Forbidden => StatusCode::FORBIDDEN,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,

@@ -83,14 +83,21 @@ pub async fn connect(url: &str) -> Result<SqlitePool, ServerError> {
 pub fn build_router(pool: SqlitePool) -> Router {
     let state = AppState { pool };
     Router::new()
-        // Auth (the only routes that do NOT require a bearer token). Machine-token issuance is
+        // Auth (the routes that do NOT require a bearer token: register + the two login steps +
+        // machine-token issuance). Machine-token issuance is
         // intentionally unauthenticated for this phase — see PROGRESS.md open items (a Phase 6
         // hardening gap: real deployments would gate it behind an authenticated admin).
+        .route("/auth/register", post(handlers::register))
         .route("/auth/login/start", post(handlers::login_start))
         .route("/auth/login/complete", post(handlers::login_complete))
         .route("/auth/machine/token", post(handlers::machine_token))
-        // Stores / environments
-        .route("/stores/{store}/envs", get(handlers::list_envs))
+        // Stores / environments. `POST /stores` and `POST /stores/{store}/envs` require any
+        // valid token; the env-creator is bootstrapped as that env's first admin member.
+        .route("/stores", post(handlers::create_store))
+        .route(
+            "/stores/{store}/envs",
+            get(handlers::list_envs).post(handlers::create_env),
+        )
         // Objects (content-addressed; any valid token — see PROGRESS.md re: no per-object env
         // scoping in this phase)
         .route("/objects/{hash}", get(handlers::get_object))
