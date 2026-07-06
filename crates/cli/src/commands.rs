@@ -13,20 +13,26 @@
 //! framing internally, so the CLI never re-derives it in two places — register builds the blob,
 //! login forwards whatever the server hands back unchanged.
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use anyhow::{bail, Context as _};
+use anyhow::{anyhow, bail, Context as _};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use wonton_crypto::generate_identity;
+use uuid::Uuid;
+use wonton_crypto::{generate_identity, EncryptedValue};
+use wonton_objects::{Blob, Commit, Hash, LocalObjectStore, Tree};
 use wonton_shared::{
     Argon2ParamsDto, LoginCompleteRequest, LoginStartRequest, RegisterRequest,
 };
-use wonton_sync::{SyncClient, SyncError};
+use wonton_sync::{PullOutcome, SyncClient, SyncError};
+use wonton_vcs::{DiffEntry, ValueDecryptor, ValueEncryptor, WorkingSet};
 
+use crate::agent::cipher::AgentCipher;
 use crate::agent::client as agent;
 use crate::agent::protocol::Argon2ParamsWire;
 use crate::config::{self, Config, Context, Identity};
+use crate::state::{object_store_dir_for, open_object_store, LocalState, StagedEntry};
 
 /// `wonton login <username>`. Registers on first use of a username, unlocks the agent, completes
 /// a challenge-response login, and caches the session token + wrapped-key material in the config.
@@ -342,4 +348,626 @@ pub fn link(config_path: &Path, cwd: &Path, name: &str) -> anyhow::Result<()> {
         .with_context(|| format!("writing {}", marker.display()))?;
     println!("Linked this directory to context '{name}' (wrote .wonton).");
     Ok(())
+}
+
+// =====================================================================================
+// Phase 4c: the VCS porcelain (switch/status/set/unset/commit/log/diff/pull/push/run/export)
+//
+// Every command below operates on a caller-resolved *current context* (`main.rs` resolves the
+// name via `config::resolve_context_name` and passes it as `ctx_name`; there is no `--context`
+// flag in v1). None of them ever holds a raw `Dek` or `UnlockedIdentity`: all encrypt/decrypt/
+// sign goes through the agent socket via [`AgentCipher`]. `state.toml` holds only key names and
+// content hashes — never plaintext or ciphertext bytes.
+// =====================================================================================
+
+/// The output format for `wonton export`. Only dotenv is supported in v1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Dotenv,
+}
+
+impl ExportFormat {
+    /// Parse the `--format` flag. Errors clearly on an unsupported value.
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "dotenv" | "env" => Ok(ExportFormat::Dotenv),
+            other => bail!("unsupported export format '{other}'; only 'dotenv' is supported"),
+        }
+    }
+}
+
+/// Resolve a context + its identity from config, requiring the agent to be unlocked for that
+/// identity and holding a cached DEK for the context. Mirrors `use_context`'s guard style so the
+/// failure message always points the user at `wonton use`.
+async fn ready_context(
+    config: &Config,
+    socket_path: &Path,
+    ctx_name: &str,
+) -> anyhow::Result<(Context, Identity)> {
+    let ctx = config
+        .find_context(ctx_name)
+        .cloned()
+        .ok_or_else(|| anyhow!("no context named '{ctx_name}'; add one with `wonton context add`"))?;
+    let identity = config
+        .find_identity(&ctx.identity)
+        .cloned()
+        .ok_or_else(|| anyhow!("context '{ctx_name}' references unknown identity '{}'", ctx.identity))?;
+
+    let status = agent::status(socket_path)
+        .await
+        .map_err(|_| anyhow!("agent is not running; run `wonton use {ctx_name}` first"))?;
+    if !status.unlocked || !status.cached_contexts.contains(&ctx.name) {
+        bail!("no DEK cached for context '{ctx_name}'; run `wonton use {ctx_name}` first");
+    }
+    Ok((ctx, identity))
+}
+
+/// `wonton switch <branch>` — purely local: set the current context's branch. No DEK unwrap, no
+/// network. This is the Phase-4 exit criterion "switching branch needs no unwrap".
+pub fn switch(state_path: &Path, ctx_name: &str, branch: &str) -> anyhow::Result<()> {
+    let mut state = LocalState::load_from(state_path)?;
+    state.context_mut(ctx_name).branch = branch.to_string();
+    state.save_to(state_path)?;
+    println!("Switched context '{ctx_name}' to branch '{branch}'.");
+    Ok(())
+}
+
+/// `wonton status` — print context, branch, DEK-cached status, and the staged working-tree diff.
+pub async fn status(
+    config_path: &Path,
+    state_path: &Path,
+    socket_path: &Path,
+    ctx_name: &str,
+) -> anyhow::Result<()> {
+    let config = Config::load_from(config_path)?;
+    let ctx = config
+        .find_context(ctx_name)
+        .ok_or_else(|| anyhow!("no context named '{ctx_name}'"))?;
+    let state = LocalState::load_from(state_path)?;
+    let cs = state.context(ctx_name).cloned().unwrap_or_default();
+    let branch = cs.branch.clone();
+
+    // Best-effort DEK-cached check (report "no" if the agent isn't running).
+    let cached = match agent::status(socket_path).await {
+        Ok(s) => s.cached_contexts.contains(&ctx.name),
+        Err(_) => false,
+    };
+
+    println!("Context: {ctx_name}");
+    println!("  store:       {}", ctx.store);
+    println!("  environment: {}", ctx.environment);
+    println!("  branch:      {branch}");
+    println!("  DEK cached:  {}", if cached { "yes" } else { "no" });
+
+    // Staged diff markers, computed WITHOUT decrypting (just key-name presence in the tip tree).
+    let store = open_object_store(&object_store_dir_for(state_path))?;
+    let tip = cs.tips.get(&branch).copied();
+    let tip_tree = tip.map(|h| tree_of_commit(&store, h)).transpose().unwrap_or(None).unwrap_or_default();
+    if cs.staged.is_empty() {
+        println!("  staged:      (nothing staged)");
+    } else {
+        println!("  staged:");
+        for (key, entry) in &cs.staged {
+            let marker = match entry {
+                StagedEntry::Set(_) if tip_tree.entries.contains_key(key) => '~',
+                StagedEntry::Set(_) => '+',
+                StagedEntry::Unset => '-',
+            };
+            println!("    {marker}{key}");
+        }
+    }
+    Ok(())
+}
+
+/// `wonton set KEY=VALUE ...` — agent-encrypt each value, store the blob locally, stage it.
+pub async fn set(
+    config_path: &Path,
+    state_path: &Path,
+    socket_path: &Path,
+    ctx_name: &str,
+    pairs: Vec<(String, String)>,
+) -> anyhow::Result<()> {
+    let config = Config::load_from(config_path)?;
+    let (ctx, _identity) = ready_context(&config, socket_path, ctx_name).await?;
+    let store = open_object_store(&object_store_dir_for(state_path))?;
+    let cipher = AgentCipher::new(socket_path, ctx.name.clone());
+
+    let mut state = LocalState::load_from(state_path)?;
+    let cs = state.context_mut(&ctx.name);
+    let count = pairs.len();
+    for (key, value) in pairs {
+        let encrypted = cipher.encrypt(value.as_bytes())?;
+        let blob = Blob::new(encrypted.nonce, encrypted.ciphertext);
+        let blob_bytes = blob.to_bytes()?;
+        let blob_hash = Hash::of(&blob_bytes);
+        store.put(&blob_hash, &blob_bytes)?;
+        cs.staged.insert(key, StagedEntry::Set(blob_hash));
+    }
+    state.save_to(state_path)?;
+    println!("Staged {count} value(s) in context '{ctx_name}'.");
+    Ok(())
+}
+
+/// `wonton unset KEY ...` — stage a tombstone for each key. Purely local (no agent/crypto).
+pub fn unset(
+    config_path: &Path,
+    state_path: &Path,
+    ctx_name: &str,
+    keys: Vec<String>,
+) -> anyhow::Result<()> {
+    // Validate the context exists for a friendly error; no crypto/network needed.
+    let config = Config::load_from(config_path)?;
+    if config.find_context(ctx_name).is_none() {
+        bail!("no context named '{ctx_name}'; add one with `wonton context add`");
+    }
+    let mut state = LocalState::load_from(state_path)?;
+    let cs = state.context_mut(ctx_name);
+    let count = keys.len();
+    for key in keys {
+        cs.staged.insert(key, StagedEntry::Unset);
+    }
+    state.save_to(state_path)?;
+    println!("Staged deletion of {count} key(s) in context '{ctx_name}'.");
+    Ok(())
+}
+
+/// `wonton commit -m <message>` — build the effective working set from the current tip plus the
+/// staged overlay, sign a new commit via the agent, advance the tip, and clear staging.
+pub async fn commit(
+    config_path: &Path,
+    state_path: &Path,
+    socket_path: &Path,
+    ctx_name: &str,
+    message: String,
+) -> anyhow::Result<()> {
+    let config = Config::load_from(config_path)?;
+    let (ctx, identity) = ready_context(&config, socket_path, ctx_name).await?;
+    let store = open_object_store(&object_store_dir_for(state_path))?;
+    let cipher = AgentCipher::new(socket_path, ctx.name.clone());
+
+    let mut state = LocalState::load_from(state_path)?;
+    let cs = state.context_mut(&ctx.name);
+    let branch = cs.branch.clone();
+    let parent = cs.tips.get(&branch).copied();
+    let staged = cs.staged.clone();
+    if staged.is_empty() {
+        bail!("nothing staged; use `wonton set KEY=value` (or `wonton unset KEY`) first");
+    }
+
+    let working_set = effective_working_set(&store, &cipher, parent, &staged)?;
+    let author_id = Uuid::parse_str(&identity.user_id)
+        .with_context(|| format!("identity user_id '{}' is not a valid UUID", identity.user_id))?;
+
+    let new_hash = wonton_vcs::commit(&store, &cipher, &cipher, author_id, parent, &working_set, message)?;
+
+    let cs = state.context_mut(&ctx.name);
+    cs.staged.clear();
+    cs.tips.insert(branch.clone(), new_hash);
+    state.save_to(state_path)?;
+    println!(
+        "Committed {} to branch '{branch}' ({}@{}).",
+        new_hash.to_hex(),
+        ctx.store,
+        ctx.environment
+    );
+    Ok(())
+}
+
+/// `wonton log` — verified first-parent history from the current tip. No cipher needed
+/// (signature-only verification against this identity's own pubkey).
+pub fn log(config_path: &Path, state_path: &Path, ctx_name: &str) -> anyhow::Result<()> {
+    let config = Config::load_from(config_path)?;
+    let ctx = config
+        .find_context(ctx_name)
+        .ok_or_else(|| anyhow!("no context named '{ctx_name}'"))?;
+    let identity = config
+        .find_identity(&ctx.identity)
+        .ok_or_else(|| anyhow!("context '{ctx_name}' references unknown identity '{}'", ctx.identity))?;
+
+    let state = LocalState::load_from(state_path)?;
+    let cs = state.context(ctx_name).cloned().unwrap_or_default();
+    let branch = cs.branch.clone();
+    let tip = match cs.tips.get(&branch).copied() {
+        Some(t) => t,
+        None => {
+            println!("No commits on branch '{branch}' yet.");
+            return Ok(());
+        }
+    };
+
+    let pubkey = decode_ed25519_pubkey(&identity.ed25519_pubkey_b64)?;
+    let store = open_object_store(&object_store_dir_for(state_path))?;
+    let history = wonton_vcs::log(&store, tip, &pubkey)?;
+    for vc in &history {
+        println!("commit {}", vc.hash.to_hex());
+        println!("  author:  {}", vc.commit.fields.author_id);
+        println!("  date:    {}", vc.commit.fields.timestamp);
+        println!("  message: {}", vc.commit.fields.message);
+        println!();
+    }
+    Ok(())
+}
+
+/// `wonton diff [a] [b]` — key-level diff (returns entries for `main.rs` to print).
+///
+/// - both given: diff commit `a` against commit `b`;
+/// - one given: diff the empty tree against that commit;
+/// - none given: diff the current tip's parent against the current tip.
+pub async fn diff(
+    config_path: &Path,
+    state_path: &Path,
+    socket_path: &Path,
+    ctx_name: &str,
+    a: Option<String>,
+    b: Option<String>,
+) -> anyhow::Result<Vec<DiffEntry>> {
+    let config = Config::load_from(config_path)?;
+    let (ctx, _identity) = ready_context(&config, socket_path, ctx_name).await?;
+    let state = LocalState::load_from(state_path)?;
+    let cs = state.context(ctx_name).cloned().unwrap_or_default();
+    let branch = cs.branch.clone();
+    let store = open_object_store(&object_store_dir_for(state_path))?;
+    let cipher = AgentCipher::new(socket_path, ctx.name.clone());
+
+    let (from_hash, to_hash) = match (a, b) {
+        (Some(a), Some(b)) => (Some(parse_commit_hash(&a)?), parse_commit_hash(&b)?),
+        // A single positional argument is the `to` commit; diff it against the empty tree.
+        (Some(a), None) => (None, parse_commit_hash(&a)?),
+        (None, _) => {
+            let tip = cs
+                .tips
+                .get(&branch)
+                .copied()
+                .ok_or_else(|| anyhow!("no commits on branch '{branch}' to diff"))?;
+            (commit_first_parent(&store, tip)?, tip)
+        }
+    };
+
+    Ok(wonton_vcs::diff(&store, &cipher, from_hash, to_hash)?)
+}
+
+/// `wonton pull` — fast-forward the current branch from the server, refreshing the local tip.
+pub async fn pull(config_path: &Path, state_path: &Path, ctx_name: &str) -> anyhow::Result<()> {
+    let config = Config::load_from(config_path)?;
+    let (ctx, identity) = context_and_identity(&config, ctx_name)?;
+    let mut state = LocalState::load_from(state_path)?;
+    let cs = state.context(ctx_name).cloned().unwrap_or_default();
+    let branch = cs.branch.clone();
+    let local_tip = cs.tips.get(&branch).copied();
+
+    let store = open_object_store(&object_store_dir_for(state_path))?;
+    let client = authed_client(&identity);
+
+    let outcome = wonton_sync::pull(&client, &store, &ctx.store, &ctx.environment, &branch, local_tip).await?;
+    match outcome {
+        PullOutcome::UpToDate => println!("Already up to date on branch '{branch}'."),
+        PullOutcome::FastForward { new_tip } => {
+            state.context_mut(ctx_name).tips.insert(branch.clone(), new_tip);
+            state.save_to(state_path)?;
+            println!("Fast-forwarded '{branch}' to {}.", new_tip.to_hex());
+        }
+        PullOutcome::Diverged { local_tip, remote_tip } => {
+            println!(
+                "Diverged: local {} vs remote {}. A merge (Phase 5) is required; local state left unchanged.",
+                local_tip.to_hex(),
+                remote_tip.to_hex()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `wonton push` — upload local objects then CAS-move the branch ref.
+///
+/// **Known v1 limitation** (pragmatic object-set walk): we read the remote's current hash for the
+/// branch as `old_hash`, then walk the local commit chain back from the tip collecting every
+/// commit/tree/blob until we reach `old_hash` (or a root, or an object the local store lacks). We
+/// do not diff against the full remote object set, so on a diverged history this may re-upload
+/// objects the server already has — harmless (uploads are idempotent), but not minimal.
+pub async fn push(config_path: &Path, state_path: &Path, ctx_name: &str) -> anyhow::Result<()> {
+    let config = Config::load_from(config_path)?;
+    let (ctx, identity) = context_and_identity(&config, ctx_name)?;
+    let state = LocalState::load_from(state_path)?;
+    let cs = state.context(ctx_name).cloned().unwrap_or_default();
+    let branch = cs.branch.clone();
+    let local_tip = cs
+        .tips
+        .get(&branch)
+        .copied()
+        .ok_or_else(|| anyhow!("nothing to push; no local commits on branch '{branch}'"))?;
+
+    let store = open_object_store(&object_store_dir_for(state_path))?;
+    let client = authed_client(&identity);
+
+    let refs = client.get_refs(&ctx.store, &ctx.environment).await?;
+    let old_hash = match refs.get(&branch) {
+        Some(hex) => Some(Hash::from_hex(hex)?),
+        None => None,
+    };
+    if old_hash == Some(local_tip) {
+        println!("Already up to date; nothing to push.");
+        return Ok(());
+    }
+
+    let object_hashes = collect_objects_to_push(&store, local_tip, old_hash)?;
+    match wonton_sync::push(
+        &client,
+        &store,
+        &ctx.store,
+        &ctx.environment,
+        &branch,
+        &object_hashes,
+        old_hash,
+        local_tip,
+    )
+    .await
+    {
+        Ok(()) => {
+            println!("Pushed branch '{branch}' -> {}.", local_tip.to_hex());
+            Ok(())
+        }
+        Err(SyncError::Conflict(c)) => bail!(
+            "someone else pushed first (remote '{branch}' is now {}); run `wonton pull` then retry",
+            c.current.as_deref().unwrap_or("<absent>")
+        ),
+        Err(e) => Err(e).context("push failed"),
+    }
+}
+
+/// `wonton run -- <cmd> [args...]` — decrypt the effective working tree into env vars, spawn the
+/// child with them injected (stdio inherited), and return the child's exit code for `main.rs` to
+/// propagate. **Never writes any decrypted value to disk.**
+pub async fn run(
+    config_path: &Path,
+    state_path: &Path,
+    socket_path: &Path,
+    ctx_name: &str,
+    cmd: Vec<String>,
+) -> anyhow::Result<i32> {
+    if cmd.is_empty() {
+        bail!("no command given; usage: `wonton run -- <cmd> [args...]`");
+    }
+    let config = Config::load_from(config_path)?;
+    let (ctx, _identity) = ready_context(&config, socket_path, ctx_name).await?;
+    let store = open_object_store(&object_store_dir_for(state_path))?;
+    let cipher = AgentCipher::new(socket_path, ctx.name.clone());
+
+    let state = LocalState::load_from(state_path)?;
+    let cs = state.context(ctx_name).cloned().unwrap_or_default();
+    let tip = cs.tips.get(&cs.branch).copied();
+    let working_set = effective_working_set(&store, &cipher, tip, &cs.staged)?;
+
+    let mut command = std::process::Command::new(&cmd[0]);
+    command.args(&cmd[1..]);
+    for (key, value) in working_set.iter() {
+        let value = std::str::from_utf8(value).map_err(|_| {
+            anyhow!("value for '{key}' is not valid UTF-8; `wonton run` can only inject UTF-8 env vars")
+        })?;
+        command.env(key, value);
+    }
+    let status = command
+        .status()
+        .with_context(|| format!("failed to spawn '{}'", cmd[0]))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+/// `wonton export --format dotenv <path>` — decrypt the effective working tree and write it to a
+/// file the user names. **Prints an explicit plaintext warning to stderr before writing.** Only
+/// ever runs on direct request, never as a side effect of another command.
+pub async fn export(
+    config_path: &Path,
+    state_path: &Path,
+    socket_path: &Path,
+    ctx_name: &str,
+    format: ExportFormat,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let config = Config::load_from(config_path)?;
+    let (ctx, _identity) = ready_context(&config, socket_path, ctx_name).await?;
+    let store = open_object_store(&object_store_dir_for(state_path))?;
+    let cipher = AgentCipher::new(socket_path, ctx.name.clone());
+
+    let state = LocalState::load_from(state_path)?;
+    let cs = state.context(ctx_name).cloned().unwrap_or_default();
+    let tip = cs.tips.get(&cs.branch).copied();
+    let working_set = effective_working_set(&store, &cipher, tip, &cs.staged)?;
+
+    let contents = match format {
+        ExportFormat::Dotenv => render_dotenv(&working_set)?,
+    };
+
+    eprintln!(
+        "wonton: writing {} decrypted secret(s) to {} in plaintext — handle with care",
+        working_set.len(),
+        path.display()
+    );
+    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+    println!("Exported {} secret(s) to {}.", working_set.len(), path.display());
+    Ok(())
+}
+
+// ---- shared helpers for the VCS porcelain --------------------------------------------------
+
+/// Resolve a context + identity from config without any agent/network check (for pull/push, which
+/// move opaque objects and need no cached DEK).
+fn context_and_identity(config: &Config, ctx_name: &str) -> anyhow::Result<(Context, Identity)> {
+    let ctx = config
+        .find_context(ctx_name)
+        .cloned()
+        .ok_or_else(|| anyhow!("no context named '{ctx_name}'; add one with `wonton context add`"))?;
+    let identity = config
+        .find_identity(&ctx.identity)
+        .cloned()
+        .ok_or_else(|| anyhow!("context '{ctx_name}' references unknown identity '{}'", ctx.identity))?;
+    Ok((ctx, identity))
+}
+
+/// A `SyncClient` for an identity's server, carrying its cached session token.
+fn authed_client(identity: &Identity) -> SyncClient {
+    let mut client = SyncClient::new(&identity.server_url);
+    if let Some(token) = &identity.session_token {
+        client.set_token(token);
+    }
+    client
+}
+
+/// Decode a base64 Ed25519 public key into 32 bytes, failing closed on a bad length.
+fn decode_ed25519_pubkey(b64: &str) -> anyhow::Result<[u8; 32]> {
+    let bytes = STANDARD
+        .decode(b64)
+        .context("stored ed25519 pubkey is not valid base64")?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("stored ed25519 pubkey is not 32 bytes"))
+}
+
+/// Parse a hex commit hash argument.
+fn parse_commit_hash(s: &str) -> anyhow::Result<Hash> {
+    Hash::from_hex(s).map_err(|_| anyhow!("'{s}' is not a valid commit hash"))
+}
+
+/// Load and deserialize the [`Tree`] a commit points at (reading `wonton_objects` directly, since
+/// `wonton-vcs`'s equivalent helper is crate-private).
+fn tree_of_commit(store: &LocalObjectStore, commit_hash: Hash) -> anyhow::Result<Tree> {
+    let bytes = store
+        .get(&commit_hash)?
+        .ok_or_else(|| anyhow!("commit {} is not in the local store; run `wonton pull` first", commit_hash.to_hex()))?;
+    let commit = Commit::from_bytes(&bytes)?;
+    let tree_bytes = store
+        .get(&commit.fields.tree_hash)?
+        .ok_or_else(|| anyhow!("tree {} missing from the local store", commit.fields.tree_hash.to_hex()))?;
+    Ok(Tree::from_bytes(&tree_bytes)?)
+}
+
+/// The (single) first parent of a commit, or `None` for a root commit.
+fn commit_first_parent(store: &LocalObjectStore, commit_hash: Hash) -> anyhow::Result<Option<Hash>> {
+    let bytes = store
+        .get(&commit_hash)?
+        .ok_or_else(|| anyhow!("commit {} is not in the local store", commit_hash.to_hex()))?;
+    let commit = Commit::from_bytes(&bytes)?;
+    match commit.fields.parent_hashes.as_slice() {
+        [] => Ok(None),
+        [p] => Ok(Some(*p)),
+        _ => bail!("commit {} is a merge commit; diffing merges is a Phase 5 concern", commit_hash.to_hex()),
+    }
+}
+
+/// Decrypt one already-stored ciphertext blob via the agent.
+fn decrypt_blob(
+    store: &LocalObjectStore,
+    cipher: &AgentCipher,
+    blob_hash: &Hash,
+) -> anyhow::Result<Vec<u8>> {
+    let bytes = store
+        .get(blob_hash)?
+        .ok_or_else(|| anyhow!("blob {} missing from the local store", blob_hash.to_hex()))?;
+    let blob = Blob::from_bytes(&bytes)?;
+    let value = EncryptedValue {
+        nonce: blob.nonce,
+        ciphertext: blob.ciphertext,
+    };
+    Ok(cipher.decrypt(&value)?)
+}
+
+/// Build the effective decrypted [`WorkingSet`] = the tip tree decrypted, with `staged` overlaid
+/// (`Set` → replace/add the decrypted staged blob, `Unset` → drop the key). Used by `commit`,
+/// `run`, and `export`. Every value is decrypted through the agent; nothing is written to disk.
+fn effective_working_set(
+    store: &LocalObjectStore,
+    cipher: &AgentCipher,
+    tip: Option<Hash>,
+    staged: &BTreeMap<String, StagedEntry>,
+) -> anyhow::Result<WorkingSet> {
+    let mut working_set = WorkingSet::new();
+
+    if let Some(tip) = tip {
+        let tree = tree_of_commit(store, tip)?;
+        for (key, blob_hash) in &tree.entries {
+            let plaintext = decrypt_blob(store, cipher, blob_hash)?;
+            working_set.set(key.clone(), plaintext);
+        }
+    }
+
+    for (key, entry) in staged {
+        match entry {
+            StagedEntry::Set(blob_hash) => {
+                let plaintext = decrypt_blob(store, cipher, blob_hash)?;
+                working_set.set(key.clone(), plaintext);
+            }
+            StagedEntry::Unset => {
+                working_set.unset(key);
+            }
+        }
+    }
+    Ok(working_set)
+}
+
+/// Collect every local commit/tree/blob hash reachable from `tip` by a first-parent walk, stopping
+/// at `stop` (the remote's current tip), a root, or an object the local store lacks. See
+/// [`push`]'s doc comment for the known-limitation caveat.
+fn collect_objects_to_push(
+    store: &LocalObjectStore,
+    tip: Hash,
+    stop: Option<Hash>,
+) -> anyhow::Result<Vec<Hash>> {
+    let mut hashes = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cursor = Some(tip);
+
+    while let Some(current) = cursor {
+        if Some(current) == stop {
+            break;
+        }
+        let bytes = match store.get(&current)? {
+            Some(b) => b,
+            // Not in the local store: it's already on the server (older history) — stop walking.
+            None => break,
+        };
+        if seen.insert(current) {
+            hashes.push(current);
+        }
+        let commit = Commit::from_bytes(&bytes)?;
+
+        // The commit's tree and every blob it references.
+        let tree_hash = commit.fields.tree_hash;
+        if store.contains(&tree_hash) && seen.insert(tree_hash) {
+            hashes.push(tree_hash);
+            if let Some(tree_bytes) = store.get(&tree_hash)? {
+                let tree = Tree::from_bytes(&tree_bytes)?;
+                for blob_hash in tree.entries.values() {
+                    if store.contains(blob_hash) && seen.insert(*blob_hash) {
+                        hashes.push(*blob_hash);
+                    }
+                }
+            }
+        }
+
+        cursor = match commit.fields.parent_hashes.as_slice() {
+            [] => None,
+            [p] => Some(*p),
+            _ => bail!("commit {} is a merge commit; pushing merges is a Phase 5 concern", current.to_hex()),
+        };
+    }
+    Ok(hashes)
+}
+
+/// Render a [`WorkingSet`] as dotenv (`KEY=value` per line). Values containing whitespace / `=` /
+/// quotes / newlines are double-quoted with `\`-escaping. A non-UTF-8 value is a hard error.
+fn render_dotenv(working_set: &WorkingSet) -> anyhow::Result<String> {
+    let mut out = String::new();
+    for (key, value) in working_set.iter() {
+        let value = std::str::from_utf8(value)
+            .map_err(|_| anyhow!("value for '{key}' is not valid UTF-8; cannot export as dotenv"))?;
+        let needs_quotes = value
+            .chars()
+            .any(|c| c.is_whitespace() || c == '=' || c == '"' || c == '\'' || c == '#');
+        if needs_quotes {
+            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+            out.push_str(&format!("{key}=\"{escaped}\"\n"));
+        } else {
+            out.push_str(&format!("{key}={value}\n"));
+        }
+    }
+    Ok(out)
 }

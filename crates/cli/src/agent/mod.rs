@@ -17,6 +17,7 @@
 // each forward-looking wrapper with an attribute.
 #[allow(dead_code)]
 pub mod client;
+pub mod cipher;
 pub mod daemon;
 pub mod protocol;
 

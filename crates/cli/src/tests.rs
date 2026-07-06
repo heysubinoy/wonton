@@ -62,6 +62,409 @@ fn temp_config_path() -> PathBuf {
     unique("cfg").join("config.toml")
 }
 
+fn temp_state_path() -> PathBuf {
+    unique("state").join("state.toml")
+}
+
+/// Grant `user_id` a freshly-generated DEK (version 1) for `store`/`env`, returning nothing —
+/// the DEK stays server-side (sealed) and is unwrapped into the agent by `use`. Mirrors what a
+/// real `wonton share` will do in a later phase.
+async fn grant_dek(base: &str, token: &str, store: &str, env: &str, user_id: &str, x25519_b64: &str) {
+    let mut client = SyncClient::new(base);
+    client.set_token(token);
+    let dek = generate_dek();
+    let x: [u8; 32] = STANDARD.decode(x25519_b64).unwrap().as_slice().try_into().unwrap();
+    let sealed = wrap_dek(&dek, &x);
+    client
+        .grant_key(
+            store,
+            env,
+            &GrantKeyRequest {
+                user_id: user_id.to_string(),
+                dek_version: 1,
+                sealed_box: STANDARD.encode(&sealed.0),
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// Everything a Phase-4c command needs: a real server, an in-process agent with the context's DEK
+/// unwrapped, and temp config/state paths (the object store is co-located with `state_path`).
+struct Fixture {
+    base: String,
+    config_path: PathBuf,
+    state_path: PathBuf,
+    socket: PathBuf,
+    user_id: String,
+}
+
+/// Log `user` in against `base`, provision `acme`/`dev`, grant + `use` the DEK, and return a
+/// ready-to-drive [`Fixture`]. Reuses `base`/`socket` if provided (so two "machines" can share one
+/// server), otherwise starts fresh ones.
+async fn ready_fixture(
+    user: &str,
+    base: Option<String>,
+    provision: bool,
+) -> Fixture {
+    let base = match base {
+        Some(b) => b,
+        None => start_server().await,
+    };
+    let socket = spawn_agent().await;
+    let config_path = temp_config_path();
+    let state_path = temp_state_path();
+
+    commands::login(&config_path, &socket, Some(base.clone()), user, format!("pw-{user}"))
+        .await
+        .unwrap();
+    let id = Config::load_from(&config_path)
+        .unwrap()
+        .find_identity(user)
+        .unwrap()
+        .clone();
+
+    if provision {
+        let mut client = SyncClient::new(&base);
+        client.set_token(id.session_token.clone().unwrap());
+        client
+            .create_store(&CreateStoreRequest { name: "acme".into() })
+            .await
+            .unwrap();
+        client
+            .create_env("acme", &CreateEnvRequest { name: "dev".into() })
+            .await
+            .unwrap();
+        grant_dek(
+            &base,
+            id.session_token.as_ref().unwrap(),
+            "acme",
+            "dev",
+            &id.user_id,
+            &id.x25519_pubkey_b64,
+        )
+        .await;
+    }
+
+    commands::context_add(&config_path, "acme-dev", "acme", "dev", user).unwrap();
+    commands::use_context(&config_path, &socket, "acme-dev")
+        .await
+        .unwrap();
+
+    Fixture {
+        base,
+        config_path,
+        state_path,
+        socket,
+        user_id: id.user_id,
+    }
+}
+
+/// `switch` is purely local: no server, no agent, and it persists the branch.
+#[tokio::test]
+async fn switch_is_local_and_persists() {
+    let state_path = temp_state_path();
+    commands::switch(&state_path, "acme-dev", "feature").unwrap();
+    let state = crate::state::LocalState::load_from(&state_path).unwrap();
+    assert_eq!(state.context("acme-dev").unwrap().branch, "feature");
+}
+
+/// `set` stages an encrypted blob; `status` runs; `unset` overwrites it with a tombstone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_status_and_unset_manage_the_staging_area() {
+    let fx = ready_fixture("erin", None, true).await;
+
+    commands::set(
+        &fx.config_path,
+        &fx.state_path,
+        &fx.socket,
+        "acme-dev",
+        vec![("API_KEY".into(), "sk-live-123".into())],
+    )
+    .await
+    .unwrap();
+
+    let state = crate::state::LocalState::load_from(&fx.state_path).unwrap();
+    let staged = &state.context("acme-dev").unwrap().staged;
+    assert!(matches!(
+        staged.get("API_KEY"),
+        Some(crate::state::StagedEntry::Set(_))
+    ));
+
+    // status must run without error against the staged tree.
+    commands::status(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev")
+        .await
+        .unwrap();
+
+    // `unset` replaces the staged Set with an Unset tombstone.
+    commands::unset(&fx.config_path, &fx.state_path, "acme-dev", vec!["API_KEY".into()]).unwrap();
+    let state = crate::state::LocalState::load_from(&fx.state_path).unwrap();
+    assert_eq!(
+        state.context("acme-dev").unwrap().staged.get("API_KEY"),
+        Some(&crate::state::StagedEntry::Unset)
+    );
+}
+
+/// `commit` clears staging, advances the tip, and `log` shows the commit with the REAL
+/// server-assigned `author_id` (`Uuid::parse_str(user_id)`), not the old placeholder derivation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_advances_tip_and_log_shows_real_author_id() {
+    let fx = ready_fixture("frank", None, true).await;
+
+    commands::set(
+        &fx.config_path,
+        &fx.state_path,
+        &fx.socket,
+        "acme-dev",
+        vec![("DATABASE_URL".into(), "postgres://x".into())],
+    )
+    .await
+    .unwrap();
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", "initial".into())
+        .await
+        .unwrap();
+
+    let state = crate::state::LocalState::load_from(&fx.state_path).unwrap();
+    let cs = state.context("acme-dev").unwrap();
+    assert!(cs.staged.is_empty(), "staging must be cleared after commit");
+    let tip = *cs.tips.get("main").expect("tip advanced");
+
+    // Read the commit back and check its author_id is the parsed real user_id.
+    let store = crate::state::open_object_store(
+        &crate::state::object_store_dir_for(&fx.state_path),
+    )
+    .unwrap();
+    let bytes = store.get(&tip).unwrap().unwrap();
+    let commit = wonton_objects::Commit::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        commit.fields.author_id,
+        uuid::Uuid::parse_str(&fx.user_id).unwrap()
+    );
+    assert_eq!(commit.fields.message, "initial");
+
+    // `log` runs and verifies the signature against the identity's own pubkey.
+    commands::log(&fx.config_path, &fx.state_path, "acme-dev").unwrap();
+}
+
+/// `diff` between two real commits reports the right Added/Changed keys, and re-committing an
+/// identical value must NOT report `Changed` (mirrors `wonton-vcs`'s critical test).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_reports_added_and_changed_but_not_unchanged() {
+    let fx = ready_fixture("grace", None, true).await;
+
+    // c1: A=apple, B=banana
+    commands::set(
+        &fx.config_path,
+        &fx.state_path,
+        &fx.socket,
+        "acme-dev",
+        vec![("A".into(), "apple".into()), ("B".into(), "banana".into())],
+    )
+    .await
+    .unwrap();
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", "c1".into())
+        .await
+        .unwrap();
+    let c1 = *crate::state::LocalState::load_from(&fx.state_path)
+        .unwrap()
+        .context("acme-dev")
+        .unwrap()
+        .tips
+        .get("main")
+        .unwrap();
+
+    // c2: A=apple (same value, re-encrypted), B=blueberry (changed), C=cherry (added)
+    commands::set(
+        &fx.config_path,
+        &fx.state_path,
+        &fx.socket,
+        "acme-dev",
+        vec![
+            ("A".into(), "apple".into()),
+            ("B".into(), "blueberry".into()),
+            ("C".into(), "cherry".into()),
+        ],
+    )
+    .await
+    .unwrap();
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", "c2".into())
+        .await
+        .unwrap();
+    let c2 = *crate::state::LocalState::load_from(&fx.state_path)
+        .unwrap()
+        .context("acme-dev")
+        .unwrap()
+        .tips
+        .get("main")
+        .unwrap();
+
+    let entries = commands::diff(
+        &fx.config_path,
+        &fx.state_path,
+        &fx.socket,
+        "acme-dev",
+        Some(c1.to_hex()),
+        Some(c2.to_hex()),
+    )
+    .await
+    .unwrap();
+
+    use wonton_vcs::DiffEntry;
+    assert_eq!(
+        entries,
+        vec![DiffEntry::Changed("B".into()), DiffEntry::Added("C".into())]
+    );
+    assert!(
+        !entries.iter().any(|e| matches!(e, DiffEntry::Changed(k) if k == "A")),
+        "re-committing the same value must not show Changed"
+    );
+}
+
+/// `run` injects the effective secrets as env vars into a child process (never touching disk) and
+/// propagates its exit code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_injects_secrets_as_env_vars() {
+    let fx = ready_fixture("heidi", None, true).await;
+
+    commands::set(
+        &fx.config_path,
+        &fx.state_path,
+        &fx.socket,
+        "acme-dev",
+        vec![("MY_SECRET".into(), "hunter2".into())],
+    )
+    .await
+    .unwrap();
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", "c1".into())
+        .await
+        .unwrap();
+
+    let out = unique("runout");
+    let out_str = out.to_string_lossy().to_string();
+    let code = commands::run(
+        &fx.config_path,
+        &fx.state_path,
+        &fx.socket,
+        "acme-dev",
+        vec![
+            "sh".into(),
+            "-c".into(),
+            format!("printf '%s' \"$MY_SECRET\" > {out_str}"),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "hunter2");
+    let _ = std::fs::remove_file(&out);
+}
+
+/// `export --format dotenv` writes a file whose parsed content matches the committed + staged
+/// values. (The plaintext warning is emitted to stderr; we assert the file's correctness.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn export_writes_dotenv_matching_the_working_tree() {
+    let fx = ready_fixture("ivan", None, true).await;
+
+    commands::set(
+        &fx.config_path,
+        &fx.state_path,
+        &fx.socket,
+        "acme-dev",
+        vec![("TOKEN".into(), "abc123".into())],
+    )
+    .await
+    .unwrap();
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", "c1".into())
+        .await
+        .unwrap();
+    // Stage an additional value on top of the committed one; export uses tip + staged overlay.
+    commands::set(
+        &fx.config_path,
+        &fx.state_path,
+        &fx.socket,
+        "acme-dev",
+        vec![("EXTRA".into(), "with space".into())],
+    )
+    .await
+    .unwrap();
+
+    let out = unique("dotenv");
+    commands::export(
+        &fx.config_path,
+        &fx.state_path,
+        &fx.socket,
+        "acme-dev",
+        commands::ExportFormat::Dotenv,
+        &out,
+    )
+    .await
+    .unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap();
+    assert!(contents.contains("TOKEN=abc123\n"), "got: {contents}");
+    assert!(contents.contains("EXTRA=\"with space\"\n"), "got: {contents}");
+    let _ = std::fs::remove_file(&out);
+}
+
+/// End-to-end: machine A commits + pushes; a second machine (fresh config/state/store + fresh
+/// agent) logs in as the same user, `use`s the DEK, pulls, and sees the same tip and the same
+/// decrypted value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_then_fresh_machine_pull_sees_the_same_secrets() {
+    // Machine A: provision + grant + commit + push.
+    let a = ready_fixture("judy", None, true).await;
+    commands::set(
+        &a.config_path,
+        &a.state_path,
+        &a.socket,
+        "acme-dev",
+        vec![("SHARED".into(), "top-secret".into())],
+    )
+    .await
+    .unwrap();
+    commands::commit(&a.config_path, &a.state_path, &a.socket, "acme-dev", "seed".into())
+        .await
+        .unwrap();
+    commands::push(&a.config_path, &a.state_path, "acme-dev").await.unwrap();
+    let a_tip = *crate::state::LocalState::load_from(&a.state_path)
+        .unwrap()
+        .context("acme-dev")
+        .unwrap()
+        .tips
+        .get("main")
+        .unwrap();
+
+    // Machine B: same user + server, but fresh socket/config/state (⇒ fresh object store).
+    let b = ready_fixture("judy", Some(a.base.clone()), false).await;
+    commands::pull(&b.config_path, &b.state_path, "acme-dev").await.unwrap();
+
+    let b_tip = *crate::state::LocalState::load_from(&b.state_path)
+        .unwrap()
+        .context("acme-dev")
+        .unwrap()
+        .tips
+        .get("main")
+        .unwrap();
+    assert_eq!(a_tip, b_tip, "machine B should have fast-forwarded to A's tip");
+
+    // Machine B can `log` (verify) and decrypt the value via `run`.
+    commands::log(&b.config_path, &b.state_path, "acme-dev").unwrap();
+    let out = unique("bpull");
+    let out_str = out.to_string_lossy().to_string();
+    let code = commands::run(
+        &b.config_path,
+        &b.state_path,
+        &b.socket,
+        "acme-dev",
+        vec!["sh".into(), "-c".into(), format!("printf '%s' \"$SHARED\" > {out_str}")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "top-secret");
+    let _ = std::fs::remove_file(&out);
+}
+
 /// A first-time `login` on a brand-new username registers, unlocks the agent, and ends with a
 /// valid cached session token + user_id in config.
 #[tokio::test]

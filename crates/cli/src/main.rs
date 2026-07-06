@@ -8,6 +8,7 @@
 mod agent;
 mod commands;
 mod config;
+mod state;
 
 #[cfg(test)]
 mod tests;
@@ -52,6 +53,57 @@ enum Command {
     Link {
         /// The context name to link.
         name: String,
+    },
+    /// Switch the current context to a different branch (purely local; no unwrap).
+    Switch {
+        /// The branch to switch to.
+        branch: String,
+    },
+    /// Show the current context, branch, DEK-cache status, and staged changes.
+    Status,
+    /// Stage one or more `KEY=VALUE` secrets in the current context.
+    Set {
+        /// `KEY=VALUE` pairs to stage.
+        #[arg(required = true)]
+        pairs: Vec<String>,
+    },
+    /// Stage deletion of one or more keys in the current context.
+    Unset {
+        /// Key names to unset.
+        #[arg(required = true)]
+        keys: Vec<String>,
+    },
+    /// Commit the staged changes in the current context.
+    Commit {
+        #[arg(short, long)]
+        message: String,
+    },
+    /// Show the verified commit history of the current branch.
+    Log,
+    /// Diff two commits (or the last commit's change if no args are given).
+    Diff {
+        /// The "from" commit hash (or the only commit, diffed against the empty tree).
+        a: Option<String>,
+        /// The "to" commit hash.
+        b: Option<String>,
+    },
+    /// Fetch and fast-forward the current branch from the server.
+    Pull,
+    /// Upload local commits and move the branch ref on the server.
+    Push,
+    /// Run a command with the current context's secrets injected as env vars (never on disk).
+    Run {
+        /// The command and its arguments (everything after `--`).
+        #[arg(trailing_var_arg = true, required = true)]
+        cmd: Vec<String>,
+    },
+    /// Export the current context's secrets to a file (plaintext — prints a warning).
+    Export {
+        /// Output format (only `dotenv` is supported in v1).
+        #[arg(long)]
+        format: String,
+        /// The file to write.
+        path: PathBuf,
     },
     /// Key agent daemon management (internal use).
     #[command(subcommand, hide = true)]
@@ -126,10 +178,121 @@ async fn main() -> anyhow::Result<()> {
             let cwd = current_dir()?;
             commands::link(&config_path, &cwd, &name)
         }
+        Command::Switch { branch } => {
+            let state_path = state::default_state_path()?;
+            let ctx = resolve_ctx()?;
+            commands::switch(&state_path, &ctx, &branch)
+        }
+        Command::Status => {
+            let config_path = config::default_config_path()?;
+            let state_path = state::default_state_path()?;
+            let socket = agent::default_socket_path()?;
+            let ctx = resolve_ctx()?;
+            commands::status(&config_path, &state_path, &socket, &ctx).await
+        }
+        Command::Set { pairs } => {
+            let config_path = config::default_config_path()?;
+            let state_path = state::default_state_path()?;
+            let parsed = parse_pairs(&pairs)?;
+            let socket = agent::client::ensure_running().await?;
+            let ctx = resolve_ctx()?;
+            commands::set(&config_path, &state_path, &socket, &ctx, parsed).await
+        }
+        Command::Unset { keys } => {
+            let config_path = config::default_config_path()?;
+            let state_path = state::default_state_path()?;
+            let ctx = resolve_ctx()?;
+            commands::unset(&config_path, &state_path, &ctx, keys)
+        }
+        Command::Commit { message } => {
+            let config_path = config::default_config_path()?;
+            let state_path = state::default_state_path()?;
+            let socket = agent::client::ensure_running().await?;
+            let ctx = resolve_ctx()?;
+            commands::commit(&config_path, &state_path, &socket, &ctx, message).await
+        }
+        Command::Log => {
+            let config_path = config::default_config_path()?;
+            let state_path = state::default_state_path()?;
+            let ctx = resolve_ctx()?;
+            commands::log(&config_path, &state_path, &ctx)
+        }
+        Command::Diff { a, b } => {
+            let config_path = config::default_config_path()?;
+            let state_path = state::default_state_path()?;
+            let socket = agent::client::ensure_running().await?;
+            let ctx = resolve_ctx()?;
+            let entries = commands::diff(&config_path, &state_path, &socket, &ctx, a, b).await?;
+            if entries.is_empty() {
+                println!("No changes.");
+            }
+            for entry in entries {
+                match entry {
+                    wonton_vcs::DiffEntry::Added(k) => println!("+ {k}"),
+                    wonton_vcs::DiffEntry::Removed(k) => println!("- {k}"),
+                    wonton_vcs::DiffEntry::Changed(k) => println!("~ {k}"),
+                }
+            }
+            Ok(())
+        }
+        Command::Pull => {
+            let config_path = config::default_config_path()?;
+            let state_path = state::default_state_path()?;
+            let ctx = resolve_ctx()?;
+            commands::pull(&config_path, &state_path, &ctx).await
+        }
+        Command::Push => {
+            let config_path = config::default_config_path()?;
+            let state_path = state::default_state_path()?;
+            let ctx = resolve_ctx()?;
+            commands::push(&config_path, &state_path, &ctx).await
+        }
+        Command::Run { cmd } => {
+            let config_path = config::default_config_path()?;
+            let state_path = state::default_state_path()?;
+            let socket = agent::client::ensure_running().await?;
+            let ctx = resolve_ctx()?;
+            let code = commands::run(&config_path, &state_path, &socket, &ctx, cmd).await?;
+            std::process::exit(code);
+        }
+        Command::Export { format, path } => {
+            let config_path = config::default_config_path()?;
+            let state_path = state::default_state_path()?;
+            let socket = agent::client::ensure_running().await?;
+            let ctx = resolve_ctx()?;
+            let format = commands::ExportFormat::parse(&format)?;
+            commands::export(&config_path, &state_path, &socket, &ctx, format, &path).await
+        }
         Command::Agent(command) => agent::run(command).await,
     }
 }
 
 fn current_dir() -> anyhow::Result<PathBuf> {
     std::env::current_dir().map_err(|e| anyhow::anyhow!("cannot determine current directory: {e}"))
+}
+
+/// Resolve the current context name for the VCS porcelain commands, via the `.wonton` marker (in
+/// the cwd or an ancestor) or `config.current_context`. All these commands operate on "the current
+/// context"; there is no `--context` flag in v1.
+fn resolve_ctx() -> anyhow::Result<String> {
+    let config_path = config::default_config_path()?;
+    let config = config::Config::load_from(&config_path)?;
+    let cwd = current_dir()?;
+    config::resolve_context_name(&config, &cwd)
+}
+
+/// Parse `KEY=VALUE` positional arguments into pairs, erroring clearly on a missing `=`.
+fn parse_pairs(pairs: &[String]) -> anyhow::Result<Vec<(String, String)>> {
+    pairs
+        .iter()
+        .map(|pair| {
+            let (key, value) = pair
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("'{pair}' is not a KEY=VALUE pair (missing '=')"))?;
+            if key.is_empty() {
+                anyhow::bail!("'{pair}' has an empty key");
+            }
+            Ok((key.to_string(), value.to_string()))
+        })
+        .collect()
 }

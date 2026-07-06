@@ -3005,6 +3005,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "wonton-crypto",
  "wonton-objects",
  "wonton-server",

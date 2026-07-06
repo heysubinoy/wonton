@@ -17,6 +17,7 @@ thiserror.workspace = true
 tokio.workspace = true
 toml = "0.8"
 tracing.workspace = true
+uuid = { version = "1.23.4", features = ["v4"] }
 tracing-subscriber.workspace = true
 wonton-crypto = { version = "0.1.0", path = "../crypto" }
 wonton-objects = { version = "0.1.0", path = "../objects" }
