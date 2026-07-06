@@ -105,9 +105,43 @@ enum Command {
         /// The file to write.
         path: PathBuf,
     },
+    /// Grant a user access to a context's environment (wraps the DEK for them; O(1)).
+    Share {
+        /// The username to share with.
+        user: String,
+        /// The context to share (a context name, per `wonton context list`).
+        #[arg(long)]
+        env: String,
+        /// The role to grant.
+        #[arg(long, default_value = "reader")]
+        role: String,
+    },
+    /// Revoke a user's access to a context's environment (removes them and rotates the DEK).
+    Revoke {
+        /// The username to revoke.
+        user: String,
+        /// The context to revoke access to (a context name).
+        #[arg(long)]
+        env: String,
+    },
+    /// Data-key management for a context's environment.
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
+    },
     /// Key agent daemon management (internal use).
     #[command(subcommand, hide = true)]
     Agent(agent::AgentCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum KeyCommand {
+    /// Rotate the environment's DEK, re-encrypting history and re-wrapping for members.
+    Rotate {
+        /// The context whose environment DEK to rotate (a context name).
+        #[arg(long)]
+        env: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -170,8 +204,9 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Use { name } => {
             let config_path = config::default_config_path()?;
+            let state_path = state::default_state_path()?;
             let socket = agent::client::ensure_running().await?;
-            commands::use_context(&config_path, &socket, &name).await
+            commands::use_context(&config_path, &state_path, &socket, &name).await
         }
         Command::Link { name } => {
             let config_path = config::default_config_path()?;
@@ -263,7 +298,39 @@ async fn main() -> anyhow::Result<()> {
             let format = commands::ExportFormat::parse(&format)?;
             commands::export(&config_path, &state_path, &socket, &ctx, format, &path).await
         }
+        Command::Share { user, env, role } => {
+            let config_path = config::default_config_path()?;
+            let state_path = state::default_state_path()?;
+            let socket = agent::client::ensure_running().await?;
+            let role = parse_role(&role)?;
+            commands::share(&config_path, &state_path, &socket, &env, &user, role).await
+        }
+        Command::Revoke { user, env } => {
+            let config_path = config::default_config_path()?;
+            let state_path = state::default_state_path()?;
+            let socket = agent::client::ensure_running().await?;
+            commands::revoke(&config_path, &state_path, &socket, &env, &user).await
+        }
+        Command::Key { command } => match command {
+            KeyCommand::Rotate { env } => {
+                let config_path = config::default_config_path()?;
+                let state_path = state::default_state_path()?;
+                let socket = agent::client::ensure_running().await?;
+                commands::rotate(&config_path, &state_path, &socket, &env).await
+            }
+        },
         Command::Agent(command) => agent::run(command).await,
+    }
+}
+
+/// Parse the `--role` flag for `wonton share` into a [`wonton_shared::Role`]. Mirrors the
+/// lowercase serde representation the wire type uses.
+fn parse_role(s: &str) -> anyhow::Result<wonton_shared::Role> {
+    match s.to_ascii_lowercase().as_str() {
+        "admin" => Ok(wonton_shared::Role::Admin),
+        "writer" => Ok(wonton_shared::Role::Writer),
+        "reader" => Ok(wonton_shared::Role::Reader),
+        other => anyhow::bail!("invalid role '{other}'; expected reader, writer, or admin"),
     }
 }
 

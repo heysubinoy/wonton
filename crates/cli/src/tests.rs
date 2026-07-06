@@ -14,13 +14,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use wonton_crypto::{generate_dek, wrap_dek};
-use wonton_shared::{CreateEnvRequest, CreateStoreRequest, GrantKeyRequest};
+use wonton_crypto::{generate_dek, wrap_dek, EncryptedValue};
+use wonton_objects::{Blob, Commit, Hash, Tree};
+use wonton_shared::{CreateEnvRequest, CreateStoreRequest, GrantKeyRequest, Role};
 use wonton_sync::SyncClient;
+use wonton_vcs::ValueDecryptor;
 
+use crate::agent::cipher::AgentCipher;
 use crate::agent::{client as agent, daemon};
 use crate::commands;
 use crate::config::Config;
+use crate::state::{object_store_dir_for, open_object_store, LocalState};
 
 /// A unique temp path per call (parallel-safe): pid + atomic counter + nanosecond timestamp.
 fn unique(tag: &str) -> PathBuf {
@@ -147,7 +151,7 @@ async fn ready_fixture(
     }
 
     commands::context_add(&config_path, "acme-dev", "acme", "dev", user).unwrap();
-    commands::use_context(&config_path, &socket, "acme-dev")
+    commands::use_context(&config_path, &state_path, &socket, "acme-dev")
         .await
         .unwrap();
 
@@ -526,6 +530,7 @@ async fn context_add_and_use_unwraps_the_dek() {
     let socket = spawn_agent().await;
     let config_path = temp_config_path();
 
+    let state_path = temp_state_path();
     commands::login(&config_path, &socket, Some(base.clone()), "carol", "pw-carol".into())
         .await
         .unwrap();
@@ -566,7 +571,7 @@ async fn context_add_and_use_unwraps_the_dek() {
         .unwrap();
 
     commands::context_add(&config_path, "acme-dev", "acme", "dev", "carol").unwrap();
-    commands::use_context(&config_path, &socket, "acme-dev")
+    commands::use_context(&config_path, &state_path, &socket, "acme-dev")
         .await
         .expect("use should unwrap the granted DEK");
 
@@ -578,9 +583,12 @@ async fn context_add_and_use_unwraps_the_dek() {
     );
     let config = Config::load_from(&config_path).unwrap();
     assert_eq!(config.current_context.as_deref(), Some("acme-dev"));
+    // `use` persisted the granted DEK version (1) into state.toml for `share`/`rotate` to read.
+    let state = crate::state::LocalState::load_from(&state_path).unwrap();
+    assert_eq!(state.context("acme-dev").unwrap().dek_version, 1);
 
     // Re-using an already-cached context is cheap and still succeeds.
-    commands::use_context(&config_path, &socket, "acme-dev")
+    commands::use_context(&config_path, &state_path, &socket, "acme-dev")
         .await
         .expect("re-use of a cached context should succeed");
 }
@@ -594,6 +602,7 @@ async fn use_without_a_granted_dek_reports_no_access() {
     let socket = spawn_agent().await;
     let config_path = temp_config_path();
 
+    let state_path = temp_state_path();
     commands::login(&config_path, &socket, Some(base.clone()), "dave", "pw-dave".into())
         .await
         .unwrap();
@@ -616,7 +625,7 @@ async fn use_without_a_granted_dek_reports_no_access() {
     // NOTE: no grant_key — dave has no wrapped DEK for prod.
 
     commands::context_add(&config_path, "acme-prod", "acme", "prod", "dave").unwrap();
-    let err = commands::use_context(&config_path, &socket, "acme-prod")
+    let err = commands::use_context(&config_path, &state_path, &socket, "acme-prod")
         .await
         .expect_err("use must fail with no granted DEK");
     assert!(
@@ -691,4 +700,257 @@ async fn link_writes_marker_and_refuses_to_clobber_a_different_context() {
     assert!(err.to_string().contains("refusing to overwrite"), "got: {err}");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- Phase 5a: share / revoke / key rotate -----------------------------------------------
+
+/// A logged-in-but-unprovisioned "machine": fresh agent/config/state, the user is registered but
+/// no store/env/context is set up yet. Used for a share *target* (who has no DEK until shared).
+struct Machine {
+    config_path: PathBuf,
+    state_path: PathBuf,
+    socket: PathBuf,
+}
+
+async fn login_only(user: &str, base: &str) -> Machine {
+    let socket = spawn_agent().await;
+    let config_path = temp_config_path();
+    let state_path = temp_state_path();
+    commands::login(&config_path, &socket, Some(base.to_string()), user, format!("pw-{user}"))
+        .await
+        .unwrap();
+    Machine {
+        config_path,
+        state_path,
+        socket,
+    }
+}
+
+/// Count the object files under `state_path`'s co-located object store (git-style fanout dirs).
+fn count_objects(state_path: &std::path::Path) -> usize {
+    fn walk(p: &std::path::Path) -> usize {
+        let mut n = 0;
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    n += walk(&path);
+                } else {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+    walk(&object_store_dir_for(state_path))
+}
+
+/// The blob hash a committed tree maps `key` to (for asserting a value's ciphertext changed after
+/// rotation without decrypting it).
+fn blob_hash_for_key(state_path: &std::path::Path, tip: Hash, key: &str) -> Hash {
+    let store = open_object_store(&object_store_dir_for(state_path)).unwrap();
+    let commit = Commit::from_bytes(&store.get(&tip).unwrap().unwrap()).unwrap();
+    let tree = Tree::from_bytes(&store.get(&commit.fields.tree_hash).unwrap().unwrap()).unwrap();
+    *tree.entries.get(key).unwrap()
+}
+
+fn tip_of(state_path: &std::path::Path) -> Hash {
+    *LocalState::load_from(state_path)
+        .unwrap()
+        .context("acme-dev")
+        .unwrap()
+        .tips
+        .get("main")
+        .unwrap()
+}
+
+/// `share` grants a second user access with NO re-encryption (O(1)): the object count is
+/// unchanged, and the target can then `use` + `pull` + read the same secret the sharer committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn share_grants_access_without_re_encryption() {
+    let owner = ready_fixture("p5owner", None, true).await;
+    commands::set(
+        &owner.config_path,
+        &owner.state_path,
+        &owner.socket,
+        "acme-dev",
+        vec![("SECRET".into(), "sk-shared".into())],
+    )
+    .await
+    .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "seed".into())
+        .await
+        .unwrap();
+    commands::push(&owner.config_path, &owner.state_path, "acme-dev").await.unwrap();
+
+    let bob = login_only("p5bob", &owner.base).await;
+
+    // O(1): share must not create any objects (no re-encryption).
+    let before = count_objects(&owner.state_path);
+    commands::share(
+        &owner.config_path,
+        &owner.state_path,
+        &owner.socket,
+        "acme-dev",
+        "p5bob",
+        Role::Reader,
+    )
+    .await
+    .expect("share should grant access");
+    let after = count_objects(&owner.state_path);
+    assert_eq!(before, after, "share must not re-encrypt / create objects");
+
+    // Bob can now use the context, pull, and read the same secret.
+    commands::context_add(&bob.config_path, "acme-dev", "acme", "dev", "p5bob").unwrap();
+    commands::use_context(&bob.config_path, &bob.state_path, &bob.socket, "acme-dev")
+        .await
+        .expect("bob can use the shared context");
+    commands::pull(&bob.config_path, &bob.state_path, "acme-dev").await.unwrap();
+
+    let out = unique("shareout");
+    let out_str = out.to_string_lossy().to_string();
+    let code = commands::run(
+        &bob.config_path,
+        &bob.state_path,
+        &bob.socket,
+        "acme-dev",
+        vec!["sh".into(), "-c".into(), format!("printf '%s' \"$SECRET\" > {out_str}")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "sk-shared");
+    let _ = std::fs::remove_file(&out);
+}
+
+/// The Phase-5 exit criterion: after `revoke` + the fresh commit that follows, the revoked user's
+/// STALE cached DEK can no longer decrypt a value committed after the revocation (AEAD auth
+/// failure, fail-closed — never garbage).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_denies_the_revoked_users_stale_dek() {
+    let owner = ready_fixture("p5rowner", None, true).await;
+    commands::set(
+        &owner.config_path,
+        &owner.state_path,
+        &owner.socket,
+        "acme-dev",
+        vec![("OLD".into(), "old-value".into())],
+    )
+    .await
+    .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "v1".into())
+        .await
+        .unwrap();
+
+    // Mallory is shared in (gets DEK v1) and caches it via `use`.
+    let mallory = login_only("p5mallory", &owner.base).await;
+    commands::share(
+        &owner.config_path,
+        &owner.state_path,
+        &owner.socket,
+        "acme-dev",
+        "p5mallory",
+        Role::Reader,
+    )
+    .await
+    .unwrap();
+    commands::context_add(&mallory.config_path, "acme-dev", "acme", "dev", "p5mallory").unwrap();
+    commands::use_context(&mallory.config_path, &mallory.state_path, &mallory.socket, "acme-dev")
+        .await
+        .expect("mallory caches DEK v1");
+
+    // Owner revokes Mallory (removes membership + rotates to v2; owner hot-swaps to v2).
+    commands::revoke(
+        &owner.config_path,
+        &owner.state_path,
+        &owner.socket,
+        "acme-dev",
+        "p5mallory",
+    )
+    .await
+    .expect("revoke + rotate");
+    let state = LocalState::load_from(&owner.state_path).unwrap();
+    assert_eq!(state.context("acme-dev").unwrap().dek_version, 2, "owner is on v2 after rotation");
+
+    // Owner commits a NEW secret under the v2 DEK.
+    commands::set(
+        &owner.config_path,
+        &owner.state_path,
+        &owner.socket,
+        "acme-dev",
+        vec![("NEW".into(), "post-revocation-secret".into())],
+    )
+    .await
+    .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "v2-secret".into())
+        .await
+        .unwrap();
+
+    // Grab the NEW blob (encrypted under v2) from the owner's store.
+    let tip = tip_of(&owner.state_path);
+    let blob_hash = blob_hash_for_key(&owner.state_path, tip, "NEW");
+    let store = open_object_store(&object_store_dir_for(&owner.state_path)).unwrap();
+    let blob = Blob::from_bytes(&store.get(&blob_hash).unwrap().unwrap()).unwrap();
+    let value = EncryptedValue {
+        nonce: blob.nonce,
+        ciphertext: blob.ciphertext,
+    };
+
+    // Mallory's agent still holds the STALE v1 DEK under "acme-dev"; it must fail to open the
+    // v2-encrypted value — fail closed, not a crash and not garbage.
+    let mallory_cipher = AgentCipher::new(mallory.socket.clone(), "acme-dev");
+    let result = tokio::task::spawn_blocking(move || mallory_cipher.decrypt(&value))
+        .await
+        .unwrap();
+    assert!(result.is_err(), "revoked user's stale DEK must not decrypt post-rotation ciphertext");
+}
+
+/// `key rotate` alone (no membership change): advances the tip, changes an existing key's blob
+/// hash (re-encrypted under a fresh DEK), and a remaining member can still log + decrypt after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn key_rotate_alone_advances_tip_and_reencrypts() {
+    let owner = ready_fixture("p5kowner", None, true).await;
+    commands::set(
+        &owner.config_path,
+        &owner.state_path,
+        &owner.socket,
+        "acme-dev",
+        vec![("KEY".into(), "the-value".into())],
+    )
+    .await
+    .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "v1".into())
+        .await
+        .unwrap();
+
+    let tip1 = tip_of(&owner.state_path);
+    let h1 = blob_hash_for_key(&owner.state_path, tip1, "KEY");
+
+    commands::rotate(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev")
+        .await
+        .expect("key rotate");
+
+    let state = LocalState::load_from(&owner.state_path).unwrap();
+    assert_eq!(state.context("acme-dev").unwrap().dek_version, 2, "version advanced to 2");
+    let tip2 = tip_of(&owner.state_path);
+    assert_ne!(tip1, tip2, "rotation must advance the tip");
+    let h2 = blob_hash_for_key(&owner.state_path, tip2, "KEY");
+    assert_ne!(h1, h2, "the same plaintext under a fresh DEK+nonce must yield a different blob");
+
+    // A remaining member (the owner) can still verify history and decrypt under the new DEK.
+    commands::log(&owner.config_path, &owner.state_path, "acme-dev").unwrap();
+    let out = unique("rotateout");
+    let out_str = out.to_string_lossy().to_string();
+    let code = commands::run(
+        &owner.config_path,
+        &owner.state_path,
+        &owner.socket,
+        "acme-dev",
+        vec!["sh".into(), "-c".into(), format!("printf '%s' \"$KEY\" > {out_str}")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "the-value");
+    let _ = std::fs::remove_file(&out);
 }

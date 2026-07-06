@@ -208,6 +208,32 @@ pub async fn decrypt_value(
     }
 }
 
+/// Generate a fresh random DEK inside the agent and cache it under `context` (overwriting any
+/// existing entry). The DEK never leaves the agent. Used by rotation to stage a new DEK.
+pub async fn generate_dek(path: &Path, context: String) -> Result<(), ClientError> {
+    match reject_error(send_request(path, &Request::GenerateDek { context }).await?)? {
+        Response::Ok => Ok(()),
+        _ => Err(ClientError::Unexpected),
+    }
+}
+
+/// Wrap the DEK cached under `context` for a recipient's base64 X25519 public key. Returns the
+/// base64 sealed box (ciphertext-equivalent) — the raw DEK never crosses the socket.
+pub async fn wrap_dek_for_recipient(
+    path: &Path,
+    context: String,
+    recipient_x25519_pubkey_b64: String,
+) -> Result<String, ClientError> {
+    let request = Request::WrapDekForRecipient {
+        context,
+        recipient_x25519_pubkey_b64,
+    };
+    match reject_error(send_request(path, &request).await?)? {
+        Response::SealedDek { sealed_box_b64 } => Ok(sealed_box_b64),
+        _ => Err(ClientError::Unexpected),
+    }
+}
+
 /// Wipe the agent's in-memory state (identity + all cached DEKs).
 pub async fn lock(path: &Path) -> Result<(), ClientError> {
     match reject_error(send_request(path, &Request::Lock).await?)? {

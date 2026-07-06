@@ -25,8 +25,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use wonton_crypto::{
-    decrypt_value, encrypt_value, sign, unlock, unwrap_dek, Argon2Params, Dek, EncryptedValue,
-    SealedDek, UnlockedIdentity, WrappedPrivateKey,
+    decrypt_value, encrypt_value, generate_dek, sign, unlock, unwrap_dek, wrap_dek, Argon2Params,
+    Dek, EncryptedValue, SealedDek, UnlockedIdentity, WrappedPrivateKey,
 };
 
 use super::protocol::{Argon2ParamsWire, Request, Response};
@@ -289,6 +289,51 @@ pub async fn handle_request(request: Request, state: &SharedState) -> Response {
                     Err(_) => Response::Error {
                         message: "decryption failed".to_string(),
                     },
+                },
+                None => no_dek(&context),
+            }
+        }
+
+        Request::GenerateDek { context } => {
+            // Require an unlocked identity even though `generate_dek` needs none: a fail-closed
+            // posture consistent with every other op (an agent that isn't logged in should do no
+            // key work at all), and it means a cached DEK always coexists with an identity.
+            let mut guard = state.lock().await;
+            if guard.identity.is_none() {
+                return locked();
+            }
+            // Overwrite any existing entry for this context — intentional: a rotation stages a new
+            // DEK under a temp context; the old context's DEK stays cached separately.
+            guard.deks.insert(context, generate_dek());
+            Response::Ok
+        }
+
+        Request::WrapDekForRecipient {
+            context,
+            recipient_x25519_pubkey_b64,
+        } => {
+            let recipient_bytes = match STANDARD.decode(&recipient_x25519_pubkey_b64) {
+                Ok(b) => b,
+                Err(_) => return bad_base64("recipient_x25519_pubkey_b64"),
+            };
+            let recipient: [u8; 32] = match recipient_bytes.as_slice().try_into() {
+                Ok(k) => k,
+                Err(_) => {
+                    return Response::Error {
+                        message: "recipient_x25519_pubkey must be 32 bytes".to_string(),
+                    }
+                }
+            };
+            let guard = state.lock().await;
+            if guard.identity.is_none() {
+                return locked();
+            }
+            match guard.deks.get(&context) {
+                // `crypto_box_seal` is anonymous: only the recipient's public key and the DEK are
+                // needed. The response is the sealed box (ciphertext-equivalent) — the raw DEK
+                // never leaves this function.
+                Some(dek) => Response::SealedDek {
+                    sealed_box_b64: STANDARD.encode(&wrap_dek(dek, &recipient).0),
                 },
                 None => no_dek(&context),
             }

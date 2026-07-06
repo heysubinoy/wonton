@@ -58,6 +58,15 @@ pub struct ContextState {
     /// The current branch. Defaults to `"main"` on first `use`/`switch`.
     #[serde(default = "default_branch")]
     pub branch: String,
+    /// The DEK version currently cached in the agent for this context — the version of the
+    /// wrapped-DEK entry `use` unwrapped. `0` means "never granted / unknown". `share` reads it to
+    /// know which version it is granting a copy of; `key rotate` bumps it after a successful
+    /// rotation. `#[serde(default)]` so old `state.toml` files without this field still load as 0.
+    ///
+    /// **Field order matters:** this scalar must precede the `tips`/`staged` tables — the `toml`
+    /// serializer rejects a scalar emitted after a table.
+    #[serde(default)]
+    pub dek_version: u32,
     /// Branch name -> last-known commit hash (local cache of the server ref; `pull` refreshes it,
     /// `push` advances it on success).
     #[serde(default)]
@@ -75,6 +84,7 @@ impl Default for ContextState {
     fn default() -> Self {
         ContextState {
             branch: default_branch(),
+            dek_version: 0,
             tips: BTreeMap::new(),
             staged: BTreeMap::new(),
         }

@@ -68,6 +68,20 @@ pub enum Request {
         nonce_b64: String,
         ciphertext_b64: String,
     },
+    /// Generate a fresh random DEK and CACHE it under `context` (overwriting any existing entry
+    /// for that context — this is how a rotation stages a brand-new DEK under a temp context
+    /// alongside the still-cached old one). Does NOT return the DEK. Requires an unlocked identity
+    /// (fail-closed posture, matching every other op — see the daemon impl).
+    GenerateDek { context: String },
+    /// Wrap the DEK cached under `context` for a *third party's* X25519 public key
+    /// (`crypto_box_seal` is anonymous — it needs no sender secret key, just the recipient's
+    /// public key and the DEK bytes, both already agent-side). Returns only the sealed box
+    /// ([`Response::SealedDek`]); the raw DEK never crosses the socket. Errors if locked, if no
+    /// DEK is cached for `context`, or if the recipient key is malformed.
+    WrapDekForRecipient {
+        context: String,
+        recipient_x25519_pubkey_b64: String,
+    },
     /// Wipe the resident identity and every cached DEK.
     Lock,
     /// Report whether unlocked, and which context names currently have a cached DEK.
@@ -97,6 +111,12 @@ pub enum Response {
     },
     PlaintextValue {
         plaintext_b64: String,
+    },
+    /// A DEK sealed for a recipient's X25519 public key (`crypto_box` sealed box). This is
+    /// ciphertext-equivalent — safe to cross the socket — never the raw DEK. Answers
+    /// [`Request::WrapDekForRecipient`].
+    SealedDek {
+        sealed_box_b64: String,
     },
     Status {
         unlocked: bool,

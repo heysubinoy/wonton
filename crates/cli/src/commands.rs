@@ -23,7 +23,8 @@ use uuid::Uuid;
 use wonton_crypto::{generate_identity, EncryptedValue};
 use wonton_objects::{Blob, Commit, Hash, LocalObjectStore, Tree};
 use wonton_shared::{
-    Argon2ParamsDto, LoginCompleteRequest, LoginStartRequest, RegisterRequest,
+    Argon2ParamsDto, GrantKeyRequest, LoginCompleteRequest, LoginStartRequest, MemberRequest,
+    ObjectUploadRequest, RegisterRequest, Role, RotateRequest,
 };
 use wonton_sync::{PullOutcome, SyncClient, SyncError};
 use wonton_vcs::{DiffEntry, ValueDecryptor, ValueEncryptor, WorkingSet};
@@ -232,7 +233,12 @@ pub async fn context_show(config_path: &Path, socket_path: &Path, cwd: &Path) ->
 /// `wonton use <name>`. Switches the current context, unwrapping the environment's DEK into the
 /// agent the first time (cheap on subsequent uses once cached). This is the Phase 4 exit
 /// criterion: "switching context unwraps the right DEK".
-pub async fn use_context(config_path: &Path, socket_path: &Path, name: &str) -> anyhow::Result<()> {
+pub async fn use_context(
+    config_path: &Path,
+    state_path: &Path,
+    socket_path: &Path,
+    name: &str,
+) -> anyhow::Result<()> {
     let mut config = Config::load_from(config_path)?;
     let ctx = config
         .find_context(name)
@@ -306,9 +312,16 @@ pub async fn use_context(config_path: &Path, socket_path: &Path, name: &str) -> 
 
     // `sealed_box` is already base64 on the wire; forward it straight to the agent, which
     // unwraps it with the resident X25519 secret and caches the DEK under the context name.
+    let dek_version = entry.dek_version;
     agent::unwrap_dek(socket_path, ctx.name.clone(), entry.sealed_box.clone())
         .await
         .context("agent could not unwrap the DEK for this environment")?;
+
+    // Persist the version we just unwrapped so `share`/`rotate` know what version this context's
+    // cached DEK is (they can't ask the agent — the raw DEK never leaves it).
+    let mut state = LocalState::load_from(state_path)?;
+    state.context_mut(&ctx.name).dek_version = dek_version;
+    state.save_to(state_path)?;
 
     // Step 5: record the selection.
     config.current_context = Some(ctx.name.clone());
@@ -786,6 +799,249 @@ pub async fn export(
     Ok(())
 }
 
+// =====================================================================================
+// Phase 5a: sharing, revocation, and DEK rotation (PLAN.md §4.4/§8.3).
+//
+// `share` is O(1) — it wraps a COPY of the already-cached DEK for a new recipient, no value
+// re-encryption. `revoke` and `key rotate` both run `perform_rotation`: a fresh DEK is generated
+// in the agent, the committed history is re-encrypted under it, the new DEK is re-wrapped for
+// every *remaining* member, and everything is applied in one atomic server-side rotate batch. A
+// revoked user, holding only the retired DEK, can no longer decrypt anything committed afterward.
+// =====================================================================================
+
+/// `wonton share <user> --env <ctx> [--role ...]` — grant `target_username` access to the
+/// context's environment by wrapping a copy of the currently-cached DEK for their X25519 public
+/// key. O(1): no value re-encryption, no rotation (PLAN.md §4.4).
+pub async fn share(
+    config_path: &Path,
+    state_path: &Path,
+    socket_path: &Path,
+    ctx_name: &str,
+    target_username: &str,
+    role: Role,
+) -> anyhow::Result<()> {
+    let config = Config::load_from(config_path)?;
+    // Needs its own cached DEK (via `wonton use`) to wrap a copy for the target.
+    let (ctx, identity) = ready_context(&config, socket_path, ctx_name).await?;
+    let client = authed_client(&identity);
+
+    // Resolve the target's public keys (any valid actor may look a user up).
+    let target = client.get_user(target_username).await.map_err(|e| match e {
+        SyncError::NotFound(_) => anyhow!("no such user '{target_username}'"),
+        other => anyhow!("could not look up user '{target_username}': {other}"),
+    })?;
+
+    // The version currently cached in the agent for this context is the version we grant under.
+    let state = LocalState::load_from(state_path)?;
+    let dek_version = state.context(ctx_name).map(|cs| cs.dek_version).unwrap_or(0);
+    if dek_version == 0 {
+        bail!("no known DEK version for context '{ctx_name}'; run `wonton use {ctx_name}` again");
+    }
+
+    // Best-effort membership upsert (server-side `ON CONFLICT DO UPDATE`, always safe to call —
+    // a no-op if the target already holds this role or higher isn't distinguished here).
+    client
+        .add_member(
+            &ctx.store,
+            &ctx.environment,
+            &MemberRequest {
+                user_id: target.user_id.clone(),
+                role,
+            },
+        )
+        .await
+        .context("could not add the target as a member of the environment")?;
+
+    // Wrap a copy of the cached DEK for the target — the raw DEK never leaves the agent.
+    let sealed_box =
+        agent::wrap_dek_for_recipient(socket_path, ctx.name.clone(), target.x25519_pubkey.clone())
+            .await
+            .context("agent could not wrap the DEK for the target")?;
+
+    client
+        .grant_key(
+            &ctx.store,
+            &ctx.environment,
+            &GrantKeyRequest {
+                user_id: target.user_id.clone(),
+                dek_version,
+                sealed_box,
+            },
+        )
+        .await
+        .context("could not upload the wrapped-DEK grant")?;
+
+    println!(
+        "Shared {}@{} with '{target_username}' as {} (DEK v{dek_version}).",
+        ctx.store,
+        ctx.environment,
+        role_label(role)
+    );
+    Ok(())
+}
+
+/// `wonton revoke <user> --env <ctx>` — remove the target's membership, then rotate the DEK.
+/// Revocation *is* rotation (PLAN.md §4.4): the target may have cached the old DEK, so the only
+/// way to actually deny them is to move to a new one they don't hold.
+pub async fn revoke(
+    config_path: &Path,
+    state_path: &Path,
+    socket_path: &Path,
+    ctx_name: &str,
+    target_username: &str,
+) -> anyhow::Result<()> {
+    let config = Config::load_from(config_path)?;
+    let (ctx, identity) = ready_context(&config, socket_path, ctx_name).await?;
+    let client = authed_client(&identity);
+
+    let target = client.get_user(target_username).await.map_err(|e| match e {
+        SyncError::NotFound(_) => anyhow!("no such user '{target_username}'"),
+        other => anyhow!("could not look up user '{target_username}': {other}"),
+    })?;
+
+    client
+        .remove_member(&ctx.store, &ctx.environment, &target.user_id)
+        .await
+        .context("could not remove the target's membership")?;
+    println!(
+        "Removed '{target_username}' from {}@{}; rotating the DEK...",
+        ctx.store, ctx.environment
+    );
+
+    perform_rotation(state_path, socket_path, &ctx, &identity).await
+}
+
+/// `wonton key rotate --env <ctx>` — rotate the environment's DEK with no membership change
+/// (re-encrypt history under a fresh DEK and re-wrap for the current members).
+pub async fn rotate(
+    config_path: &Path,
+    state_path: &Path,
+    socket_path: &Path,
+    ctx_name: &str,
+) -> anyhow::Result<()> {
+    let config = Config::load_from(config_path)?;
+    let (ctx, identity) = ready_context(&config, socket_path, ctx_name).await?;
+    perform_rotation(state_path, socket_path, &ctx, &identity).await
+}
+
+/// The shared 8-step rotation both `revoke` and `key rotate` run (PROGRESS.md §3.7). Assumes the
+/// caller already resolved + guarded the context (old DEK cached under `ctx.name`).
+///
+/// Known edge case (not specially handled): if `revoke` removed the last *other* member, the
+/// member list may contain only the rotator (or, if the rotator revoked themselves, be empty).
+/// The rotation still proceeds; an env with zero members afterward is unusual but not this
+/// phase's problem to prevent — the code simply doesn't crash on it.
+async fn perform_rotation(
+    state_path: &Path,
+    socket_path: &Path,
+    ctx: &Context,
+    identity: &Identity,
+) -> anyhow::Result<()> {
+    let client = authed_client(identity);
+    let store = open_object_store(&object_store_dir_for(state_path))?;
+
+    // 2. The members to re-wrap for (reflects any just-applied `remove_member`).
+    let members = client
+        .list_members(&ctx.store, &ctx.environment)
+        .await
+        .context("could not list environment members")?;
+
+    // 3. The next DEK version.
+    let details = client
+        .get_env_details(&ctx.store, &ctx.environment)
+        .await
+        .context("could not read the environment's current DEK version")?;
+    let new_version = details.active_dek_version + 1;
+
+    // 4. Stage a fresh DEK in the agent under a temp context (distinct from `ctx.name`, whose DEK
+    //    is still the OLD one we need to decrypt the current history with).
+    let temp_ctx = format!("{}::rotate::{new_version}", ctx.name);
+    agent::generate_dek(socket_path, temp_ctx.clone())
+        .await
+        .context("agent could not generate a new DEK")?;
+
+    // 5. Re-encrypt the CURRENT TIP's committed tree (no staged overlay) under the new DEK. The
+    //    new commit's parent is the old tip; sign via either cipher (signing ignores context).
+    let mut state = LocalState::load_from(state_path)?;
+    let cs = state.context(&ctx.name).cloned().unwrap_or_default();
+    let branch = cs.branch.clone();
+    let old_tip = cs.tips.get(&branch).copied();
+
+    let old_cipher = AgentCipher::new(socket_path, ctx.name.clone());
+    let new_cipher = AgentCipher::new(socket_path, temp_ctx.clone());
+    let working_set = effective_working_set(&store, &old_cipher, old_tip, &BTreeMap::new())?;
+
+    let author_id = Uuid::parse_str(&identity.user_id)
+        .with_context(|| format!("identity user_id '{}' is not a valid UUID", identity.user_id))?;
+    let new_hash = wonton_vcs::commit(
+        &store,
+        &new_cipher,
+        &old_cipher,
+        author_id,
+        old_tip,
+        &working_set,
+        "key rotation",
+    )?;
+
+    // 6. Wrap the new DEK for every remaining member; remember our own sealed box for the hot-swap.
+    let mut wrapped_deks = Vec::with_capacity(members.len());
+    let mut own_sealed: Option<String> = None;
+    for member in &members {
+        let sealed =
+            agent::wrap_dek_for_recipient(socket_path, temp_ctx.clone(), member.x25519_pubkey.clone())
+                .await
+                .with_context(|| {
+                    format!("could not wrap the new DEK for member {}", member.user_id)
+                })?;
+        if member.user_id == identity.user_id {
+            own_sealed = Some(sealed.clone());
+        }
+        wrapped_deks.push(GrantKeyRequest {
+            user_id: member.user_id.clone(),
+            dek_version: new_version,
+            sealed_box: sealed,
+        });
+    }
+
+    // 7. Collect the re-encrypted object batch (new commit back to the old tip) and apply the
+    //    rotation atomically server-side (objects + new wrapped-DEK map + version bump).
+    let object_hashes = collect_objects_to_push(&store, new_hash, old_tip)?;
+    let objects = objects_for_upload(&store, &object_hashes)?;
+    client
+        .rotate(
+            &ctx.store,
+            &ctx.environment,
+            &RotateRequest {
+                new_dek_version: new_version,
+                objects,
+                wrapped_deks,
+            },
+        )
+        .await
+        .context("rotation batch was rejected by the server")?;
+
+    // 8. Advance the local tip, hot-swap the agent's `ctx.name`-cached DEK to the new one (so the
+    //    caller keeps working under the new DEK), and persist the new version.
+    if let Some(sealed) = own_sealed {
+        agent::unwrap_dek(socket_path, ctx.name.clone(), sealed)
+            .await
+            .context("could not hot-swap the rotated DEK into the agent")?;
+    }
+    let cs = state.context_mut(&ctx.name);
+    cs.tips.insert(branch.clone(), new_hash);
+    cs.dek_version = new_version;
+    state.save_to(state_path)?;
+
+    println!(
+        "Rotated {}@{} to DEK v{new_version}; re-encrypted history at {} for {} member(s).",
+        ctx.store,
+        ctx.environment,
+        new_hash.to_hex(),
+        members.len()
+    );
+    Ok(())
+}
+
 // ---- shared helpers for the VCS porcelain --------------------------------------------------
 
 /// Resolve a context + identity from config without any agent/network check (for pull/push, which
@@ -950,6 +1206,50 @@ fn collect_objects_to_push(
         };
     }
     Ok(hashes)
+}
+
+/// Build the [`ObjectUploadRequest`] batch for a rotation from a list of local object hashes,
+/// reading each object's bytes from the store and sniffing its kind. Used by `perform_rotation`
+/// (the `rotate` route takes an explicit object batch rather than reusing `wonton_sync::push`,
+/// which moves a ref instead of applying a wrapped-DEK map).
+fn objects_for_upload(
+    store: &LocalObjectStore,
+    hashes: &[Hash],
+) -> anyhow::Result<Vec<ObjectUploadRequest>> {
+    let mut out = Vec::with_capacity(hashes.len());
+    for h in hashes {
+        let bytes = store
+            .get(h)?
+            .ok_or_else(|| anyhow!("object {} missing from the local store", h.to_hex()))?;
+        out.push(ObjectUploadRequest {
+            hash: h.to_hex(),
+            kind: sniff_kind(&bytes).to_string(),
+            body: STANDARD.encode(&bytes),
+        });
+    }
+    Ok(out)
+}
+
+/// Determine an object's kind by structural sniffing (`Commit`, then `Tree`, else `blob`) — the
+/// same disjoint-required-fields heuristic `wonton_sync::push` uses (the wire format doesn't
+/// self-describe its kind).
+fn sniff_kind(bytes: &[u8]) -> &'static str {
+    if Commit::from_bytes(bytes).is_ok() {
+        "commit"
+    } else if Tree::from_bytes(bytes).is_ok() {
+        "tree"
+    } else {
+        "blob"
+    }
+}
+
+/// The stored/wire string for a [`Role`], for user-facing confirmation messages.
+fn role_label(role: Role) -> &'static str {
+    match role {
+        Role::Admin => "admin",
+        Role::Writer => "writer",
+        Role::Reader => "reader",
+    }
 }
 
 /// Render a [`WorkingSet`] as dotenv (`KEY=value` per line). Values containing whitespace / `=` /

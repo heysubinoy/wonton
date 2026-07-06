@@ -17,7 +17,8 @@ use base64::Engine;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use wonton_crypto::{
-    generate_dek, generate_identity, verify, wrap_dek, PublicIdentity, WrappedPrivateKey,
+    generate_dek, generate_identity, unlock, unwrap_dek, verify, wrap_dek, PublicIdentity,
+    SealedDek, WrappedPrivateKey,
 };
 
 use super::client::{self, ClientError};
@@ -254,6 +255,74 @@ async fn malformed_line_errors_that_request_but_keeps_connection_alive() {
     let mut line2 = String::new();
     reader.read_line(&mut line2).await.unwrap();
     assert!(line2.contains("\"result\":\"Pong\""), "got: {line2}");
+}
+
+#[tokio::test]
+async fn generate_and_wrap_dek_round_trips_to_a_recipient() {
+    let path = spawn_daemon().await;
+    let _public = do_login(&path).await;
+
+    // Stage a fresh DEK in the agent under a context.
+    let ctx = "acme/dev".to_string();
+    client::generate_dek(&path, ctx.clone()).await.expect("generate dek");
+    // Status shows the context is now cached.
+    let status = client::status(&path).await.unwrap();
+    assert!(status.cached_contexts.contains(&ctx));
+
+    // A separate recipient identity; ask the agent to wrap the staged DEK for its X25519 pubkey.
+    let (recipient_public, recipient_wrapped) = generate_identity(b"recipient pass");
+    let sealed_b64 = client::wrap_dek_for_recipient(
+        &path,
+        ctx.clone(),
+        STANDARD.encode(recipient_public.x25519_pubkey),
+    )
+    .await
+    .expect("wrap for recipient");
+
+    // The sealed box the agent returned must actually open for the intended recipient — proving
+    // the agent wrapped the real cached DEK for the right key, and that only the sealed box (not
+    // the raw DEK) crossed the socket.
+    let recipient = unlock(&recipient_wrapped, b"recipient pass").unwrap();
+    let sealed = SealedDek(STANDARD.decode(&sealed_b64).unwrap());
+    unwrap_dek(&sealed, &recipient).expect("recipient can open the sealed box");
+}
+
+#[tokio::test]
+async fn wrap_dek_without_a_cached_dek_fails_closed() {
+    let path = spawn_daemon().await;
+    let _public = do_login(&path).await;
+
+    let (recipient_public, _w) = generate_identity(b"r");
+    let err = client::wrap_dek_for_recipient(
+        &path,
+        "never-generated".to_string(),
+        STANDARD.encode(recipient_public.x25519_pubkey),
+    )
+    .await
+    .expect_err("no cached DEK for this context");
+    assert!(matches!(err, ClientError::Agent(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn wrap_dek_with_a_malformed_recipient_pubkey_fails_closed() {
+    let path = spawn_daemon().await;
+    let _public = do_login(&path).await;
+    client::generate_dek(&path, "ctx".to_string()).await.unwrap();
+
+    // A too-short recipient pubkey (not 32 bytes) must fail closed, never panic.
+    let err = client::wrap_dek_for_recipient(&path, "ctx".to_string(), STANDARD.encode([0u8; 10]))
+        .await
+        .expect_err("malformed recipient pubkey");
+    assert!(matches!(err, ClientError::Agent(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn generate_dek_before_login_fails_closed() {
+    let path = spawn_daemon().await;
+    let err = client::generate_dek(&path, "ctx".to_string())
+        .await
+        .expect_err("generate_dek requires an unlocked identity");
+    assert!(matches!(err, ClientError::Agent(_)), "got {err:?}");
 }
 
 #[tokio::test]
