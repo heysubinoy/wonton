@@ -1,17 +1,21 @@
 <div align="center">
+  <img src="assets/wonton-solo.png" alt="" width="140">
 
-# Wonton
+  <h1>Wonton</h1>
 
-**A zero-knowledge, git-like secrets manager.**
+  <p><strong>A zero-knowledge, git-like secrets manager.</strong></p>
 
-Version, diff, branch, and merge your environment variables the way you do source code —
-except every value is end-to-end encrypted, and the server that stores and syncs your history
-never holds a key that can read it.
+  <p>
+    Version, diff, branch, and merge your environment variables the way you do source code —
+    except every value is end-to-end encrypted, and the server that stores and syncs your
+    history never holds a key that can read it.
+  </p>
 
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org)
-[![Crypto](https://img.shields.io/badge/crypto-XChaCha20--Poly1305%20%C2%B7%20X25519%20%C2%B7%20Ed25519%20%C2%B7%20Argon2id-informational.svg)](#how-it-works)
-
+  <p>
+    <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License: MIT OR Apache-2.0"></a>
+    <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-2021%20edition-orange.svg" alt="Rust 2021 edition"></a>
+    <a href="#how-it-works"><img src="https://img.shields.io/badge/crypto-XChaCha20--Poly1305%20%C2%B7%20X25519%20%C2%B7%20Ed25519%20%C2%B7%20Argon2id-informational.svg" alt="Crypto: XChaCha20-Poly1305, X25519, Ed25519, Argon2id"></a>
+  </p>
 </div>
 
 ---
@@ -36,6 +40,7 @@ $ wonton run -- ./start-server
 - [Security model](#security-model)
 - [Status](#status)
 - [Testing](#testing)
+- [Branding](#branding)
 - [License](#license)
 
 ## Why
@@ -217,6 +222,13 @@ cargo test --workspace          # or: cargo nextest run --workspace
 cargo clippy --workspace --all-targets
 cargo audit
 ```
+
+## Branding
+
+Logo assets live in [`assets/`](assets/): `wonton-solo.png` is the icon alone on a transparent
+background (what's used above, and the one to reach for on a dark or colored surface);
+`wonton.png` is the full lockup with the wordmark and tagline baked in, which reads better as a
+flat social-preview card (GitHub → Settings → Social preview) than embedded inline.
 
 ## License
 
