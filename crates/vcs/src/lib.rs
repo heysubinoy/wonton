@@ -100,6 +100,13 @@ pub enum VcsError {
     #[error(transparent)]
     Crypto(#[from] CryptoError),
 
+    /// A [`ValueEncryptor`]/[`ValueDecryptor`] backed by something other than a local [`Dek`]
+    /// (e.g. an agent connection) failed for a reason outside this crate's own error taxonomy —
+    /// the agent was locked, unreachable, or returned a protocol error. The message is opaque to
+    /// this crate; the concrete adapter's own error type carries the detail.
+    #[error("cipher backend error: {0}")]
+    Cipher(String),
+
     /// A commit hash was walked/requested but no object exists for it in the store.
     #[error("commit not found in store: {0}")]
     CommitNotFound(String),
