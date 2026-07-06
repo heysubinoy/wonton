@@ -295,6 +295,20 @@ impl SyncClient {
         json_response(resp).await
     }
 
+    /// `GET /users/by-id/{user_id}`. The same public identity keys as [`Self::get_user`], looked
+    /// up by server-assigned user id (a commit's `author_id`) instead of username. Unlike
+    /// [`Self::list_members`] (current env membership only), this resolves *any* user's public
+    /// key regardless of their current access — needed to verify a commit authored by someone
+    /// since revoked from the environment. Requires any valid token. 404 (`SyncError::NotFound`)
+    /// if the id is unknown.
+    pub async fn get_user_by_id(&self, user_id: &str) -> Result<UserPublicInfo, SyncError> {
+        let resp = self
+            .authed(self.http.get(self.url(&format!("/users/by-id/{user_id}"))))
+            .send()
+            .await?;
+        json_response(resp).await
+    }
+
     /// `GET /envs/{store}/{env}`. Environment metadata (id + active DEK version). Requires
     /// >= reader.
     pub async fn get_env_details(&self, store: &str, env: &str) -> Result<EnvDetails, SyncError> {
