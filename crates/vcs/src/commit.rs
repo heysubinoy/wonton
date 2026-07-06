@@ -34,7 +34,7 @@ pub fn commit(
     // 1. Encrypt each staged value and store it as a blob; record key -> blob_hash.
     let mut tree = Tree::new();
     for (key, plaintext) in working_set.iter() {
-        let encrypted = enc.encrypt(plaintext);
+        let encrypted = enc.encrypt(plaintext)?;
         // Bridge crypto's `EncryptedValue` to objects' structurally-identical `Blob`.
         let blob = Blob::new(encrypted.nonce, encrypted.ciphertext);
         let blob_bytes = blob.to_bytes()?;

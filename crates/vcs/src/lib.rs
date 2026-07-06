@@ -56,26 +56,30 @@ pub use working_set::WorkingSet;
 /// never hold a raw DEK in its own process (e.g. the CLI, which only talks to `wonton-agent`)
 /// can supply a per-value, agent-backed adapter instead. Implemented for [`Dek`] itself so every
 /// existing offline caller (and every test in this crate) is unaffected.
+///
+/// Fallible (unlike the underlying local `encrypt_value`, which cannot fail): an agent-backed
+/// implementation can fail closed on things a raw `Dek` never could — the agent being locked,
+/// unreachable, or not holding a cached DEK for the requested context.
 pub trait ValueEncryptor {
-    fn encrypt(&self, plaintext: &[u8]) -> EncryptedValue;
+    fn encrypt(&self, plaintext: &[u8]) -> Result<EncryptedValue, VcsError>;
 }
 
-/// Decrypts a single [`EncryptedValue`], failing closed on a bad key/nonce/auth tag. [`diff`] is
-/// generic over this trait for the same reason [`commit`] is generic over [`ValueEncryptor`] —
-/// see its docs.
+/// Decrypts a single [`EncryptedValue`], failing closed on a bad key/nonce/auth tag (or, for an
+/// agent-backed implementation, a locked/unreachable agent). [`diff`] is generic over this trait
+/// for the same reason [`commit`] is generic over [`ValueEncryptor`] — see its docs.
 pub trait ValueDecryptor {
-    fn decrypt(&self, value: &EncryptedValue) -> Result<Vec<u8>, CryptoError>;
+    fn decrypt(&self, value: &EncryptedValue) -> Result<Vec<u8>, VcsError>;
 }
 
 impl ValueEncryptor for Dek {
-    fn encrypt(&self, plaintext: &[u8]) -> EncryptedValue {
-        encrypt_value(self, plaintext)
+    fn encrypt(&self, plaintext: &[u8]) -> Result<EncryptedValue, VcsError> {
+        Ok(encrypt_value(self, plaintext))
     }
 }
 
 impl ValueDecryptor for Dek {
-    fn decrypt(&self, value: &EncryptedValue) -> Result<Vec<u8>, CryptoError> {
-        decrypt_value(self, value)
+    fn decrypt(&self, value: &EncryptedValue) -> Result<Vec<u8>, VcsError> {
+        Ok(decrypt_value(self, value)?)
     }
 }
 
@@ -229,5 +233,5 @@ pub(crate) fn decrypt_blob(
         nonce: blob.nonce,
         ciphertext: blob.ciphertext,
     };
-    Ok(dec.decrypt(&value)?)
+    dec.decrypt(&value)
 }
