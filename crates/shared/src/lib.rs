@@ -68,11 +68,14 @@ pub struct LoginCompleteRequest {
     pub signature: String,
 }
 
-/// `POST /auth/login/complete` response: a bearer token and its unix-seconds expiry.
+/// `POST /auth/login/complete` response: a bearer token, its unix-seconds expiry, and the
+/// server-assigned user id. The `user_id` lets the client look up its own wrapped-DEK entry in
+/// `GET /envs/:store/:env/keys`'s response (a `KeysMap` keyed by user id).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoginCompleteResponse {
     pub token: String,
     pub expires_at: i64,
+    pub user_id: String,
 }
 
 /// `POST /auth/register` request. No authentication required — this *is* the auth bootstrap

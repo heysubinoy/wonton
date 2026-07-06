@@ -155,6 +155,7 @@ pub async fn login_complete(
     Ok(Json(LoginCompleteResponse {
         token,
         expires_at: session_expires,
+        user_id,
     }))
 }
 

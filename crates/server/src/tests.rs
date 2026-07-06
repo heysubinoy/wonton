@@ -584,6 +584,9 @@ async fn login_start_and_complete_round_trip_issues_a_working_token() {
     assert_eq!(status, StatusCode::OK);
     let token = complete["token"].as_str().unwrap().to_string();
     assert!(complete["expires_at"].as_i64().unwrap() > now_unix());
+    // The response carries the server-assigned user id (used by the CLI to find its own
+    // wrapped-DEK entry in the keys map).
+    assert_eq!(complete["user_id"].as_str().unwrap(), user_id);
 
     // The freshly minted token actually authenticates a subsequent request.
     let (status, _) = send_json(&router, "GET", "/stores/acme/envs", Some(&token), None).await;
