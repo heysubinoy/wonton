@@ -15,6 +15,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+toml = "0.8"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 wonton-crypto = { version = "0.1.0", path = "../crypto" }
@@ -22,3 +23,10 @@ wonton-objects = { version = "0.1.0", path = "../objects" }
 wonton-shared = { version = "0.1.0", path = "../shared" }
 wonton-sync = { version = "0.1.0", path = "../sync" }
 wonton-vcs = { version = "0.1.0", path = "../vcs" }
+
+[dev-dependencies]
+# Test-only: stand up a real `wonton-server` (bound to an ephemeral port) so the CLI command
+# logic can be driven end-to-end against a genuine backend, mirroring `wonton-sync`'s own
+# integration tests. Not in `[dependencies]`, so this doesn't widen the shipped CLI graph.
+axum = "0.8.9"
+wonton-server = { version = "0.1.0", path = "../server" }
