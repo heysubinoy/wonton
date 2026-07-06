@@ -247,7 +247,7 @@ async fn commit_advances_tip_and_log_shows_real_author_id() {
     assert_eq!(commit.fields.message, "initial");
 
     // `log` runs and verifies the signature against the identity's own pubkey.
-    commands::log(&fx.config_path, &fx.state_path, "acme-dev").unwrap();
+    commands::log(&fx.config_path, &fx.state_path, "acme-dev").await.unwrap();
 }
 
 /// `diff` between two real commits reports the right Added/Changed keys, and re-committing an
@@ -452,7 +452,7 @@ async fn push_then_fresh_machine_pull_sees_the_same_secrets() {
     assert_eq!(a_tip, b_tip, "machine B should have fast-forwarded to A's tip");
 
     // Machine B can `log` (verify) and decrypt the value via `run`.
-    commands::log(&b.config_path, &b.state_path, "acme-dev").unwrap();
+    commands::log(&b.config_path, &b.state_path, "acme-dev").await.unwrap();
     let out = unique("bpull");
     let out_str = out.to_string_lossy().to_string();
     let code = commands::run(
@@ -823,6 +823,67 @@ async fn share_grants_access_without_re_encryption() {
     let _ = std::fs::remove_file(&out);
 }
 
+/// The bug found by manual end-to-end testing (2026-07-06): `log` used to verify every commit
+/// against the *local caller's own* pubkey, so a second identity reading a history it did not
+/// entirely author itself would fail signature verification on every commit it didn't write —
+/// not because anything was tampered, but because its own key obviously can't verify someone
+/// else's signature. After sharing, Bob's `log` over a history genuinely authored by BOTH Alice
+/// and Bob (each committing in turn) must succeed, resolving each commit against its own author.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn log_verifies_a_history_with_more_than_one_real_author() {
+    let alice = ready_fixture("p5xalice", None, true).await;
+    commands::set(
+        &alice.config_path,
+        &alice.state_path,
+        &alice.socket,
+        "acme-dev",
+        vec![("K".into(), "alice-value".into())],
+    )
+    .await
+    .unwrap();
+    commands::commit(&alice.config_path, &alice.state_path, &alice.socket, "acme-dev", "alice's commit".into())
+        .await
+        .unwrap();
+    commands::push(&alice.config_path, &alice.state_path, "acme-dev").await.unwrap();
+
+    let bob = login_only("p5xbob", &alice.base).await;
+    commands::share(
+        &alice.config_path,
+        &alice.state_path,
+        &alice.socket,
+        "acme-dev",
+        "p5xbob",
+        Role::Writer,
+    )
+    .await
+    .unwrap();
+    commands::context_add(&bob.config_path, "acme-dev", "acme", "dev", "p5xbob").unwrap();
+    commands::use_context(&bob.config_path, &bob.state_path, &bob.socket, "acme-dev")
+        .await
+        .unwrap();
+    commands::pull(&bob.config_path, &bob.state_path, "acme-dev").await.unwrap();
+
+    // Bob commits too, so the history now has two genuinely distinct real authors.
+    commands::set(
+        &bob.config_path,
+        &bob.state_path,
+        &bob.socket,
+        "acme-dev",
+        vec![("K2".into(), "bob-value".into())],
+    )
+    .await
+    .unwrap();
+    commands::commit(&bob.config_path, &bob.state_path, &bob.socket, "acme-dev", "bob's commit".into())
+        .await
+        .unwrap();
+
+    // Both Alice and Bob must be able to verify the full two-author history via `log`.
+    commands::log(&bob.config_path, &bob.state_path, "acme-dev").await.unwrap();
+    commands::push(&bob.config_path, &bob.state_path, "acme-dev").await.unwrap();
+    commands::pull(&alice.config_path, &alice.state_path, "acme-dev").await.unwrap();
+    commands::log(&alice.config_path, &alice.state_path, "acme-dev").await.unwrap();
+}
+
 /// The Phase-5 exit criterion: after `revoke` + the fresh commit that follows, the revoked user's
 /// STALE cached DEK can no longer decrypt a value committed after the revocation (AEAD auth
 /// failure, fail-closed — never garbage).
@@ -938,7 +999,7 @@ async fn key_rotate_alone_advances_tip_and_reencrypts() {
     assert_ne!(h1, h2, "the same plaintext under a fresh DEK+nonce must yield a different blob");
 
     // A remaining member (the owner) can still verify history and decrypt under the new DEK.
-    commands::log(&owner.config_path, &owner.state_path, "acme-dev").unwrap();
+    commands::log(&owner.config_path, &owner.state_path, "acme-dev").await.unwrap();
     let out = unique("rotateout");
     let out_str = out.to_string_lossy().to_string();
     let code = commands::run(
@@ -1031,7 +1092,7 @@ async fn merge_with_no_conflicts_produces_a_two_parent_commit() {
     assert!(commit.fields.parent_hashes.contains(&main_tip_before));
 
     // `wonton log`'s Phase 5b mainline-follow fix must walk past the merge commit without error.
-    commands::log(&owner.config_path, &owner.state_path, "acme-dev").unwrap();
+    commands::log(&owner.config_path, &owner.state_path, "acme-dev").await.unwrap();
 
     assert_eq!(read_via_run(&owner, "ROOT").await, "root-value");
     assert_eq!(read_via_run(&owner, "MAIN_KEY").await, "main-value");
@@ -1119,7 +1180,7 @@ async fn merge_conflict_pauses_with_hash_only_state_then_continue_resolves() {
     let store = open_object_store(&object_store_dir_for(&owner.state_path)).unwrap();
     let commit = Commit::from_bytes(&store.get(&merged_tip).unwrap().unwrap()).unwrap();
     assert_eq!(commit.fields.parent_hashes.len(), 2);
-    commands::log(&owner.config_path, &owner.state_path, "acme-dev").unwrap();
+    commands::log(&owner.config_path, &owner.state_path, "acme-dev").await.unwrap();
 
     assert_eq!(read_via_run(&owner, "KEY").await, "main-value", "resolved to ours (main-value)");
 }

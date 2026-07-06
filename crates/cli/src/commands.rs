@@ -13,7 +13,7 @@
 //! framing internally, so the CLI never re-derives it in two places — register builds the blob,
 //! login forwards whatever the server hands back unchanged.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::Path;
 
@@ -570,9 +570,14 @@ pub async fn commit(
     Ok(())
 }
 
-/// `wonton log` — verified first-parent history from the current tip. No cipher needed
-/// (signature-only verification against this identity's own pubkey).
-pub fn log(config_path: &Path, state_path: &Path, ctx_name: &str) -> anyhow::Result<()> {
+/// `wonton log` — verified first-parent history from the current tip. Resolves each commit's
+/// expected signer by its own `author_id` rather than assuming the local caller's own identity
+/// authored the whole history: a history shared with (or received from) another user contains
+/// commits authored by *their* identity too, and those must verify against *their* pubkey, not
+/// ours (found by manual end-to-end testing — see PROGRESS.md). Author pubkeys are resolved via
+/// the server's global user directory (`get_user_by_id`), not just current env membership, so a
+/// since-revoked member's past commits remain verifiable.
+pub async fn log(config_path: &Path, state_path: &Path, ctx_name: &str) -> anyhow::Result<()> {
     let config = Config::load_from(config_path)?;
     let ctx = config
         .find_context(ctx_name)
@@ -592,9 +597,19 @@ pub fn log(config_path: &Path, state_path: &Path, ctx_name: &str) -> anyhow::Res
         }
     };
 
-    let pubkey = decode_ed25519_pubkey(&identity.ed25519_pubkey_b64)?;
     let store = open_object_store(&object_store_dir_for(state_path))?;
-    let history = wonton_vcs::log(&store, tip, &pubkey)?;
+    let author_ids = wonton_vcs::mainline_author_ids(&store, tip)?;
+    let client = authed_client(identity);
+    let mut signers: HashMap<Uuid, [u8; 32]> = HashMap::new();
+    for author_id in author_ids {
+        let info = client
+            .get_user_by_id(&author_id.to_string())
+            .await
+            .with_context(|| format!("could not resolve public key for commit author {author_id}"))?;
+        signers.insert(author_id, decode_ed25519_pubkey(&info.ed25519_pubkey)?);
+    }
+
+    let history = wonton_vcs::log(&store, tip, |author_id| signers.get(&author_id).copied())?;
     for vc in &history {
         println!("commit {}", vc.hash.to_hex());
         println!("  author:  {}", vc.commit.fields.author_id);

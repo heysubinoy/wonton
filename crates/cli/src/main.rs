@@ -259,7 +259,7 @@ async fn main() -> anyhow::Result<()> {
             let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
             let ctx = resolve_ctx()?;
-            commands::log(&config_path, &state_path, &ctx)
+            commands::log(&config_path, &state_path, &ctx).await
         }
         Command::Diff { a, b } => {
             let config_path = config::default_config_path()?;
