@@ -29,7 +29,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 use wonton_crypto::{generate_dek, generate_identity, sign, unlock, Dek, UnlockedIdentity};
-use wonton_objects::{Hash, LocalObjectStore};
+use wonton_objects::{Commit, Hash, LocalObjectStore};
 use wonton_shared::{
     Argon2ParamsDto, CreateEnvRequest, CreateStoreRequest, LoginCompleteRequest, LoginStartRequest,
     RefConflict, RegisterRequest,
@@ -259,6 +259,72 @@ async fn fetch_object_rejects_content_hash_mismatch() {
         }
         other => panic!("expected IntegrityMismatch, got {other:?}"),
     }
+}
+
+/// A server that silently *drops* a referenced object (as opposed to serving a poisoned body,
+/// which `fetch_object_rejects_content_hash_mismatch` covers) must not let a second client
+/// clone a truncated history. Here we push a real 3-commit history, delete the MIDDLE commit's
+/// tree object directly from the server DB, then have a fresh client `pull`: the walk reaches
+/// the dropped object and must fail closed with a clear error (a `NotFound`), never a crash and
+/// never a silently-incomplete clone.
+///
+/// The middle commit's tree is chosen deliberately: each commit changes a distinct key, so its
+/// tree is a unique object that is *not* re-fetched earlier in the tip-first walk (unlike a
+/// shared blob, which the tip's tree would already have pulled in).
+#[tokio::test]
+async fn pull_fails_closed_when_server_drops_a_referenced_object() {
+    let (base, pool, _db) = start_server().await;
+    let user_id = seed_user(&pool, "alice", &[1u8; 32]).await;
+    let store_id = seed_store(&pool, "acme").await;
+    let env_id = seed_env(&pool, &store_id, "dev").await;
+    seed_member(&pool, &env_id, &user_id, "writer").await;
+    let token = seed_session(&pool, &user_id).await;
+
+    let mut client = SyncClient::new(base);
+    client.set_token(token);
+
+    // Build root <- middle <- tip, each commit adding a distinct key (=> a distinct tree).
+    let src = temp_store();
+    let identity = new_identity();
+    let dek = new_dek();
+    let mut ws = WorkingSet::new();
+    ws.set("A", b"1".to_vec());
+    let root = commit(&src.store, &dek, &identity, author_id_from_identity(identity.public()), None, &ws, "root").unwrap();
+    ws.set("B", b"2".to_vec());
+    let middle = commit(&src.store, &dek, &identity, author_id_from_identity(identity.public()), Some(root), &ws, "middle").unwrap();
+    ws.set("C", b"3".to_vec());
+    let tip = commit(&src.store, &dek, &identity, author_id_from_identity(identity.public()), Some(middle), &ws, "tip").unwrap();
+
+    let objects = all_object_hashes(&src.root);
+    push(&client, &src.store, "acme", "dev", "main", &objects, None, tip)
+        .await
+        .unwrap();
+
+    // Find the middle commit's (unique) tree object and drop it from the server, simulating a
+    // server that has silently lost an object it should still be serving.
+    let middle_bytes = src.store.get(&middle).unwrap().unwrap();
+    let middle_tree = Commit::from_bytes(&middle_bytes).unwrap().fields.tree_hash;
+    let deleted = sqlx::query("DELETE FROM objects WHERE hash = ?")
+        .bind(middle_tree.to_hex())
+        .execute(&pool)
+        .await
+        .unwrap()
+        .rows_affected();
+    assert_eq!(deleted, 1, "the middle commit's tree must have been present to delete");
+
+    // A fresh client cloning the branch must fail closed when the walk reaches the dropped
+    // object, not accept a truncated history.
+    let dst = temp_store();
+    let err = pull(&client, &dst.store, "acme", "dev", "main", None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, SyncError::NotFound(_)),
+        "expected a clean NotFound when the server drops a referenced object, got {err:?}"
+    );
+
+    // The dropped object never materialized in the destination store.
+    assert!(dst.store.get(&middle_tree).unwrap().is_none());
 }
 
 /// A multi-commit history built in one store, pushed, then pulled into a second empty store
