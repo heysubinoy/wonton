@@ -13,9 +13,11 @@ use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use wonton_objects::Hash;
 use wonton_shared::{
-    EnvSummary, GrantKeyRequest, KeysMap, LoginCompleteRequest, LoginCompleteResponse,
-    LoginStartRequest, LoginStartResponse, MachineTokenRequest, MachineTokenResponse,
-    MemberRequest, ObjectUploadRequest, RefConflict, RefMap, RefMoveRequest, RotateRequest,
+    CreateEnvRequest, CreateEnvResponse, CreateStoreRequest, CreateStoreResponse, EnvSummary,
+    GrantKeyRequest, KeysMap, LoginCompleteRequest, LoginCompleteResponse, LoginStartRequest,
+    LoginStartResponse, MachineTokenRequest, MachineTokenResponse, MemberRequest,
+    ObjectUploadRequest, RefConflict, RefMap, RefMoveRequest, RegisterRequest, RegisterResponse,
+    RotateRequest,
 };
 
 use crate::error::SyncError;
@@ -81,6 +83,20 @@ impl SyncClient {
 
     // ---- Auth (no token required) -----------------------------------------------------
 
+    /// `POST /auth/register`. No authentication — this *is* the auth bootstrap (like any signup
+    /// endpoint). The caller must have already run `wonton_crypto::generate_identity` locally and
+    /// filled `req` with the public keys + opaque wrapped-privkey blob; this method only
+    /// transports them. Returns the server-assigned user id. 409 if the username is taken.
+    pub async fn register(&self, req: &RegisterRequest) -> Result<RegisterResponse, SyncError> {
+        let resp = self
+            .http
+            .post(self.url("/auth/register"))
+            .json(req)
+            .send()
+            .await?;
+        json_response(resp).await
+    }
+
     /// `POST /auth/login/start`. Returns the (ciphertext) wrapped private key, Argon2id params,
     /// and a challenge nonce. All non-secret. 404 if the username is unknown.
     pub async fn login_start(
@@ -133,6 +149,38 @@ impl SyncClient {
     pub async fn list_envs(&self, store: &str) -> Result<Vec<EnvSummary>, SyncError> {
         let resp = self
             .authed(self.http.get(self.url(&format!("/stores/{store}/envs"))))
+            .send()
+            .await?;
+        json_response(resp).await
+    }
+
+    /// `POST /stores`. Create a store. Requires any valid token (no store-level ownership in the
+    /// schema — access control is per-environment via `env_members`). 409 on a duplicate name.
+    pub async fn create_store(
+        &self,
+        req: &CreateStoreRequest,
+    ) -> Result<CreateStoreResponse, SyncError> {
+        let resp = self
+            .authed(self.http.post(self.url("/stores")).json(req))
+            .send()
+            .await?;
+        json_response(resp).await
+    }
+
+    /// `POST /stores/{store}/envs`. Create an environment inside a store; the creating actor is
+    /// made its first `admin` member server-side. Requires any valid token. 404 if the store is
+    /// unknown, 409 if the env name already exists in that store.
+    pub async fn create_env(
+        &self,
+        store: &str,
+        req: &CreateEnvRequest,
+    ) -> Result<CreateEnvResponse, SyncError> {
+        let resp = self
+            .authed(
+                self.http
+                    .post(self.url(&format!("/stores/{store}/envs")))
+                    .json(req),
+            )
             .send()
             .await?;
         json_response(resp).await

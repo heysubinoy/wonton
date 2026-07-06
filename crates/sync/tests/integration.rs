@@ -28,9 +28,12 @@ use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use sqlx::SqlitePool;
 use uuid::Uuid;
-use wonton_crypto::{generate_dek, generate_identity, unlock, Dek, UnlockedIdentity};
+use wonton_crypto::{generate_dek, generate_identity, sign, unlock, Dek, UnlockedIdentity};
 use wonton_objects::{Hash, LocalObjectStore};
-use wonton_shared::{LoginCompleteRequest, LoginStartRequest, RefConflict};
+use wonton_shared::{
+    Argon2ParamsDto, CreateEnvRequest, CreateStoreRequest, LoginCompleteRequest, LoginStartRequest,
+    RefConflict, RegisterRequest,
+};
 use wonton_sync::{pull, push, PullOutcome, SyncClient, SyncError};
 use wonton_vcs::{commit, WorkingSet};
 
@@ -495,6 +498,93 @@ async fn rbac_and_auth_errors_are_surfaced() {
     let none = SyncClient::new(base);
     let err = none.get_refs("acme", "dev").await.unwrap_err();
     assert!(matches!(err, SyncError::Unauthorized), "expected Unauthorized, got {err:?}");
+}
+
+/// The provisioning trio (`register` + `create_store` + `create_env`): a brand-new user
+/// registers, logs in with the two-step flow, then creates a store and an environment (becoming
+/// its admin). Exercises all three new `SyncClient` methods end-to-end against a real server.
+#[tokio::test]
+async fn register_login_and_provision_store_and_env() {
+    let (base, _pool, _db) = start_server().await;
+    let client = SyncClient::new(base);
+
+    // Register a fresh identity (client generates it locally, per the wire framing convention).
+    let (public, wrapped) = generate_identity(b"provision-pass");
+    let mut blob = wrapped.nonce.to_vec();
+    blob.extend_from_slice(&wrapped.ciphertext);
+    let reg = client
+        .register(&RegisterRequest {
+            username: "provisioner".to_string(),
+            ed25519_pubkey: STANDARD.encode(public.ed25519_pubkey),
+            x25519_pubkey: STANDARD.encode(public.x25519_pubkey),
+            wrapped_privkey: STANDARD.encode(&blob),
+            argon2_params: Argon2ParamsDto {
+                salt: STANDARD.encode(wrapped.argon2_params.salt),
+                m_cost_kib: wrapped.argon2_params.m_cost_kib,
+                t_cost: wrapped.argon2_params.t_cost,
+                p_cost: wrapped.argon2_params.p_cost,
+            },
+        })
+        .await
+        .unwrap();
+    assert!(!reg.user_id.is_empty());
+
+    // Log in to get a bearer token (needed for create_store / create_env).
+    let start = client
+        .login_start(&LoginStartRequest {
+            username: "provisioner".to_string(),
+        })
+        .await
+        .unwrap();
+    let nonce = STANDARD.decode(&start.challenge_nonce).unwrap();
+    let identity = unlock(&wrapped, b"provision-pass").unwrap();
+    let signature = sign(&identity, &nonce);
+    let complete = client
+        .login_complete(&LoginCompleteRequest {
+            username: "provisioner".to_string(),
+            challenge_nonce: start.challenge_nonce.clone(),
+            signature: STANDARD.encode(signature),
+        })
+        .await
+        .unwrap();
+    assert_eq!(complete.user_id, reg.user_id);
+
+    let mut client = client;
+    client.set_token(complete.token);
+
+    // Create a store, then an environment inside it.
+    let store = client
+        .create_store(&CreateStoreRequest {
+            name: "provisioned-store".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(!store.store_id.is_empty());
+    let env = client
+        .create_env(
+            "provisioned-store",
+            &CreateEnvRequest {
+                name: "prod".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!env.env_id.is_empty());
+
+    // The creator is admin of the new env, so it shows up in their env listing with that role.
+    let envs = client.list_envs("provisioned-store").await.unwrap();
+    assert_eq!(envs.len(), 1);
+    assert_eq!(envs[0].name, "prod");
+    assert_eq!(envs[0].role, wonton_shared::Role::Admin);
+
+    // A duplicate store name is a clean conflict, not a crash.
+    let err = client
+        .create_store(&CreateStoreRequest {
+            name: "provisioned-store".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SyncError::ServerError(_, _) | SyncError::Conflict(_)));
 }
 
 /// The two-step login round-trip: the client transports a nonce + externally-computed Ed25519
