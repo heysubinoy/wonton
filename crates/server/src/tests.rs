@@ -19,7 +19,7 @@ use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -982,4 +982,80 @@ async fn admin_can_do_everything() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// A rotation that fails partway through its transaction must apply **nothing** — the whole
+/// batch (new objects + wrapped-DEK map + active-version bump) is one all-or-nothing `sqlx`
+/// transaction. We force a failure by making the *second* wrapped-DEK entry reference a
+/// `user_id` that does not exist: `wrapped_deks.user_id REFERENCES users(id)` with foreign-key
+/// enforcement on (see `test_pool`), so that INSERT raises a constraint violation *after* the
+/// batch object and the first (valid) wrapped-DEK row have already been written inside the same
+/// transaction. The rollback must undo all of it.
+#[tokio::test]
+async fn rotation_that_fails_partway_rolls_back_the_whole_batch() {
+    let pool = test_pool().await;
+    let admin_id = seed_user(&pool, "admin", &[1u8; 32], &[2u8; 32]).await;
+    let store_id = seed_store(&pool, "acme").await;
+    let env_id = seed_env(&pool, &store_id, "dev").await;
+    seed_member(&pool, &env_id, &admin_id, "admin").await;
+    let admin_token = seed_session(&pool, &admin_id, now_unix() + 3600).await;
+    // Keep a handle to the pool so we can inspect the DB after the request; the router owns a
+    // clone.
+    let router = build_router(pool.clone());
+
+    // A brand-new object the batch would insert first. Its hash is not present beforehand, so if
+    // it survives the failed rotation we know the object insert was not rolled back.
+    let batch_content = b"rotation-batch-object-that-must-not-persist";
+    let batch_hash = Hash::of(batch_content).to_hex();
+
+    let (status, _) = send_json(
+        &router,
+        "POST",
+        "/envs/acme/dev/rotate",
+        Some(&admin_token),
+        Some(json!({
+            "new_dek_version": 2,
+            "objects": [object_upload_body("blob", batch_content)],
+            "wrapped_deks": [
+                // First entry is valid (references the real admin user) and is written inside
+                // the transaction before the failing one.
+                { "user_id": admin_id, "dek_version": 2, "sealed_box": STANDARD.encode(b"valid-sealed") },
+                // Second entry references a user that does not exist -> FK violation, mid-tx.
+                { "user_id": "00000000-0000-0000-0000-000000000000", "dek_version": 2, "sealed_box": STANDARD.encode(b"orphan-sealed") },
+            ],
+        })),
+    )
+    .await;
+    // The rotation did not succeed. (The constraint violation surfaces as a 500; the point of
+    // the test is the atomicity that follows, not the exact status.)
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // 1. The env's active DEK version never moved off its original value of 1.
+    let version: i64 = sqlx::query("SELECT active_dek_version FROM environments WHERE id = ?")
+        .bind(&env_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("active_dek_version");
+    assert_eq!(version, 1, "active_dek_version must not move on a failed rotation");
+
+    // 2. No wrapped-DEK row for the env survived — not even the first, valid one.
+    let dek_rows: i64 = sqlx::query("SELECT COUNT(*) AS n FROM wrapped_deks WHERE env_id = ?")
+        .bind(&env_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("n");
+    assert_eq!(dek_rows, 0, "no wrapped-DEK row may survive a rolled-back rotation");
+
+    // 3. The batch's new object was not persisted, so it can never be confused with committed
+    //    state on a later read.
+    let obj_rows: i64 = sqlx::query("SELECT COUNT(*) AS n FROM objects WHERE hash = ?")
+        .bind(&batch_hash)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("n");
+    assert_eq!(obj_rows, 0, "no batch object may survive a rolled-back rotation");
 }
