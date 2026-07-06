@@ -4,10 +4,9 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
-use wonton_crypto::Dek;
 use wonton_objects::{Hash, LocalObjectStore};
 
-use crate::{decrypt_blob, load_tree_of_commit, VcsError};
+use crate::{decrypt_blob, load_tree_of_commit, ValueDecryptor, VcsError};
 
 /// One key-level difference between two commits. Carries only the (plaintext) key name, which
 /// is fine because key names are plaintext metadata by design (PLAN.md §16 decision).
@@ -42,7 +41,7 @@ pub enum DiffEntry {
 ///   Treating hash inequality alone as "changed" would wrongly flag values nobody touched.
 pub fn diff(
     store: &LocalObjectStore,
-    dek: &Dek,
+    dec: &impl ValueDecryptor,
     from: Option<Hash>,
     to: Hash,
 ) -> Result<Vec<DiffEntry>, VcsError> {
@@ -71,8 +70,8 @@ pub fn diff(
                 }
                 // Different blob hash is NOT proof of change: decrypt both and compare
                 // plaintext (PLAN.md §6, "Never a byte diff of ciphertext").
-                let from_plain = decrypt_blob(store, dek, from_hash)?;
-                let to_plain = decrypt_blob(store, dek, to_hash)?;
+                let from_plain = decrypt_blob(store, dec, from_hash)?;
+                let to_plain = decrypt_blob(store, dec, to_hash)?;
                 if from_plain != to_plain {
                     entries.push(DiffEntry::Changed(key.clone()));
                 }

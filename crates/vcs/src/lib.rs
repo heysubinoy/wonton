@@ -43,13 +43,41 @@ mod testutil;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
-use wonton_crypto::{decrypt_value, verify, CryptoError, EncryptedValue, PublicIdentity};
+use wonton_crypto::{decrypt_value, encrypt_value, verify, CryptoError, Dek, EncryptedValue, PublicIdentity};
 use wonton_objects::{Blob, Commit, Hash, LocalObjectStore, ObjectError, Tree};
 
 pub use commit::commit;
 pub use diff::{diff, DiffEntry};
 pub use log::{log, VerifiedCommit};
 pub use working_set::WorkingSet;
+
+/// Encrypts a single plaintext value into an [`EncryptedValue`] with a fresh nonce. [`commit`]
+/// is generic over this trait rather than taking a raw [`Dek`] directly, so a caller that must
+/// never hold a raw DEK in its own process (e.g. the CLI, which only talks to `wonton-agent`)
+/// can supply a per-value, agent-backed adapter instead. Implemented for [`Dek`] itself so every
+/// existing offline caller (and every test in this crate) is unaffected.
+pub trait ValueEncryptor {
+    fn encrypt(&self, plaintext: &[u8]) -> EncryptedValue;
+}
+
+/// Decrypts a single [`EncryptedValue`], failing closed on a bad key/nonce/auth tag. [`diff`] is
+/// generic over this trait for the same reason [`commit`] is generic over [`ValueEncryptor`] —
+/// see its docs.
+pub trait ValueDecryptor {
+    fn decrypt(&self, value: &EncryptedValue) -> Result<Vec<u8>, CryptoError>;
+}
+
+impl ValueEncryptor for Dek {
+    fn encrypt(&self, plaintext: &[u8]) -> EncryptedValue {
+        encrypt_value(self, plaintext)
+    }
+}
+
+impl ValueDecryptor for Dek {
+    fn decrypt(&self, value: &EncryptedValue) -> Result<Vec<u8>, CryptoError> {
+        decrypt_value(self, value)
+    }
+}
 
 /// Errors from every fallible path in this crate. Wraps the underlying [`ObjectError`] and
 /// [`CryptoError`] (so a corrupted/tampered object on disk or a failed decrypt/verify
@@ -184,13 +212,13 @@ pub(crate) fn load_tree_of_commit(
     Ok(Tree::from_bytes(&bytes)?)
 }
 
-/// Fetch a blob by hash and decrypt it under `dek`, bridging `wonton-objects`'s [`Blob`]
+/// Fetch a blob by hash and decrypt it via `dec`, bridging `wonton-objects`'s [`Blob`]
 /// (nonce + ciphertext) to `wonton-crypto`'s structurally-identical [`EncryptedValue`]. Fails
 /// closed on a missing blob, on-disk tampering (`store.get` re-verifies the hash), or an AEAD
 /// authentication failure.
 pub(crate) fn decrypt_blob(
     store: &LocalObjectStore,
-    dek: &wonton_crypto::Dek,
+    dec: &impl ValueDecryptor,
     blob_hash: &Hash,
 ) -> Result<Vec<u8>, VcsError> {
     let bytes = store
@@ -201,5 +229,5 @@ pub(crate) fn decrypt_blob(
         nonce: blob.nonce,
         ciphertext: blob.ciphertext,
     };
-    Ok(decrypt_value(dek, &value)?)
+    Ok(dec.decrypt(&value)?)
 }

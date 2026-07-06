@@ -2,17 +2,17 @@
 //! environment DEK, build and store the blob/tree/commit objects, and sign the commit with
 //! the author's Ed25519 key. Entirely offline and client-side.
 
-use wonton_crypto::{encrypt_value, sign, Dek, UnlockedIdentity};
+use wonton_crypto::{sign, UnlockedIdentity};
 use wonton_objects::{Blob, Commit, CommitFields, Hash, LocalObjectStore, Tree};
 
-use crate::{author_id_from_identity, current_unix_seconds, VcsError, WorkingSet};
+use crate::{author_id_from_identity, current_unix_seconds, ValueEncryptor, VcsError, WorkingSet};
 
 /// Create a signed, content-addressed commit from a staged [`WorkingSet`] and return its
 /// [`Hash`].
 ///
 /// Steps (PLAN.md §6):
-/// 1. Encrypt every staged value under `dek` with a fresh random nonce ([`encrypt_value`]),
-///    wrap each as a [`Blob`], hash it, and `put` it into `store`.
+/// 1. Encrypt every staged value via `enc` (a fresh random nonce per value), wrap each as a
+///    [`Blob`], hash it, and `put` it into `store`.
 /// 2. Build a [`Tree`] mapping each (plaintext) key name to its blob hash; hash and `put` it.
 /// 3. Build [`CommitFields`] — the new tree hash, `parent`'s hash as `parent_hashes` (`None`
 ///    ⇒ a 0-parent root commit), the author id derived from `identity`
@@ -25,7 +25,7 @@ use crate::{author_id_from_identity, current_unix_seconds, VcsError, WorkingSet}
 /// stored (PLAN.md §2).
 pub fn commit(
     store: &LocalObjectStore,
-    dek: &Dek,
+    enc: &impl ValueEncryptor,
     identity: &UnlockedIdentity,
     parent: Option<Hash>,
     working_set: &WorkingSet,
@@ -34,7 +34,7 @@ pub fn commit(
     // 1. Encrypt each staged value and store it as a blob; record key -> blob_hash.
     let mut tree = Tree::new();
     for (key, plaintext) in working_set.iter() {
-        let encrypted = encrypt_value(dek, plaintext);
+        let encrypted = enc.encrypt(plaintext);
         // Bridge crypto's `EncryptedValue` to objects' structurally-identical `Blob`.
         let blob = Blob::new(encrypted.nonce, encrypted.ciphertext);
         let blob_bytes = blob.to_bytes()?;
