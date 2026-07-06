@@ -100,6 +100,7 @@ pub fn build_router(pool: SqlitePool) -> Router {
         )
         // User directory (any valid token — public keys, gated only to avoid enumeration)
         .route("/users/{username}", get(handlers::get_user))
+        .route("/users/by-id/{user_id}", get(handlers::get_user_by_id))
         // Objects (content-addressed; any valid token — see PROGRESS.md re: no per-object env
         // scoping in this phase)
         .route("/objects/{hash}", get(handlers::get_object))

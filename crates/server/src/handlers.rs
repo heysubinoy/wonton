@@ -405,6 +405,32 @@ pub async fn get_user(
     }))
 }
 
+/// `GET /users/by-id/:user_id` — the same public identity keys as [`get_user`], looked up by the
+/// server-assigned user id (a commit's `author_id`) rather than by username. Needed so a client
+/// can verify a shared/multi-author commit history: `list_members` only reflects *current* env
+/// membership, but a commit's author remains verifiable by their (permanent, global) public key
+/// even after they lose access to that particular environment. Requires any valid token; a
+/// user's public keys are not secret (same trust level as `get_user`).
+pub async fn get_user_by_id(
+    State(st): State<AppState>,
+    _actor: Actor,
+    Path(user_id): Path<String>,
+) -> Result<Json<UserPublicInfo>, ApiError> {
+    let row = sqlx::query("SELECT id, ed25519_pubkey, x25519_pubkey FROM users WHERE id = ?")
+        .bind(&user_id)
+        .fetch_optional(&st.pool)
+        .await?
+        .ok_or(ApiError::NotFound("user"))?;
+    let user_id: String = row.get("id");
+    let ed: Vec<u8> = row.get("ed25519_pubkey");
+    let x: Vec<u8> = row.get("x25519_pubkey");
+    Ok(Json(UserPublicInfo {
+        user_id,
+        ed25519_pubkey: STANDARD.encode(ed),
+        x25519_pubkey: STANDARD.encode(x),
+    }))
+}
+
 // ---- Objects --------------------------------------------------------------------------
 
 /// `GET /objects/:hash` — opaque bytes, 404 if absent. Any valid token (no per-object env

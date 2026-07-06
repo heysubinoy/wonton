@@ -375,6 +375,48 @@ async fn get_user_returns_public_keys_and_404s_for_unknown() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+/// `GET /users/by-id/:user_id` resolves the same public keys as `GET /users/:username`, but by
+/// server-assigned id — needed so a client can verify a commit's `author_id` even for a user who
+/// is no longer a member of the environment that commit lives in.
+#[tokio::test]
+async fn get_user_by_id_returns_public_keys_and_404s_for_unknown() {
+    let pool = test_pool().await;
+    let ed = [9u8; 32];
+    let x = [10u8; 32];
+    let user_id = seed_user(&pool, "alice", &ed, &x).await;
+    let caller_id = seed_user(&pool, "caller", &[1u8; 32], &[2u8; 32]).await;
+    let token = seed_session(&pool, &caller_id, now_unix() + 3600).await;
+    let router = build_router(pool);
+
+    let (status, body) = send_json(
+        &router,
+        "GET",
+        &format!("/users/by-id/{user_id}"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user_id"].as_str().unwrap(), user_id);
+    assert_eq!(body["ed25519_pubkey"], json!(STANDARD.encode(ed)));
+    assert_eq!(body["x25519_pubkey"], json!(STANDARD.encode(x)));
+
+    // Unknown id -> 404.
+    let (status, _) = send_json(
+        &router,
+        "GET",
+        "/users/by-id/00000000-0000-0000-0000-000000000000",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Unauthenticated -> 401.
+    let (status, _) = send_json(&router, "GET", &format!("/users/by-id/{user_id}"), None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn get_env_details_returns_active_version_for_a_reader_and_403s_for_non_members() {
     let pool = test_pool().await;
