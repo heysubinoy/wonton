@@ -30,8 +30,10 @@ impl core::fmt::Debug for VerifiedCommit {
     }
 }
 
-/// Walk the first-parent chain from `tip` back to the root, verifying every commit, and
-/// return the verified commits **tip-first** (index 0 is `tip`, the last element is the root).
+/// Walk the mainline (first-parent) chain from `tip` back to the root, verifying every commit,
+/// and return the verified commits **tip-first** (index 0 is `tip`, the last element is the
+/// root). Mirrors `git log --first-parent`: a merge commit itself is included in the walk, but
+/// its second-and-later parents' exclusive history is not additionally traversed.
 ///
 /// For each commit, in order:
 /// 1. Fetch it via the store (which re-verifies the content hash — an
@@ -39,14 +41,20 @@ impl core::fmt::Debug for VerifiedCommit {
 ///    propagates as an error) and re-check `commit.hash()` as defense in depth ([`load_commit`]).
 /// 2. Verify the Ed25519 signature over `fields.signing_bytes()` against `signer_pubkey`. A
 ///    failure aborts the walk with an error — the commit is never accepted or skipped.
-/// 3. Continue via `parent_hashes[0]`; stop when `parent_hashes` is empty (root reached).
+/// 3. Continue via `parent_hashes[0]` (the mainline parent, whether this is a 1-parent commit or
+///    a 2+-parent merge commit); stop when `parent_hashes` is empty (root reached).
 ///
-/// **Phase-2 constraints (temporary — see crate docs / PROGRESS.md §8):**
-/// - `signer_pubkey` is a single expected signer for the whole history (single-identity local
-///   use). Multi-author signer resolution via a user registry is a Phase 3/4 concern.
-/// - Only the first-parent line is followed. A commit with 2+ parents (a merge) aborts with
-///   [`VcsError::MultiParentCommit`] rather than silently picking a parent; full merge-graph
-///   traversal is a Phase 5 concern.
+/// **Phase-2 constraint still in force (temporary — see crate docs / PROGRESS.md §8):**
+/// `signer_pubkey` is a single expected signer for the whole history (single-identity local use).
+/// Multi-author signer resolution via a user registry is a Phase 3/4 concern.
+///
+/// **Phase 5b change:** earlier phases rejected any 2+-parent commit outright
+/// ([`VcsError::MultiParentCommit`]), since merge commits could not yet exist. Now that
+/// [`crate::merge::commit_merge`] produces them, `log` must not permanently break on a branch
+/// that has ever been merged — it follows the first parent through a merge commit instead of
+/// erroring. Finding the *other* side's history (or the merge base) is
+/// [`crate::merge::merge_base`]'s job, which deliberately uses a different, all-parents
+/// traversal.
 pub fn log(
     store: &LocalObjectStore,
     tip: Hash,
@@ -59,12 +67,9 @@ pub fn log(
         let commit = load_commit(store, &hash)?;
         verify_commit_signature(&commit, &hash, signer_pubkey)?;
 
-        // Decide the next hop before moving `commit` into the output vec.
-        cursor = match commit.fields.parent_hashes.as_slice() {
-            [] => None,
-            [parent] => Some(*parent),
-            _ => return Err(VcsError::MultiParentCommit(hash.to_hex())),
-        };
+        // Mainline hop: first parent, whether this is a normal commit or a merge commit. Empty
+        // `parent_hashes` (a root commit) ends the walk.
+        cursor = commit.fields.parent_hashes.first().copied();
 
         history.push(VerifiedCommit { hash, commit });
     }
@@ -196,27 +201,34 @@ mod tests {
         assert!(matches!(err, VcsError::BadSignatureLength { actual: 10, .. }));
     }
 
+    /// Phase 5b behavior change: a 2+-parent (merge) commit is no longer rejected. `log` includes
+    /// it in the walk and continues via its *first* parent (the mainline), and must NOT error and
+    /// must NOT additionally walk the merged-in side's exclusive history.
     #[test]
-    fn multi_parent_commit_is_rejected_not_silently_followed() {
+    fn multi_parent_commit_is_included_and_walk_follows_first_parent() {
         let (_dir, store) = temp_store();
         let identity = new_identity(b"pass");
         let dek = new_dek();
+        let author = crate::author_id_from_identity(identity.public());
 
-        // Two independent root commits.
-        let p1 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),None, &WorkingSet::new(), "p1").unwrap();
-        let p2 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),None, &WorkingSet::new(), "p2").unwrap();
+        // Mainline: root -> child.
+        let root = commit(&store, &dek, &identity, author, None, &WorkingSet::new(), "root").unwrap();
+        let child = commit(&store, &dek, &identity, author, Some(root), &WorkingSet::new(), "child").unwrap();
+
+        // An independent side branch ("theirs") that only a merge commit's SECOND parent reaches.
+        let side = commit(&store, &dek, &identity, author, None, &WorkingSet::new(), "side").unwrap();
 
         // Hand-build a signed merge commit with two parents (commit() only makes 0/1-parent
-        // commits) and store it.
+        // commits) and store it: parents = [mainline child, side].
         let empty_tree = Tree::new();
         let tree_bytes = empty_tree.to_bytes().unwrap();
         let tree_hash = Hash::of(&tree_bytes);
         store.put(&tree_hash, &tree_bytes).unwrap();
         let fields = CommitFields {
             tree_hash,
-            parent_hashes: vec![p1, p2],
-            author_id: crate::author_id_from_identity(identity.public()),
-            timestamp: 1_700_000_000,
+            parent_hashes: vec![child, side],
+            author_id: author,
+            timestamp: 1_700_000_100,
             message: "merge".to_string(),
         };
         let signature = sign(&identity, &fields.signing_bytes().unwrap());
@@ -225,8 +237,14 @@ mod tests {
         let merge_hash = Hash::of(&merge_bytes);
         store.put(&merge_hash, &merge_bytes).unwrap();
 
-        let err = log(&store, merge_hash, &identity.public().ed25519_pubkey).unwrap_err();
-        assert!(matches!(err, VcsError::MultiParentCommit(_)));
+        // Must not error, must include the merge commit, must follow parent[0] (mainline) only.
+        let history = log(&store, merge_hash, &identity.public().ed25519_pubkey).unwrap();
+        let hashes: Vec<Hash> = history.iter().map(|v| v.hash).collect();
+        assert_eq!(hashes, vec![merge_hash, child, root]);
+        assert!(
+            !hashes.contains(&side),
+            "must not additionally walk the merged-in side's exclusive history"
+        );
     }
 
     #[test]

@@ -28,13 +28,18 @@
 //! - **Single-signer `log`.** [`log`] takes one expected signer pubkey and verifies every
 //!   commit in the history against it. Multi-author signer resolution via a user registry is
 //!   a Phase 3/4 concern.
-//! - **First-parent-only walk.** [`log`] follows `parent_hashes[0]` only and *errors* on any
-//!   commit with 2+ parents ([`VcsError::MultiParentCommit`]) rather than silently picking a
-//!   line. Full merge-graph traversal is a Phase 5 concern (merges do not exist yet).
+//! - **`log` follows the mainline through merge commits (resolved in Phase 5b).** Merge commits
+//!   (2+ parents) now exist — see the [`merge`] module. [`log`] includes a merge commit in its
+//!   walk and continues via `parent_hashes[0]`, i.e. `git log --first-parent` semantics, rather
+//!   than erroring as it briefly did before any merge commit could exist. It deliberately does
+//!   **not** additionally walk a merged-in side branch's exclusive history — full merge-graph
+//!   traversal ([`merge::merge_base`] aside, which needs its own, different, all-parents walk)
+//!   is not needed by anything else in this codebase.
 
 mod commit;
 mod diff;
 mod log;
+pub mod merge;
 mod working_set;
 
 #[cfg(test)]
@@ -52,6 +57,7 @@ use wonton_objects::{Blob, Commit, Hash, LocalObjectStore, ObjectError, Tree};
 pub use commit::commit;
 pub use diff::{diff, DiffEntry};
 pub use log::{log, VerifiedCommit};
+pub use merge::{commit_merge, merge_base, three_way_merge, MergeEntry};
 pub use working_set::WorkingSet;
 
 /// Encrypts a single plaintext value into an [`EncryptedValue`] with a fresh nonce. [`commit`]
@@ -153,11 +159,14 @@ pub enum VcsError {
     #[error("commit {hash} has a malformed signature: expected 64 bytes, got {actual}")]
     BadSignatureLength { hash: String, actual: usize },
 
-    /// [`log`]'s first-parent walk reached a commit with 2+ parents (a merge commit). Phase 2
-    /// deliberately refuses to silently pick a parent; full merge-graph traversal is Phase 5.
+    /// No longer produced by [`log`] as of Phase 5b: a 2+-parent (merge) commit is now included
+    /// in the walk and followed via its first parent rather than rejected (see the crate docs'
+    /// "Phase-2 simplifications" note). Kept in the enum — removing a `thiserror` variant is a
+    /// breaking change to this crate's public error type for no behavioral benefit, and nothing
+    /// currently requires its removal.
     #[error(
-        "multi-parent (merge) commit {0} encountered during first-parent log walk; \
-         merge-graph traversal is a Phase 5 concern"
+        "multi-parent (merge) commit {0} encountered during a first-parent-only walk that does \
+         not support merge commits"
     )]
     MultiParentCommit(String),
 }

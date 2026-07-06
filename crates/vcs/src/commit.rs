@@ -37,6 +37,29 @@ pub fn commit(
     working_set: &WorkingSet,
     message: impl Into<String>,
 ) -> Result<Hash, VcsError> {
+    build_and_sign(
+        store,
+        enc,
+        signer,
+        author_id,
+        parent.into_iter().collect(),
+        working_set,
+        message,
+    )
+}
+
+/// The encrypt-blobs/build-tree/sign-and-store logic shared by [`commit`] (0-or-1 parents) and
+/// [`crate::merge::commit_merge`] (exactly 2 parents, Phase 5b). Factored out so `commit`'s public
+/// signature and behavior never change — see its doc comment above.
+pub(crate) fn build_and_sign(
+    store: &LocalObjectStore,
+    enc: &impl ValueEncryptor,
+    signer: &impl CommitSigner,
+    author_id: Uuid,
+    parent_hashes: Vec<Hash>,
+    working_set: &WorkingSet,
+    message: impl Into<String>,
+) -> Result<Hash, VcsError> {
     // 1. Encrypt each staged value and store it as a blob; record key -> blob_hash.
     let mut tree = Tree::new();
     for (key, plaintext) in working_set.iter() {
@@ -54,11 +77,10 @@ pub fn commit(
     let tree_hash = Hash::of(&tree_bytes);
     store.put(&tree_hash, &tree_bytes)?;
 
-    // 3. Assemble the signable fields. `parent` is 0-or-1 hashes in Phase 2 (root or linear);
-    //    merge commits with 2+ parents are a Phase 5 concern.
+    // 3. Assemble the signable fields. 0 parents = root, 1 = normal, 2 = merge (Phase 5b).
     let fields = CommitFields {
         tree_hash,
-        parent_hashes: parent.into_iter().collect(),
+        parent_hashes,
         author_id,
         timestamp: current_unix_seconds(),
         message: message.into(),
