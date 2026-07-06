@@ -14,6 +14,7 @@
 //! login forwards whatever the server hands back unchanged.
 
 use std::collections::{BTreeMap, HashSet};
+use std::io::{BufRead, Write};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context as _};
@@ -27,13 +28,16 @@ use wonton_shared::{
     ObjectUploadRequest, RegisterRequest, Role, RotateRequest,
 };
 use wonton_sync::{PullOutcome, SyncClient, SyncError};
-use wonton_vcs::{DiffEntry, ValueDecryptor, ValueEncryptor, WorkingSet};
+use wonton_vcs::{DiffEntry, MergeEntry, ValueDecryptor, ValueEncryptor, WorkingSet};
 
 use crate::agent::cipher::AgentCipher;
 use crate::agent::client as agent;
 use crate::agent::protocol::Argon2ParamsWire;
 use crate::config::{self, Config, Context, Identity};
-use crate::state::{object_store_dir_for, open_object_store, LocalState, StagedEntry};
+use crate::state::{
+    object_store_dir_for, open_object_store, ConflictHashes, LocalState, MergeState,
+    ResolvedEntry, StagedEntry,
+};
 
 /// `wonton login <username>`. Registers on first use of a username, unlocks the agent, completes
 /// a challenge-response login, and caches the session token + wrapped-key material in the config.
@@ -727,6 +731,420 @@ pub async fn push(config_path: &Path, state_path: &Path, ctx_name: &str) -> anyh
     }
 }
 
+/// Decrypt an entire commit's tree into a plaintext `key -> value` map. `tip = None` yields an
+/// empty map (used for a merge base of `None`, i.e. disjoint histories — PROGRESS.md §3.8).
+fn tree_to_plaintext_map(
+    store: &LocalObjectStore,
+    cipher: &AgentCipher,
+    tip: Option<Hash>,
+) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
+    let mut map = BTreeMap::new();
+    if let Some(tip) = tip {
+        let tree = tree_of_commit(store, tip)?;
+        for (key, blob_hash) in &tree.entries {
+            map.insert(key.clone(), decrypt_blob(store, cipher, blob_hash)?);
+        }
+    }
+    Ok(map)
+}
+
+/// Agent-encrypt `plaintext` and store it as a new blob, returning its hash. The manual-entry
+/// conflict-resolution path uses this — identical to what `set()` does for `wonton set`, never
+/// writing the plaintext to disk itself.
+fn encrypt_and_store(store: &LocalObjectStore, cipher: &AgentCipher, plaintext: &[u8]) -> anyhow::Result<Hash> {
+    let encrypted = cipher.encrypt(plaintext)?;
+    let blob = Blob::new(encrypted.nonce, encrypted.ciphertext);
+    let blob_bytes = blob.to_bytes()?;
+    let blob_hash = Hash::of(&blob_bytes);
+    store.put(&blob_hash, &blob_bytes)?;
+    Ok(blob_hash)
+}
+
+/// Render a value for the interactive conflict prompt: `<deleted>` for an absent side, the UTF-8
+/// text if valid, else a byte-count placeholder (never guess/mangle non-UTF-8 bytes into text).
+fn display_conflict_value(value: Option<&[u8]>) -> String {
+    match value {
+        None => "<deleted>".to_string(),
+        Some(bytes) => match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => format!("<binary, {} bytes>", bytes.len()),
+        },
+    }
+}
+
+/// One conflict's resolution, as chosen at the interactive prompt.
+enum PromptOutcome {
+    Ours,
+    Theirs,
+    Manual(String),
+    /// Stop resolving now (explicit `s`, or EOF on a non-interactive/closed stdin).
+    Skip,
+}
+
+/// Prompt for a single conflicting key's resolution via `reader`/`writer` (injectable so this is
+/// testable without real stdin/stdout — PROGRESS.md §3.8). Re-prompts on an unrecognized line;
+/// EOF at any point is treated as `Skip` (a closed/non-interactive stdin must never hang or panic).
+fn prompt_conflict_resolution(
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+    key: &str,
+    ours: Option<&[u8]>,
+    theirs: Option<&[u8]>,
+) -> anyhow::Result<PromptOutcome> {
+    writeln!(writer, "Conflict on '{key}':")?;
+    writeln!(writer, "  ours:   {}", display_conflict_value(ours))?;
+    writeln!(writer, "  theirs: {}", display_conflict_value(theirs))?;
+    loop {
+        write!(writer, "[o]urs / [t]heirs / [m]anual / [s]kip> ")?;
+        writer.flush()?;
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(PromptOutcome::Skip); // EOF
+        }
+        match line.trim() {
+            "o" | "ours" => return Ok(PromptOutcome::Ours),
+            "t" | "theirs" => return Ok(PromptOutcome::Theirs),
+            "s" | "skip" => return Ok(PromptOutcome::Skip),
+            "m" | "manual" => {
+                write!(writer, "Enter value for '{key}': ")?;
+                writer.flush()?;
+                let mut value = String::new();
+                if reader.read_line(&mut value)? == 0 {
+                    return Ok(PromptOutcome::Skip); // EOF while typing the value
+                }
+                let value = value.strip_suffix('\n').unwrap_or(&value);
+                let value = value.strip_suffix('\r').unwrap_or(value);
+                return Ok(PromptOutcome::Manual(value.to_string()));
+            }
+            _ => {
+                writeln!(writer, "Please enter o, t, m, or s.")?;
+            }
+        }
+    }
+}
+
+/// Run the interactive one-key-at-a-time conflict prompt over `conflicts`, moving each resolved
+/// key into `resolved`. Calls `persist` after **every single resolution** so an interrupted
+/// `--continue` loses at most the one answer in flight (PROGRESS.md §3.8). Stops — leaving that
+/// key and every key after it in `conflicts` — on `Skip`.
+fn resolve_conflicts_interactively(
+    store: &LocalObjectStore,
+    cipher: &AgentCipher,
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+    conflicts: &mut BTreeMap<String, ConflictHashes>,
+    resolved: &mut BTreeMap<String, ResolvedEntry>,
+    mut persist: impl FnMut(&BTreeMap<String, ConflictHashes>, &BTreeMap<String, ResolvedEntry>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let keys: Vec<String> = conflicts.keys().cloned().collect();
+    for key in keys {
+        let hashes = conflicts.get(&key).expect("key came from conflicts.keys()").clone();
+        let ours_plain = hashes.ours.as_ref().map(|h| decrypt_blob(store, cipher, h)).transpose()?;
+        let theirs_plain = hashes.theirs.as_ref().map(|h| decrypt_blob(store, cipher, h)).transpose()?;
+
+        let outcome = prompt_conflict_resolution(reader, writer, &key, ours_plain.as_deref(), theirs_plain.as_deref())?;
+        let resolved_entry = match outcome {
+            PromptOutcome::Skip => break,
+            PromptOutcome::Ours => match hashes.ours {
+                Some(h) => ResolvedEntry::Set(h),
+                None => ResolvedEntry::Delete,
+            },
+            PromptOutcome::Theirs => match hashes.theirs {
+                Some(h) => ResolvedEntry::Set(h),
+                None => ResolvedEntry::Delete,
+            },
+            PromptOutcome::Manual(value) => ResolvedEntry::Set(encrypt_and_store(store, cipher, value.as_bytes())?),
+        };
+        conflicts.remove(&key);
+        resolved.insert(key, resolved_entry);
+        persist(conflicts, resolved)?;
+    }
+    Ok(())
+}
+
+/// Finalize a merge: fold every already-settled conflict (`resolved`, decrypting each blob hash
+/// back to plaintext — `commit_merge` takes a plaintext `WorkingSet`, not hashes) into the
+/// non-conflicting `resolved_plaintext` map, build the final `WorkingSet`, and produce the
+/// 2-parent merge commit. Prints an added/changed/removed summary relative to `ours_map`.
+#[allow(clippy::too_many_arguments)]
+fn finalize_merge_commit(
+    store: &LocalObjectStore,
+    cipher: &AgentCipher,
+    author_id: Uuid,
+    ours_tip: Hash,
+    theirs_tip: Hash,
+    ours_map: &BTreeMap<String, Vec<u8>>,
+    mut resolved_plaintext: BTreeMap<String, Option<Vec<u8>>>,
+    resolved_conflicts: &BTreeMap<String, ResolvedEntry>,
+    branch: &str,
+) -> anyhow::Result<Hash> {
+    for (key, entry) in resolved_conflicts {
+        let value = match entry {
+            ResolvedEntry::Set(hash) => Some(decrypt_blob(store, cipher, hash)?),
+            ResolvedEntry::Delete => None,
+        };
+        resolved_plaintext.insert(key.clone(), value);
+    }
+
+    let mut working_set = WorkingSet::new();
+    let (mut added, mut changed, mut removed) = (0usize, 0usize, 0usize);
+    for (key, value) in &resolved_plaintext {
+        match (ours_map.get(key), value) {
+            (None, Some(v)) => {
+                working_set.set(key.clone(), v.clone());
+                added += 1;
+            }
+            (Some(old), Some(new)) => {
+                working_set.set(key.clone(), new.clone());
+                if old != new {
+                    changed += 1;
+                }
+            }
+            (Some(_), None) => removed += 1,
+            (None, None) => {}
+        }
+    }
+
+    let message = format!("Merge branch '{branch}'");
+    let hash = wonton_vcs::commit_merge(store, cipher, cipher, author_id, [ours_tip, theirs_tip], &working_set, message)?;
+    println!(
+        "Merged '{branch}': {added} added, {changed} changed, {removed} removed -> {}.",
+        hash.to_hex()
+    );
+    Ok(hash)
+}
+
+/// `wonton merge <branch>` — three-way merge `branch` into the current branch (PROGRESS.md §3.8).
+/// Entirely offline/client-side: the server never sees plaintext, a merge base, or a conflict.
+pub async fn merge(
+    config_path: &Path,
+    state_path: &Path,
+    socket_path: &Path,
+    ctx_name: &str,
+    branch: &str,
+) -> anyhow::Result<()> {
+    let config = Config::load_from(config_path)?;
+    let (ctx, identity) = ready_context(&config, socket_path, ctx_name).await?;
+    let store = open_object_store(&object_store_dir_for(state_path))?;
+    let cipher = AgentCipher::new(socket_path, ctx.name.clone());
+    let author_id = Uuid::parse_str(&identity.user_id)
+        .with_context(|| format!("identity user_id '{}' is not a valid UUID", identity.user_id))?;
+
+    let mut state = LocalState::load_from(state_path)?;
+    let cs = state.context_mut(&ctx.name);
+    if cs.merge.is_some() {
+        bail!("a merge is already in progress; resolve it and run `wonton merge --continue`");
+    }
+    let current_branch = cs.branch.clone();
+    let ours_tip = cs
+        .tips
+        .get(&current_branch)
+        .copied()
+        .ok_or_else(|| anyhow!("branch '{current_branch}' has no commits yet; nothing to merge into"))?;
+    let theirs_tip = cs.tips.get(branch).copied().ok_or_else(|| {
+        anyhow!("unknown branch '{branch}'; `pull`/`switch` to make it known locally first")
+    })?;
+
+    if ours_tip == theirs_tip {
+        println!("Branch '{branch}' is already merged into '{current_branch}'.");
+        return Ok(());
+    }
+
+    let base = wonton_vcs::merge_base(&store, ours_tip, theirs_tip)?;
+    let ours_tree = tree_of_commit(&store, ours_tip)?;
+    let theirs_tree = tree_of_commit(&store, theirs_tip)?;
+
+    let base_map = tree_to_plaintext_map(&store, &cipher, base)?;
+    let ours_map = tree_to_plaintext_map(&store, &cipher, Some(ours_tip))?;
+    let theirs_map = tree_to_plaintext_map(&store, &cipher, Some(theirs_tip))?;
+
+    let merged = wonton_vcs::three_way_merge(&base_map, &ours_map, &theirs_map);
+
+    let mut resolved_plaintext: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
+    let mut conflicts: BTreeMap<String, ConflictHashes> = BTreeMap::new();
+    for (key, entry) in merged {
+        match entry {
+            MergeEntry::Resolved(value) => {
+                resolved_plaintext.insert(key, value);
+            }
+            MergeEntry::Conflict { .. } => {
+                conflicts.insert(
+                    key.clone(),
+                    ConflictHashes {
+                        ours: ours_tree.entries.get(&key).copied(),
+                        theirs: theirs_tree.entries.get(&key).copied(),
+                    },
+                );
+            }
+        }
+    }
+
+    if conflicts.is_empty() {
+        let hash = finalize_merge_commit(
+            &store,
+            &cipher,
+            author_id,
+            ours_tip,
+            theirs_tip,
+            &ours_map,
+            resolved_plaintext,
+            &BTreeMap::new(),
+            branch,
+        )?;
+        let cs = state.context_mut(&ctx.name);
+        cs.tips.insert(current_branch, hash);
+        state.save_to(state_path)?;
+        return Ok(());
+    }
+
+    // Conflicts exist: persist the initial (fully unresolved) state up front, so even an
+    // immediate `s`kip on the very first key leaves a resumable `--continue` state on disk.
+    let mut resolved: BTreeMap<String, ResolvedEntry> = BTreeMap::new();
+    let cs = state.context_mut(&ctx.name);
+    cs.merge = Some(MergeState {
+        branch: branch.to_string(),
+        ours_tip,
+        theirs_tip,
+        base,
+        resolved: resolved.clone(),
+        conflicts: conflicts.clone(),
+    });
+    state.save_to(state_path)?;
+
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let mut stdout = std::io::stdout();
+    resolve_conflicts_interactively(&store, &cipher, &mut reader, &mut stdout, &mut conflicts, &mut resolved, |c, r| {
+        let mut state = LocalState::load_from(state_path)?;
+        let cs = state.context_mut(&ctx.name);
+        cs.merge = Some(MergeState {
+            branch: branch.to_string(),
+            ours_tip,
+            theirs_tip,
+            base,
+            resolved: r.clone(),
+            conflicts: c.clone(),
+        });
+        Ok(state.save_to(state_path)?)
+    })?;
+
+    if conflicts.is_empty() {
+        let hash = finalize_merge_commit(
+            &store,
+            &cipher,
+            author_id,
+            ours_tip,
+            theirs_tip,
+            &ours_map,
+            resolved_plaintext,
+            &resolved,
+            branch,
+        )?;
+        let mut state = LocalState::load_from(state_path)?;
+        let cs = state.context_mut(&ctx.name);
+        cs.tips.insert(current_branch, hash);
+        cs.merge = None;
+        state.save_to(state_path)?;
+    } else {
+        println!(
+            "Merge paused: {} conflict(s) remain. Resolve them and run `wonton merge --continue`.",
+            conflicts.len()
+        );
+    }
+    Ok(())
+}
+
+/// `wonton merge --continue` — resume a merge paused by `merge` on unresolved conflicts.
+pub async fn merge_continue(
+    config_path: &Path,
+    state_path: &Path,
+    socket_path: &Path,
+    ctx_name: &str,
+) -> anyhow::Result<()> {
+    let config = Config::load_from(config_path)?;
+    let (ctx, identity) = ready_context(&config, socket_path, ctx_name).await?;
+    let store = open_object_store(&object_store_dir_for(state_path))?;
+    let cipher = AgentCipher::new(socket_path, ctx.name.clone());
+    let author_id = Uuid::parse_str(&identity.user_id)
+        .with_context(|| format!("identity user_id '{}' is not a valid UUID", identity.user_id))?;
+
+    let state = LocalState::load_from(state_path)?;
+    let cs = state.context(&ctx.name).cloned().unwrap_or_default();
+    let mut merge_state = cs
+        .merge
+        .clone()
+        .ok_or_else(|| anyhow!("no merge in progress; run `wonton merge <branch>` first"))?;
+
+    let branch_name = merge_state.branch.clone();
+    let ours_tip = merge_state.ours_tip;
+    let theirs_tip = merge_state.theirs_tip;
+    let base = merge_state.base;
+
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let mut stdout = std::io::stdout();
+    resolve_conflicts_interactively(
+        &store,
+        &cipher,
+        &mut reader,
+        &mut stdout,
+        &mut merge_state.conflicts,
+        &mut merge_state.resolved,
+        |c, r| {
+            let mut state = LocalState::load_from(state_path)?;
+            let cs = state.context_mut(&ctx.name);
+            cs.merge = Some(MergeState {
+                branch: branch_name.clone(),
+                ours_tip,
+                theirs_tip,
+                base,
+                resolved: r.clone(),
+                conflicts: c.clone(),
+            });
+            Ok(state.save_to(state_path)?)
+        },
+    )?;
+
+    if merge_state.conflicts.is_empty() {
+        let base_map = tree_to_plaintext_map(&store, &cipher, base)?;
+        let ours_map = tree_to_plaintext_map(&store, &cipher, Some(ours_tip))?;
+        let theirs_map = tree_to_plaintext_map(&store, &cipher, Some(theirs_tip))?;
+        let merged = wonton_vcs::three_way_merge(&base_map, &ours_map, &theirs_map);
+        let mut resolved_plaintext: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
+        for (key, entry) in merged {
+            if let MergeEntry::Resolved(value) = entry {
+                resolved_plaintext.insert(key, value);
+            }
+        }
+
+        let hash = finalize_merge_commit(
+            &store,
+            &cipher,
+            author_id,
+            ours_tip,
+            theirs_tip,
+            &ours_map,
+            resolved_plaintext,
+            &merge_state.resolved,
+            &branch_name,
+        )?;
+
+        let mut state = LocalState::load_from(state_path)?;
+        let cs = state.context_mut(&ctx.name);
+        let current_branch = cs.branch.clone();
+        cs.tips.insert(current_branch, hash);
+        cs.merge = None;
+        state.save_to(state_path)?;
+    } else {
+        // Already persisted incrementally by `resolve_conflicts_interactively`'s `persist` closure.
+        println!(
+            "Merge paused: {} conflict(s) remain. Resolve them and run `wonton merge --continue`.",
+            merge_state.conflicts.len()
+        );
+    }
+    Ok(())
+}
+
 /// `wonton run -- <cmd> [args...]` — decrypt the effective working tree into env vars, spawn the
 /// child with them injected (stdio inherited), and return the child's exit code for `main.rs` to
 /// propagate. **Never writes any decrypted value to disk.**
@@ -1159,9 +1577,13 @@ fn effective_working_set(
     Ok(working_set)
 }
 
-/// Collect every local commit/tree/blob hash reachable from `tip` by a first-parent walk, stopping
-/// at `stop` (the remote's current tip), a root, or an object the local store lacks. See
-/// [`push`]'s doc comment for the known-limitation caveat.
+/// Collect every local commit/tree/blob hash reachable from `tip`, stopping a given path at
+/// `stop` (the remote's current tip), a root, an object the local store lacks, or a
+/// previously-visited hash. Walks **every** parent of a merge commit (Phase 5b), not just the
+/// first — unlike `log`'s mainline-only walk, `push` must upload objects reachable via a merge
+/// commit's second parent too (e.g. a side branch merged in but never separately pushed on this
+/// ref). Uploading is idempotent server-side, so visiting a shared ancestor from two paths and
+/// (thanks to `seen`) collecting it only once is an optimization, not a correctness requirement.
 fn collect_objects_to_push(
     store: &LocalObjectStore,
     tip: Hash,
@@ -1169,20 +1591,18 @@ fn collect_objects_to_push(
 ) -> anyhow::Result<Vec<Hash>> {
     let mut hashes = Vec::new();
     let mut seen = HashSet::new();
-    let mut cursor = Some(tip);
+    let mut worklist = vec![tip];
 
-    while let Some(current) = cursor {
-        if Some(current) == stop {
-            break;
+    while let Some(current) = worklist.pop() {
+        if Some(current) == stop || !seen.insert(current) {
+            continue;
         }
         let bytes = match store.get(&current)? {
             Some(b) => b,
             // Not in the local store: it's already on the server (older history) — stop walking.
-            None => break,
+            None => continue,
         };
-        if seen.insert(current) {
-            hashes.push(current);
-        }
+        hashes.push(current);
         let commit = Commit::from_bytes(&bytes)?;
 
         // The commit's tree and every blob it references.
@@ -1199,11 +1619,7 @@ fn collect_objects_to_push(
             }
         }
 
-        cursor = match commit.fields.parent_hashes.as_slice() {
-            [] => None,
-            [p] => Some(*p),
-            _ => bail!("commit {} is a merge commit; pushing merges is a Phase 5 concern", current.to_hex()),
-        };
+        worklist.extend(commit.fields.parent_hashes.iter().copied());
     }
     Ok(hashes)
 }
@@ -1270,4 +1686,208 @@ fn render_dotenv(working_set: &WorkingSet) -> anyhow::Result<String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod merge_prompt_tests {
+    use std::io::Cursor;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use wonton_crypto::{generate_dek, generate_identity, wrap_dek};
+
+    use super::*;
+    use crate::agent::daemon;
+    use crate::agent::protocol::Argon2ParamsWire;
+
+    // ---- prompt_conflict_resolution (pure, no store/cipher needed) ---------------------------
+
+    #[test]
+    fn ours_and_theirs_are_parsed() {
+        let mut out = Vec::new();
+        let outcome =
+            prompt_conflict_resolution(&mut Cursor::new(b"o\n".to_vec()), &mut out, "K", Some(b"a"), Some(b"b"))
+                .unwrap();
+        assert!(matches!(outcome, PromptOutcome::Ours));
+
+        let mut out = Vec::new();
+        let outcome =
+            prompt_conflict_resolution(&mut Cursor::new(b"t\n".to_vec()), &mut out, "K", Some(b"a"), Some(b"b"))
+                .unwrap();
+        assert!(matches!(outcome, PromptOutcome::Theirs));
+    }
+
+    #[test]
+    fn skip_and_eof_both_yield_skip() {
+        let mut out = Vec::new();
+        let outcome =
+            prompt_conflict_resolution(&mut Cursor::new(b"s\n".to_vec()), &mut out, "K", Some(b"a"), Some(b"b"))
+                .unwrap();
+        assert!(matches!(outcome, PromptOutcome::Skip));
+
+        let mut out = Vec::new();
+        let outcome =
+            prompt_conflict_resolution(&mut Cursor::new(Vec::new()), &mut out, "K", Some(b"a"), Some(b"b")).unwrap();
+        assert!(matches!(outcome, PromptOutcome::Skip), "EOF on a non-interactive stdin must not hang or panic");
+    }
+
+    #[test]
+    fn manual_entry_reads_the_typed_value() {
+        let mut out = Vec::new();
+        let outcome = prompt_conflict_resolution(
+            &mut Cursor::new(b"m\nmanual-value\n".to_vec()),
+            &mut out,
+            "K",
+            Some(b"a"),
+            Some(b"b"),
+        )
+        .unwrap();
+        match outcome {
+            PromptOutcome::Manual(v) => assert_eq!(v, "manual-value"),
+            _ => panic!("expected Manual"),
+        }
+    }
+
+    #[test]
+    fn unrecognized_input_reprompts_then_accepts_a_valid_choice() {
+        let mut out = Vec::new();
+        let outcome = prompt_conflict_resolution(
+            &mut Cursor::new(b"nonsense\no\n".to_vec()),
+            &mut out,
+            "K",
+            Some(b"a"),
+            Some(b"b"),
+        )
+        .unwrap();
+        assert!(matches!(outcome, PromptOutcome::Ours));
+        let printed = String::from_utf8(out).unwrap();
+        assert!(printed.contains("Please enter"), "must nudge the user on garbage input, got:\n{printed}");
+    }
+
+    #[test]
+    fn deleted_sides_render_distinctly_from_binary_or_utf8() {
+        assert_eq!(display_conflict_value(None), "<deleted>");
+        assert_eq!(display_conflict_value(Some(b"hello")), "hello");
+        assert!(display_conflict_value(Some(&[0xff, 0xfe, 0x00])).starts_with("<binary"));
+    }
+
+    // ---- resolve_conflicts_interactively (needs a real store + agent-cached DEK) --------------
+
+    fn unique_path(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!(
+            "wonton-merge-resolve-test-{tag}-{}-{n}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    async fn agent_with_dek_and_store(context: &str) -> (PathBuf, LocalObjectStore) {
+        let sock = unique_path("sock").with_extension("sock");
+        let listener = daemon::bind_listener(&sock).await.expect("bind agent socket");
+        tokio::spawn(daemon::serve(listener, daemon::new_state()));
+
+        let passphrase = b"pw-merge-resolve";
+        let (public, wrapped) = generate_identity(passphrase);
+        let blob = [wrapped.nonce.as_slice(), wrapped.ciphertext.as_slice()].concat();
+        let params = Argon2ParamsWire {
+            salt_b64: STANDARD.encode(wrapped.argon2_params.salt),
+            m_cost_kib: wrapped.argon2_params.m_cost_kib,
+            t_cost: wrapped.argon2_params.t_cost,
+            p_cost: wrapped.argon2_params.p_cost,
+        };
+        agent::login(&sock, STANDARD.encode(&blob), params, String::from_utf8_lossy(passphrase).into_owned())
+            .await
+            .expect("agent login");
+
+        let dek = generate_dek();
+        let sealed = wrap_dek(&dek, &public.x25519_pubkey);
+        agent::unwrap_dek(&sock, context.to_string(), STANDARD.encode(&sealed.0))
+            .await
+            .expect("agent unwrap dek");
+
+        let store = open_object_store(&unique_path("objects")).expect("open object store");
+        (sock, store)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stops_on_skip_and_persists_after_every_resolution_not_before() {
+        let (sock, store) = agent_with_dek_and_store("ctx").await;
+        let cipher = AgentCipher::new(sock, "ctx");
+
+        let ours_a = encrypt_and_store(&store, &cipher, b"ours-a").unwrap();
+        let theirs_a = encrypt_and_store(&store, &cipher, b"theirs-a").unwrap();
+        let ours_b = encrypt_and_store(&store, &cipher, b"ours-b").unwrap();
+        let theirs_b = encrypt_and_store(&store, &cipher, b"theirs-b").unwrap();
+
+        let mut conflicts = BTreeMap::new();
+        conflicts.insert("A".to_string(), ConflictHashes { ours: Some(ours_a), theirs: Some(theirs_a) });
+        conflicts.insert("B".to_string(), ConflictHashes { ours: Some(ours_b), theirs: Some(theirs_b) });
+        let mut resolved = BTreeMap::new();
+
+        // "A" resolved via ours; "B" is skipped, stopping the loop.
+        let mut reader = Cursor::new(b"o\ns\n".to_vec());
+        let mut writer = Vec::new();
+        let mut persist_calls = 0u32;
+        resolve_conflicts_interactively(&store, &cipher, &mut reader, &mut writer, &mut conflicts, &mut resolved, |_c, _r| {
+            persist_calls += 1;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(persist_calls, 1, "persist must run exactly once, right after A resolves");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved.get("A"), Some(&ResolvedEntry::Set(ours_a)));
+        assert_eq!(conflicts.len(), 1, "B must remain unresolved after a skip");
+        assert!(conflicts.contains_key("B"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manual_and_delete_vs_modify_resolutions_work() {
+        let (sock, store) = agent_with_dek_and_store("ctx").await;
+        let cipher = AgentCipher::new(sock, "ctx");
+
+        let theirs_hash = encrypt_and_store(&store, &cipher, b"theirs-value").unwrap();
+
+        let mut conflicts = BTreeMap::new();
+        // "DELETED": ours deleted it (None), theirs modified it.
+        conflicts.insert("DELETED".to_string(), ConflictHashes { ours: None, theirs: Some(theirs_hash) });
+        let mut resolved = BTreeMap::new();
+
+        // Resolve "DELETED" manually to a brand-new value.
+        let mut reader = Cursor::new(b"m\nmanual-resolution\n".to_vec());
+        let mut writer = Vec::new();
+        resolve_conflicts_interactively(&store, &cipher, &mut reader, &mut writer, &mut conflicts, &mut resolved, |_c, _r| Ok(()))
+            .unwrap();
+
+        assert!(conflicts.is_empty());
+        match resolved.get("DELETED") {
+            Some(ResolvedEntry::Set(hash)) => {
+                let plaintext = decrypt_blob(&store, &cipher, hash).unwrap();
+                assert_eq!(plaintext, b"manual-resolution");
+            }
+            other => panic!("expected a manually-resolved Set entry, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn theirs_choice_on_a_deleted_side_resolves_to_delete() {
+        let (sock, store) = agent_with_dek_and_store("ctx").await;
+        let cipher = AgentCipher::new(sock, "ctx");
+
+        let ours_hash = encrypt_and_store(&store, &cipher, b"ours-value").unwrap();
+        let mut conflicts = BTreeMap::new();
+        // ours modified it, theirs deleted it (None) — choosing "theirs" must resolve to Delete.
+        conflicts.insert("KEY".to_string(), ConflictHashes { ours: Some(ours_hash), theirs: None });
+        let mut resolved = BTreeMap::new();
+
+        let mut reader = Cursor::new(b"t\n".to_vec());
+        let mut writer = Vec::new();
+        resolve_conflicts_interactively(&store, &cipher, &mut reader, &mut writer, &mut conflicts, &mut resolved, |_c, _r| Ok(()))
+            .unwrap();
+
+        assert_eq!(resolved.get("KEY"), Some(&ResolvedEntry::Delete));
+    }
 }

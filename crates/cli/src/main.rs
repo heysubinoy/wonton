@@ -91,6 +91,15 @@ enum Command {
     Pull,
     /// Upload local commits and move the branch ref on the server.
     Push,
+    /// Three-way merge a branch into the current branch (or resume a paused merge with
+    /// `--continue`). Exactly one of `branch` / `--continue` must be given.
+    Merge {
+        /// The branch to merge into the current branch.
+        branch: Option<String>,
+        /// Resume a merge paused earlier on unresolved conflicts.
+        #[arg(long = "continue")]
+        resume: bool,
+    },
     /// Run a command with the current context's secrets injected as env vars (never on disk).
     Run {
         /// The command and its arguments (everything after `--`).
@@ -297,6 +306,18 @@ async fn main() -> anyhow::Result<()> {
             let ctx = resolve_ctx()?;
             let format = commands::ExportFormat::parse(&format)?;
             commands::export(&config_path, &state_path, &socket, &ctx, format, &path).await
+        }
+        Command::Merge { branch, resume } => {
+            let config_path = config::default_config_path()?;
+            let state_path = state::default_state_path()?;
+            let socket = agent::client::ensure_running().await?;
+            let ctx = resolve_ctx()?;
+            match (branch, resume) {
+                (Some(_), true) => anyhow::bail!("pass either a branch name or `--continue`, not both"),
+                (Some(branch), false) => commands::merge(&config_path, &state_path, &socket, &ctx, &branch).await,
+                (None, true) => commands::merge_continue(&config_path, &state_path, &socket, &ctx).await,
+                (None, false) => anyhow::bail!("usage: `wonton merge <branch>` or `wonton merge --continue`"),
+            }
         }
         Command::Share { user, env, role } => {
             let config_path = config::default_config_path()?;

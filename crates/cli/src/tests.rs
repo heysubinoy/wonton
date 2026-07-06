@@ -24,7 +24,7 @@ use crate::agent::cipher::AgentCipher;
 use crate::agent::{client as agent, daemon};
 use crate::commands;
 use crate::config::Config;
-use crate::state::{object_store_dir_for, open_object_store, LocalState};
+use crate::state::{object_store_dir_for, open_object_store, LocalState, ResolvedEntry};
 
 /// A unique temp path per call (parallel-safe): pid + atomic counter + nanosecond timestamp.
 fn unique(tag: &str) -> PathBuf {
@@ -953,4 +953,200 @@ async fn key_rotate_alone_advances_tip_and_reencrypts() {
     assert_eq!(code, 0);
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "the-value");
     let _ = std::fs::remove_file(&out);
+}
+
+// ---- Phase 5b: three-way merge ------------------------------------------------------------
+
+/// Fork a new local branch named `branch` off `at` (the commit both histories will share as
+/// their merge base) within `ctx_name`. There's no `checkout -b` porcelain command (PLAN.md v1
+/// only has `switch` to an already-known branch), so this directly seeds `state.toml`'s `tips`
+/// map the same way `pull` would after fetching a peer's branch.
+fn fork_branch(state_path: &std::path::Path, ctx_name: &str, branch: &str, at: Hash) {
+    let mut state = LocalState::load_from(state_path).unwrap();
+    state.context_mut(ctx_name).tips.insert(branch.to_string(), at);
+    state.save_to(state_path).unwrap();
+}
+
+/// Read one env var's value out of the current working tree via `wonton run`, for asserting the
+/// merged result without touching the object store's internals.
+async fn read_via_run(f: &Fixture, key: &str) -> String {
+    let out = unique(&format!("mergeread-{key}"));
+    let out_str = out.to_string_lossy().to_string();
+    let code = commands::run(
+        &f.config_path,
+        &f.state_path,
+        &f.socket,
+        "acme-dev",
+        vec!["sh".into(), "-c".into(), format!("printf '%s' \"${key}\" > {out_str}")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0);
+    let value = std::fs::read_to_string(&out).unwrap();
+    let _ = std::fs::remove_file(&out);
+    value
+}
+
+/// Two branches that each add a different, non-overlapping key auto-merge with zero conflicts,
+/// producing a real 2-parent commit that `wonton log` walks through without erroring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_with_no_conflicts_produces_a_two_parent_commit() {
+    let owner = ready_fixture("p5bmerge1", None, true).await;
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("ROOT".into(), "root-value".into())])
+        .await
+        .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "root".into())
+        .await
+        .unwrap();
+    let root_tip = tip_of(&owner.state_path);
+
+    fork_branch(&owner.state_path, "acme-dev", "feature", root_tip);
+    commands::switch(&owner.state_path, "acme-dev", "feature").unwrap();
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("FEATURE_KEY".into(), "feature-value".into())])
+        .await
+        .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "feature commit".into())
+        .await
+        .unwrap();
+
+    commands::switch(&owner.state_path, "acme-dev", "main").unwrap();
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("MAIN_KEY".into(), "main-value".into())])
+        .await
+        .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "main commit".into())
+        .await
+        .unwrap();
+    let main_tip_before = tip_of(&owner.state_path);
+
+    commands::merge(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "feature")
+        .await
+        .expect("no conflicts, must merge cleanly");
+
+    let merged_tip = tip_of(&owner.state_path);
+    assert_ne!(merged_tip, main_tip_before);
+
+    let store = open_object_store(&object_store_dir_for(&owner.state_path)).unwrap();
+    let commit = Commit::from_bytes(&store.get(&merged_tip).unwrap().unwrap()).unwrap();
+    assert_eq!(commit.fields.parent_hashes.len(), 2, "a merge commit must have exactly 2 parents");
+    assert!(commit.fields.parent_hashes.contains(&main_tip_before));
+
+    // `wonton log`'s Phase 5b mainline-follow fix must walk past the merge commit without error.
+    commands::log(&owner.config_path, &owner.state_path, "acme-dev").unwrap();
+
+    assert_eq!(read_via_run(&owner, "ROOT").await, "root-value");
+    assert_eq!(read_via_run(&owner, "MAIN_KEY").await, "main-value");
+    assert_eq!(read_via_run(&owner, "FEATURE_KEY").await, "feature-value");
+
+    let state = LocalState::load_from(&owner.state_path).unwrap();
+    assert!(state.context("acme-dev").unwrap().merge.is_none(), "no merge state persisted for a clean merge");
+}
+
+/// A same-key divergent edit on both branches conflicts. Since the test process's stdin is
+/// non-interactive (immediate EOF), `merge` pauses on it exactly like a skipped prompt would,
+/// persisting only content hashes (never plaintext) into `state.toml`. Manually completing the
+/// resolution (as the interactive loop itself would) and calling `merge --continue` must then
+/// finalize the 2-parent commit and clear the paused state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_conflict_pauses_with_hash_only_state_then_continue_resolves() {
+    let owner = ready_fixture("p5bmerge2", None, true).await;
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("KEY".into(), "base-value".into())])
+        .await
+        .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "root".into())
+        .await
+        .unwrap();
+    let root_tip = tip_of(&owner.state_path);
+
+    fork_branch(&owner.state_path, "acme-dev", "feature", root_tip);
+    commands::switch(&owner.state_path, "acme-dev", "feature").unwrap();
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("KEY".into(), "feature-value".into())])
+        .await
+        .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "feature edit".into())
+        .await
+        .unwrap();
+
+    commands::switch(&owner.state_path, "acme-dev", "main").unwrap();
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("KEY".into(), "main-value".into())])
+        .await
+        .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "main edit".into())
+        .await
+        .unwrap();
+
+    commands::merge(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "feature")
+        .await
+        .expect("merge itself succeeds even though it pauses on an unresolved conflict");
+
+    let state = LocalState::load_from(&owner.state_path).unwrap();
+    let merge_state = state
+        .context("acme-dev")
+        .unwrap()
+        .merge
+        .clone()
+        .expect("a paused merge must be persisted");
+    assert_eq!(merge_state.branch, "feature");
+    assert_eq!(merge_state.conflicts.len(), 1);
+    assert!(merge_state.conflicts.contains_key("KEY"));
+    assert!(merge_state.resolved.is_empty());
+
+    // Only hex hashes / structural TOML keys may appear — never the plaintext values.
+    let raw = std::fs::read_to_string(&owner.state_path).unwrap();
+    assert!(!raw.contains("base-value"));
+    assert!(!raw.contains("feature-value"));
+    assert!(!raw.contains("main-value"));
+
+    // Resolve "KEY" to "ours" (main-value) exactly as a completed interactive prompt would,
+    // by editing the persisted hashes directly, then finish via `--continue`.
+    {
+        let mut state = LocalState::load_from(&owner.state_path).unwrap();
+        let cs = state.context_mut("acme-dev");
+        let mut merge_state = cs.merge.clone().unwrap();
+        let conflict = merge_state.conflicts.remove("KEY").unwrap();
+        merge_state.resolved.insert("KEY".to_string(), ResolvedEntry::Set(conflict.ours.unwrap()));
+        cs.merge = Some(merge_state);
+        state.save_to(&owner.state_path).unwrap();
+    }
+
+    commands::merge_continue(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev")
+        .await
+        .expect("continue finalizes once every conflict is resolved");
+
+    let state = LocalState::load_from(&owner.state_path).unwrap();
+    assert!(state.context("acme-dev").unwrap().merge.is_none(), "merge state must be cleared after finalizing");
+
+    let merged_tip = tip_of(&owner.state_path);
+    let store = open_object_store(&object_store_dir_for(&owner.state_path)).unwrap();
+    let commit = Commit::from_bytes(&store.get(&merged_tip).unwrap().unwrap()).unwrap();
+    assert_eq!(commit.fields.parent_hashes.len(), 2);
+    commands::log(&owner.config_path, &owner.state_path, "acme-dev").unwrap();
+
+    assert_eq!(read_via_run(&owner, "KEY").await, "main-value", "resolved to ours (main-value)");
+}
+
+/// `merge --continue` with nothing paused is a clear user error, not a silent no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_continue_without_a_paused_merge_errors() {
+    let owner = ready_fixture("p5bmerge3", None, true).await;
+    let err = commands::merge_continue(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no merge in progress"), "got: {err}");
+}
+
+/// Merging an unknown/never-fetched branch name is a clear user error, not a silent no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_unknown_branch_errors() {
+    let owner = ready_fixture("p5bmerge4", None, true).await;
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("K".into(), "v".into())])
+        .await
+        .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "root".into())
+        .await
+        .unwrap();
+
+    let err = commands::merge(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "nonexistent")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("unknown branch"), "got: {err}");
 }

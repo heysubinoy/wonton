@@ -74,6 +74,13 @@ pub struct ContextState {
     /// Pending changes not yet committed: key name -> staged entry.
     #[serde(default)]
     pub staged: BTreeMap<String, StagedEntry>,
+    /// A `wonton merge` paused on unresolved conflicts, resumed via `wonton merge --continue`.
+    /// `None` when no merge is in progress. Holds only content hashes and key/branch names —
+    /// never plaintext (PROGRESS.md §3.8: reuses the exact hash-only mechanism `StagedEntry`
+    /// already uses, instead of PLAN.md §6's plaintext-conflict-file suggestion, which would
+    /// violate rule #5).
+    #[serde(default)]
+    pub merge: Option<MergeState>,
 }
 
 fn default_branch() -> String {
@@ -87,8 +94,63 @@ impl Default for ContextState {
             dek_version: 0,
             tips: BTreeMap::new(),
             staged: BTreeMap::new(),
+            merge: None,
         }
     }
+}
+
+/// A merge paused mid-resolution: the two tips + their (possibly absent) common ancestor, and
+/// whatever conflicts have/haven't yet been resolved. Every field is a content hash, key name, or
+/// branch name — never plaintext.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeState {
+    /// The branch being merged in ("theirs").
+    pub branch: String,
+    pub ours_tip: Hash,
+    pub theirs_tip: Hash,
+    /// The merge-base commit, or `None` for disjoint histories (the merge then proceeds against
+    /// an empty base tree).
+    #[serde(default)]
+    pub base: Option<Hash>,
+    /// Key -> resolved entry for every conflicting key that has been settled so far (via the
+    /// interactive prompt). See [`ResolvedEntry`] for why this isn't a plain `Option<Hash>`.
+    #[serde(default)]
+    pub resolved: BTreeMap<String, ResolvedEntry>,
+    /// Key -> the still-conflicting (ours, theirs) blob hashes, not yet resolved.
+    #[serde(default)]
+    pub conflicts: BTreeMap<String, ConflictHashes>,
+}
+
+/// One key's resolved outcome in a paused/resumed merge. Mirrors [`StagedEntry`]'s adjacent
+/// tagging, and for the same underlying reason: a plain `Option<Hash>` map value would work for
+/// the `Set` case, but `toml_edit`'s inline-table serializer silently *drops* a `None` map value
+/// on serialize instead of preserving it (verified empirically against `toml_edit` 0.22's
+/// `SerializeInlineTable::serialize_value`, which treats the value's `Error::unsupported_none()`
+/// as "just omit this entry"). That would make a resolved-to-deletion key indistinguishable from
+/// "never resolved" after a save/load round trip, silently corrupting a paused merge's state. An
+/// explicit tombstone variant round-trips exactly like `StagedEntry` already does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", content = "hash", rename_all = "lowercase")]
+pub enum ResolvedEntry {
+    /// Resolved to this blob hash (already agent-encrypted, already in the local object store —
+    /// either an existing side's blob reused as-is, or a freshly-encrypted manual entry).
+    Set(Hash),
+    /// Resolved to a deletion: the key will be absent from the merge commit's tree.
+    Delete,
+}
+
+/// The still-conflicting blob hashes for one key. `None` on a side means that side deleted the
+/// key (the classic "one side deletes, the other modifies" conflict). Unlike [`ResolvedEntry`]
+/// above, `Option<Hash>` is fine here: these are plain struct fields, not map values, so a `None`
+/// field is simply omitted from the serialized table (the same precedent as
+/// `Identity::session_token`), never silently dropped from a collection the way a map value would
+/// be.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictHashes {
+    #[serde(default)]
+    pub ours: Option<Hash>,
+    #[serde(default)]
+    pub theirs: Option<Hash>,
 }
 
 /// A pending staged change for one key. Adjacently tagged so both variants serialize as uniform
@@ -251,5 +313,103 @@ mod tests {
             back.context("c").unwrap().staged.get("UNSET"),
             Some(&StagedEntry::Unset)
         );
+    }
+
+    /// The field-ordering constraint this file's doc comments already warn about: `merge` (an
+    /// `Option` of a table-shaped type) must not break the TOML serializer when placed after the
+    /// existing `tips`/`staged` tables. Also covers the `None`/empty-map cases explicitly.
+    #[test]
+    fn context_state_round_trips_with_no_merge_in_progress() {
+        let mut state = LocalState::default();
+        state.context_mut("acme-dev").tips.insert("main".to_string(), sample_hash(b"tip"));
+
+        let toml = toml::to_string_pretty(&state).unwrap();
+        assert!(
+            !toml.contains("[contexts.acme-dev.merge]"),
+            "an absent merge must not appear at all, got:\n{toml}"
+        );
+        let back: LocalState = toml::from_str(&toml).unwrap();
+        assert_eq!(back, state);
+        assert_eq!(back.context("acme-dev").unwrap().merge, None);
+    }
+
+    /// A fully populated `MergeState` — including a resolved deletion (`ResolvedEntry::Delete`)
+    /// and a delete-vs-modify conflict (`ConflictHashes { ours: None, .. }`) — round-trips through
+    /// TOML exactly, and the serialized file holds only hex hashes / key names / branch names,
+    /// never plaintext.
+    #[test]
+    fn merge_state_round_trips_through_toml_including_none_and_tombstone_cases() {
+        let dir = std::env::temp_dir().join(format!("wonton-state-merge-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("state.toml");
+
+        let mut resolved = BTreeMap::new();
+        resolved.insert("SET_KEY".to_string(), ResolvedEntry::Set(sample_hash(b"resolved-blob")));
+        resolved.insert("DELETED_KEY".to_string(), ResolvedEntry::Delete);
+
+        let mut conflicts = BTreeMap::new();
+        conflicts.insert(
+            "STILL_CONFLICTING".to_string(),
+            ConflictHashes {
+                ours: Some(sample_hash(b"ours-blob")),
+                theirs: Some(sample_hash(b"theirs-blob")),
+            },
+        );
+        conflicts.insert(
+            "DELETE_VS_MODIFY".to_string(),
+            ConflictHashes {
+                ours: None,
+                theirs: Some(sample_hash(b"theirs-blob-2")),
+            },
+        );
+
+        let mut state = LocalState::default();
+        let cs = state.context_mut("acme-dev");
+        cs.tips.insert("main".to_string(), sample_hash(b"ours-tip"));
+        cs.merge = Some(MergeState {
+            branch: "feature".to_string(),
+            ours_tip: sample_hash(b"ours-tip"),
+            theirs_tip: sample_hash(b"theirs-tip"),
+            base: Some(sample_hash(b"base-tip")),
+            resolved,
+            conflicts,
+        });
+        state.save_to(&path).unwrap();
+
+        let loaded = LocalState::load_from(&path).unwrap();
+        assert_eq!(loaded, state);
+
+        let merge = loaded.context("acme-dev").unwrap().merge.as_ref().unwrap();
+        assert_eq!(merge.branch, "feature");
+        assert_eq!(merge.resolved.get("DELETED_KEY"), Some(&ResolvedEntry::Delete));
+        assert_eq!(
+            merge.conflicts.get("DELETE_VS_MODIFY"),
+            Some(&ConflictHashes { ours: None, theirs: Some(sample_hash(b"theirs-blob-2")) })
+        );
+
+        // No plaintext byte anywhere in the file: every non-structural token is either hex (a
+        // `Hash`'s hex encoding is 64 lowercase hex chars) or one of the key/branch names we
+        // supplied ourselves above.
+        let contents = std::fs::read_to_string(&path).unwrap();
+        for token in contents.split(['=', '"', '\n', ' ', '.', '[', ']']) {
+            let token = token.trim();
+            if token.is_empty() || token.ends_with(':') {
+                continue;
+            }
+            let is_hex_hash = token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit());
+            let is_known_plaintext_metadata = matches!(
+                token,
+                "contexts" | "acme-dev" | "branch" | "main" | "feature" | "dek_version" | "tips"
+                    | "staged" | "merge" | "ours_tip" | "theirs_tip" | "base" | "resolved"
+                    | "conflicts" | "op" | "hash" | "set" | "delete" | "ours" | "theirs"
+                    | "SET_KEY" | "DELETED_KEY" | "STILL_CONFLICTING" | "DELETE_VS_MODIFY" | "0"
+            );
+            assert!(
+                is_hex_hash || is_known_plaintext_metadata,
+                "unexpected token '{token}' in state.toml (possible plaintext leak):\n{contents}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
