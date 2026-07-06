@@ -26,3 +26,4 @@ wonton-shared = { version = "0.1.0", path = "../shared" }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }  # ServiceExt::oneshot for route-level tests
+toml = "0.8"  # parses Cargo.toml files for the server-blindness dependency-direction test
