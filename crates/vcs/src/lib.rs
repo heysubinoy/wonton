@@ -43,7 +43,10 @@ mod testutil;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
-use wonton_crypto::{decrypt_value, encrypt_value, verify, CryptoError, Dek, EncryptedValue, PublicIdentity};
+use wonton_crypto::{
+    decrypt_value, encrypt_value, sign, verify, CryptoError, Dek, EncryptedValue, PublicIdentity,
+    UnlockedIdentity,
+};
 use wonton_objects::{Blob, Commit, Hash, LocalObjectStore, ObjectError, Tree};
 
 pub use commit::commit;
@@ -69,6 +72,25 @@ pub trait ValueEncryptor {
 /// for the same reason [`commit`] is generic over [`ValueEncryptor`] — see its docs.
 pub trait ValueDecryptor {
     fn decrypt(&self, value: &EncryptedValue) -> Result<Vec<u8>, VcsError>;
+}
+
+/// Signs a commit's canonical field bytes with an Ed25519 key, returning the 64-byte signature.
+/// [`commit`] is generic over this trait rather than taking a raw [`UnlockedIdentity`] directly,
+/// for the same reason it is generic over [`ValueEncryptor`]: a caller that must never hold raw
+/// key material in its own process (e.g. the CLI, which only talks to `wonton-agent`) can supply
+/// an agent-backed adapter that signs remotely. Implemented for [`UnlockedIdentity`] itself so
+/// every existing offline caller (and every test in this crate) is unaffected.
+///
+/// Fallible (unlike the underlying local `sign`, which cannot fail): an agent-backed
+/// implementation can fail closed on the agent being locked or unreachable.
+pub trait CommitSigner {
+    fn sign(&self, message: &[u8]) -> Result<[u8; 64], VcsError>;
+}
+
+impl CommitSigner for UnlockedIdentity {
+    fn sign(&self, message: &[u8]) -> Result<[u8; 64], VcsError> {
+        Ok(sign(self, message))
+    }
 }
 
 impl ValueEncryptor for Dek {

@@ -90,11 +90,11 @@ mod tests {
 
         let mut ws = WorkingSet::new();
         ws.set("K", b"one".to_vec());
-        let c1 = commit(&store, &dek, &identity, None, &ws, "c1").unwrap();
+        let c1 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),None, &ws, "c1").unwrap();
         ws.set("K", b"two".to_vec());
-        let c2 = commit(&store, &dek, &identity, Some(c1), &ws, "c2").unwrap();
+        let c2 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),Some(c1), &ws, "c2").unwrap();
         ws.set("K", b"three".to_vec());
-        let c3 = commit(&store, &dek, &identity, Some(c2), &ws, "c3").unwrap();
+        let c3 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),Some(c2), &ws, "c3").unwrap();
 
         let history = log(&store, c3, &pubkey).unwrap();
         let hashes: Vec<Hash> = history.iter().map(|v| v.hash).collect();
@@ -108,7 +108,7 @@ mod tests {
         let (_dir, store) = temp_store();
         let identity = new_identity(b"pass");
         let dek = new_dek();
-        let c1 = commit(&store, &dek, &identity, None, &WorkingSet::new(), "root").unwrap();
+        let c1 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),None, &WorkingSet::new(), "root").unwrap();
         let history = log(&store, c1, &identity.public().ed25519_pubkey).unwrap();
         assert_eq!(history.len(), 1);
         assert!(history[0].commit.fields.parent_hashes.is_empty());
@@ -119,7 +119,7 @@ mod tests {
         let (_dir, store) = temp_store();
         let identity = new_identity(b"pass");
         let dek = new_dek();
-        let c1 = commit(&store, &dek, &identity, None, &WorkingSet::new(), "root").unwrap();
+        let c1 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),None, &WorkingSet::new(), "root").unwrap();
 
         // Overwrite the stored commit bytes in place (hostile/corrupted disk). The store's
         // own hash re-verification on `get` must catch it.
@@ -134,7 +134,7 @@ mod tests {
         let (_dir, store) = temp_store();
         let identity = new_identity(b"pass");
         let dek = new_dek();
-        let c1 = commit(&store, &dek, &identity, None, &WorkingSet::new(), "root").unwrap();
+        let c1 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),None, &WorkingSet::new(), "root").unwrap();
 
         // Read the commit, flip a signature byte, and re-store it at its *recomputed* hash so
         // the content-hash check passes and we actually reach signature verification.
@@ -158,7 +158,16 @@ mod tests {
         let signer = new_identity(b"signer pass");
         let other = new_identity(b"other pass");
         let dek = new_dek();
-        let c1 = commit(&store, &dek, &signer, None, &WorkingSet::new(), "root").unwrap();
+        let c1 = commit(
+            &store,
+            &dek,
+            &signer,
+            crate::author_id_from_identity(signer.public()),
+            None,
+            &WorkingSet::new(),
+            "root",
+        )
+        .unwrap();
 
         // A genuine, untampered commit verified against the wrong pubkey must fail.
         let err = log(&store, c1, &other.public().ed25519_pubkey).unwrap_err();
@@ -173,7 +182,7 @@ mod tests {
         let (_dir, store) = temp_store();
         let identity = new_identity(b"pass");
         let dek = new_dek();
-        let c1 = commit(&store, &dek, &identity, None, &WorkingSet::new(), "root").unwrap();
+        let c1 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),None, &WorkingSet::new(), "root").unwrap();
 
         // Truncate the signature to an invalid length and re-store at the recomputed hash.
         let bytes = store.get(&c1).unwrap().unwrap();
@@ -194,8 +203,8 @@ mod tests {
         let dek = new_dek();
 
         // Two independent root commits.
-        let p1 = commit(&store, &dek, &identity, None, &WorkingSet::new(), "p1").unwrap();
-        let p2 = commit(&store, &dek, &identity, None, &WorkingSet::new(), "p2").unwrap();
+        let p1 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),None, &WorkingSet::new(), "p1").unwrap();
+        let p2 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),None, &WorkingSet::new(), "p2").unwrap();
 
         // Hand-build a signed merge commit with two parents (commit() only makes 0/1-parent
         // commits) and store it.

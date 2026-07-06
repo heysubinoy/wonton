@@ -100,7 +100,7 @@ mod tests {
         let mut ws = WorkingSet::new();
         ws.set("A", b"1".to_vec());
         ws.set("B", b"2".to_vec());
-        let c1 = commit(&store, &dek, &identity, None, &ws, "c1").unwrap();
+        let c1 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),None, &ws, "c1").unwrap();
 
         let d = diff(&store, &dek, None, c1).unwrap();
         assert_eq!(
@@ -120,7 +120,7 @@ mod tests {
         ws.set("A", b"apple".to_vec());
         ws.set("B", b"banana".to_vec());
         ws.set("R", b"removeme".to_vec());
-        let c1 = commit(&store, &dek, &identity, None, &ws, "c1").unwrap();
+        let c1 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),None, &ws, "c1").unwrap();
 
         // c2: A=apple (unchanged value, re-encrypted), B=blueberry (changed), C=cherry (added),
         //     R dropped (removed).
@@ -128,7 +128,7 @@ mod tests {
         ws2.set("A", b"apple".to_vec());
         ws2.set("B", b"blueberry".to_vec());
         ws2.set("C", b"cherry".to_vec());
-        let c2 = commit(&store, &dek, &identity, Some(c1), &ws2, "c2").unwrap();
+        let c2 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),Some(c1), &ws2, "c2").unwrap();
 
         let d = diff(&store, &dek, Some(c1), c2).unwrap();
         // Sorted key order: A(unchanged→absent), B(changed), C(added), R(removed).
@@ -156,12 +156,12 @@ mod tests {
 
         let mut ws = WorkingSet::new();
         ws.set("SECRET", b"do-not-touch".to_vec());
-        let c1 = commit(&store, &dek, &identity, None, &ws, "c1").unwrap();
+        let c1 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),None, &ws, "c1").unwrap();
 
         // Re-stage the identical plaintext and commit again.
         let mut ws2 = WorkingSet::new();
         ws2.set("SECRET", b"do-not-touch".to_vec());
-        let c2 = commit(&store, &dek, &identity, Some(c1), &ws2, "c2").unwrap();
+        let c2 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),Some(c1), &ws2, "c2").unwrap();
 
         // Precondition: the two blob hashes for SECRET genuinely differ (distinct nonces), so
         // a hash-only diff *would* wrongly report a change.
@@ -190,9 +190,9 @@ mod tests {
         // Two commits with a genuinely different value for K, so diff must decrypt both blobs.
         let mut ws = WorkingSet::new();
         ws.set("K", b"v1".to_vec());
-        let c1 = commit(&store, &dek, &identity, None, &ws, "c1").unwrap();
+        let c1 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),None, &ws, "c1").unwrap();
         ws.set("K", b"v2".to_vec());
-        let c2 = commit(&store, &dek, &identity, Some(c1), &ws, "c2").unwrap();
+        let c2 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),Some(c1), &ws, "c2").unwrap();
 
         // Corrupt c2's blob for K on disk; the store's hash check on `get` must fire.
         let t2 = crate::load_tree_of_commit(&store, &c2).unwrap();
@@ -214,9 +214,9 @@ mod tests {
 
         let mut ws = WorkingSet::new();
         ws.set("K", b"v1".to_vec());
-        let c1 = commit(&store, &dek, &identity, None, &ws, "c1").unwrap();
+        let c1 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),None, &ws, "c1").unwrap();
         ws.set("K", b"v2".to_vec());
-        let c2 = commit(&store, &dek, &identity, Some(c1), &ws, "c2").unwrap();
+        let c2 = commit(&store, &dek, &identity, crate::author_id_from_identity(identity.public()),Some(c1), &ws, "c2").unwrap();
 
         // A different DEK cannot authenticate the blobs → decryption fails closed.
         let wrong = new_dek();
