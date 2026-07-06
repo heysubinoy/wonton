@@ -13,11 +13,11 @@ use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use wonton_objects::Hash;
 use wonton_shared::{
-    CreateEnvRequest, CreateEnvResponse, CreateStoreRequest, CreateStoreResponse, EnvSummary,
-    GrantKeyRequest, KeysMap, LoginCompleteRequest, LoginCompleteResponse, LoginStartRequest,
-    LoginStartResponse, MachineTokenRequest, MachineTokenResponse, MemberRequest,
-    ObjectUploadRequest, RefConflict, RefMap, RefMoveRequest, RegisterRequest, RegisterResponse,
-    RotateRequest,
+    CreateEnvRequest, CreateEnvResponse, CreateStoreRequest, CreateStoreResponse, EnvDetails,
+    EnvSummary, GrantKeyRequest, KeysMap, LoginCompleteRequest, LoginCompleteResponse,
+    LoginStartRequest, LoginStartResponse, MachineTokenRequest, MachineTokenResponse, MemberInfo,
+    MemberRequest, ObjectUploadRequest, RefConflict, RefMap, RefMoveRequest, RegisterRequest,
+    RegisterResponse, RotateRequest, UserPublicInfo,
 };
 
 use crate::error::SyncError;
@@ -280,6 +280,46 @@ impl SyncClient {
             return Err(SyncError::Conflict(conflict));
         }
         ok_response(resp).await
+    }
+
+    // ---- Directory / lookups ----------------------------------------------------------
+
+    /// `GET /users/{username}`. Resolve a username to its public identity keys (needed to wrap a
+    /// DEK for a share target and to resolve a username to a user id). Requires any valid token.
+    /// 404 (`SyncError::NotFound`) if the username is unknown.
+    pub async fn get_user(&self, username: &str) -> Result<UserPublicInfo, SyncError> {
+        let resp = self
+            .authed(self.http.get(self.url(&format!("/users/{username}"))))
+            .send()
+            .await?;
+        json_response(resp).await
+    }
+
+    /// `GET /envs/{store}/{env}`. Environment metadata (id + active DEK version). Requires
+    /// >= reader.
+    pub async fn get_env_details(&self, store: &str, env: &str) -> Result<EnvDetails, SyncError> {
+        let resp = self
+            .authed(self.http.get(self.url(&format!("/envs/{store}/{env}"))))
+            .send()
+            .await?;
+        json_response(resp).await
+    }
+
+    /// `GET /envs/{store}/{env}/members`. Every member's id, role, and X25519 pubkey (for
+    /// re-wrapping a rotated DEK). Requires >= reader.
+    pub async fn list_members(
+        &self,
+        store: &str,
+        env: &str,
+    ) -> Result<Vec<MemberInfo>, SyncError> {
+        let resp = self
+            .authed(
+                self.http
+                    .get(self.url(&format!("/envs/{store}/{env}/members"))),
+            )
+            .send()
+            .await?;
+        json_response(resp).await
     }
 
     // ---- Wrapped-DEK maps / membership ------------------------------------------------
