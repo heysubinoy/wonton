@@ -35,7 +35,7 @@ use wonton_shared::{
     RefConflict, RegisterRequest,
 };
 use wonton_sync::{pull, push, PullOutcome, SyncClient, SyncError};
-use wonton_vcs::{commit, WorkingSet};
+use wonton_vcs::{author_id_from_identity, commit, WorkingSet};
 
 // ---- server / fixture infrastructure --------------------------------------------------
 
@@ -282,9 +282,9 @@ async fn push_then_pull_round_trips_a_linear_history() {
     let dek = new_dek();
     let mut ws = WorkingSet::new();
     ws.set("DATABASE_URL", b"postgres://db".to_vec());
-    let root = commit(&src.store, &dek, &identity, None, &ws, "root").unwrap();
+    let root = commit(&src.store, &dek, &identity, author_id_from_identity(identity.public()), None, &ws, "root").unwrap();
     ws.set("API_KEY", b"sk-live-xyz".to_vec());
-    let tip = commit(&src.store, &dek, &identity, Some(root), &ws, "add api key").unwrap();
+    let tip = commit(&src.store, &dek, &identity, author_id_from_identity(identity.public()), Some(root), &ws, "add api key").unwrap();
 
     // Push everything, then create the ref.
     let objects = all_object_hashes(&src.root);
@@ -335,7 +335,7 @@ async fn pull_reports_up_to_date_when_tips_match() {
     let dek = new_dek();
     let mut ws = WorkingSet::new();
     ws.set("K", b"v".to_vec());
-    let tip = commit(&src.store, &dek, &identity, None, &ws, "only").unwrap();
+    let tip = commit(&src.store, &dek, &identity, author_id_from_identity(identity.public()), None, &ws, "only").unwrap();
     let objects = all_object_hashes(&src.root);
     push(&client, &src.store, "acme", "dev", "main", &objects, None, tip)
         .await
@@ -371,7 +371,7 @@ async fn pull_reports_diverged_for_unrelated_histories() {
     let dek = new_dek();
     let mut ws = WorkingSet::new();
     ws.set("REMOTE", b"r".to_vec());
-    let remote_tip = commit(&remote_src.store, &dek, &identity, None, &ws, "remote root").unwrap();
+    let remote_tip = commit(&remote_src.store, &dek, &identity, author_id_from_identity(identity.public()), None, &ws, "remote root").unwrap();
     let objects = all_object_hashes(&remote_src.root);
     push(
         &client,
@@ -391,7 +391,7 @@ async fn pull_reports_diverged_for_unrelated_histories() {
     let local_src = temp_store();
     let mut ws2 = WorkingSet::new();
     ws2.set("LOCAL", b"l".to_vec());
-    let local_tip = commit(&local_src.store, &dek, &identity, None, &ws2, "local root").unwrap();
+    let local_tip = commit(&local_src.store, &dek, &identity, author_id_from_identity(identity.public()), None, &ws2, "local root").unwrap();
     assert_ne!(local_tip, remote_tip);
 
     let dst = temp_store();
@@ -426,9 +426,9 @@ async fn push_with_stale_old_hash_surfaces_conflict() {
     let dek = new_dek();
     let mut ws = WorkingSet::new();
     ws.set("K", b"v1".to_vec());
-    let a = commit(&src.store, &dek, &identity, None, &ws, "A").unwrap();
+    let a = commit(&src.store, &dek, &identity, author_id_from_identity(identity.public()), None, &ws, "A").unwrap();
     ws.set("K", b"v2".to_vec());
-    let b = commit(&src.store, &dek, &identity, Some(a), &ws, "B").unwrap();
+    let b = commit(&src.store, &dek, &identity, author_id_from_identity(identity.public()), Some(a), &ws, "B").unwrap();
     let objects = all_object_hashes(&src.root);
 
     // Establish main -> A, then advance main A -> B.
@@ -469,7 +469,7 @@ async fn rbac_and_auth_errors_are_surfaced() {
     let identity = new_identity();
     let dek = new_dek();
     let ws = WorkingSet::new();
-    let tip = commit(&src.store, &dek, &identity, None, &ws, "c").unwrap();
+    let tip = commit(&src.store, &dek, &identity, author_id_from_identity(identity.public()), None, &ws, "c").unwrap();
     let objects = all_object_hashes(&src.root);
 
     // Forbidden: a reader may not move a ref (push).
