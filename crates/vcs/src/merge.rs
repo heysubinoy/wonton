@@ -352,7 +352,7 @@ mod tests {
         assert_eq!(merged_commit.fields.parent_hashes, vec![ours, theirs]);
 
         // `log`'s mainline-follow fix (Phase 5b) must walk straight through without erroring.
-        let history = crate::log(&store, merge_hash, &identity.public().ed25519_pubkey).unwrap();
+        let history = crate::log(&store, merge_hash, |_| Some(identity.public().ed25519_pubkey)).unwrap();
         let hashes: Vec<Hash> = history.iter().map(|v| v.hash).collect();
         assert_eq!(hashes, vec![merge_hash, ours, root]);
     }

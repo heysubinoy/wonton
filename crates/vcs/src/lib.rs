@@ -25,9 +25,16 @@
 //!   UUIDv5 from the Ed25519 public key so the same identity always commits under the same
 //!   id. Phase 3/4 replaces this with a real, server-assigned registered user id — the
 //!   commit format does not change, only the source of the `Uuid`.
-//! - **Single-signer `log`.** [`log`] takes one expected signer pubkey and verifies every
-//!   commit in the history against it. Multi-author signer resolution via a user registry is
-//!   a Phase 3/4 concern.
+//! - **Multi-author `log` (resolved — found via manual end-to-end testing, 2026-07-06).**
+//!   [`log`] used to take one fixed expected signer pubkey for the whole history, which broke
+//!   the moment a second identity (e.g. a user a history was shared with) tried to verify a
+//!   history it didn't entirely author itself — every commit not authored by the *caller's own*
+//!   identity failed signature verification, even though nothing was tampered. [`log`] now takes
+//!   a `resolve_signer: impl Fn(Uuid) -> Option<[u8; 32]>` callback and looks up each commit's
+//!   pubkey by its own `author_id`, so a genuinely multi-author, shared history verifies
+//!   correctly for every reader who has each author's public key (the CLI builds this map from
+//!   the server's user directory — see [`mainline_author_ids`]). A resolver returning `None`
+//!   fails the walk closed ([`VcsError::UnknownSigner`]) rather than skipping verification.
 //! - **`log` follows the mainline through merge commits (resolved in Phase 5b).** Merge commits
 //!   (2+ parents) now exist — see the [`merge`] module. [`log`] includes a merge commit in its
 //!   walk and continues via `parent_hashes[0]`, i.e. `git log --first-parent` semantics, rather
@@ -56,7 +63,7 @@ use wonton_objects::{Blob, Commit, Hash, LocalObjectStore, ObjectError, Tree};
 
 pub use commit::commit;
 pub use diff::{diff, DiffEntry};
-pub use log::{log, VerifiedCommit};
+pub use log::{log, mainline_author_ids, VerifiedCommit};
 pub use merge::{commit_merge, merge_base, three_way_merge, MergeEntry};
 pub use working_set::WorkingSet;
 
@@ -169,6 +176,13 @@ pub enum VcsError {
          not support merge commits"
     )]
     MultiParentCommit(String),
+
+    /// [`log`]'s signer resolver returned `None` for a commit's `author_id`: the caller has no
+    /// known public key for that author, so the signature cannot be verified at all. This is a
+    /// hard failure (fail closed, PLAN.md §12.3), never treated as "assume valid" or silently
+    /// skipped.
+    #[error("no known public key for commit author {0}; cannot verify signature")]
+    UnknownSigner(Uuid),
 }
 
 /// Derive the Phase-2 **placeholder** author id for an identity.
