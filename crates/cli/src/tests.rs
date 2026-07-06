@@ -1150,3 +1150,77 @@ async fn merge_unknown_branch_errors() {
         .unwrap_err();
     assert!(err.to_string().contains("unknown branch"), "got: {err}");
 }
+
+// ---- §14 no-plaintext-on-disk -------------------------------------------------------------
+
+/// Recursively collects every regular file under `root` (missing dirs yield an empty list).
+fn all_files(root: &std::path::Path) -> Vec<PathBuf> {
+    fn walk(p: &std::path::Path, out: &mut Vec<PathBuf>) {
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(root, &mut files);
+    files
+}
+
+/// PLAN.md rule #5 (§8.6): plaintext secrets must never touch disk except through the two named
+/// exits (`wonton run`'s child-process environment and `wonton export`'s named file). This drives
+/// a full `set` -> `commit` -> `run` cycle (the same cycle `share_grants_access_without_re_encryption`
+/// above uses to actually read a secret back) and then scans every file under both the state
+/// directory (object store + `state.toml`, including any paused-merge state) and the config
+/// directory (`config.toml`, cached wrapped keys) for the literal plaintext bytes, asserting they
+/// never appear — only ciphertext/hashes may.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_plaintext_secret_touches_disk_outside_the_named_export_exit() {
+    let fx = ready_fixture("nopt", None, true).await;
+    let plaintext = "sk-super-secret-plaintext-marker-9f3a";
+
+    commands::set(
+        &fx.config_path,
+        &fx.state_path,
+        &fx.socket,
+        "acme-dev",
+        vec![("SECRET".into(), plaintext.into())],
+    )
+    .await
+    .unwrap();
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", "seed".into())
+        .await
+        .unwrap();
+
+    // `run` must inject the plaintext only into the child process's environment, never to disk.
+    let code = commands::run(
+        &fx.config_path,
+        &fx.state_path,
+        &fx.socket,
+        "acme-dev",
+        vec!["true".into()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0);
+
+    let needle = plaintext.as_bytes();
+    for dir in [
+        fx.state_path.parent().expect("state_path has a parent dir"),
+        fx.config_path.parent().expect("config_path has a parent dir"),
+    ] {
+        for file in all_files(dir) {
+            let bytes = std::fs::read(&file).unwrap();
+            assert!(
+                bytes.windows(needle.len()).all(|w| w != needle),
+                "plaintext secret leaked to disk at {}",
+                file.display()
+            );
+        }
+    }
+}
