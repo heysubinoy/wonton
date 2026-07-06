@@ -238,3 +238,38 @@ pub struct MemberRequest {
     pub user_id: String,
     pub role: Role,
 }
+
+// ---------------------------------------------------------------------------------------
+// Directory / lookup responses (Phase 5a: needed by `share` / `revoke` / `key rotate`)
+// ---------------------------------------------------------------------------------------
+
+/// `GET /users/:username` response: a user's public identity keys. Everything here is
+/// non-secret (public keys + a server-assigned id); it is what `share` needs to wrap a DEK for
+/// a target and what a client uses to resolve a username to a user id before granting/revoking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserPublicInfo {
+    pub user_id: String,
+    /// base64 of the 32-byte Ed25519 public key.
+    pub ed25519_pubkey: String,
+    /// base64 of the 32-byte X25519 public key.
+    pub x25519_pubkey: String,
+}
+
+/// One entry of `GET /envs/:store/:env/members` response: a member's id, role, and the X25519
+/// public key needed to re-wrap a rotated DEK for them (`key rotate` re-wraps for every member).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemberInfo {
+    pub user_id: String,
+    pub role: Role,
+    /// base64 of the member's 32-byte X25519 public key.
+    pub x25519_pubkey: String,
+}
+
+/// `GET /envs/:store/:env` response: environment metadata a client needs to grant/rotate at the
+/// correct version. `active_dek_version` is tracked server-side (`environments.active_dek_version`)
+/// and never otherwise exposed; `share` grants at it, `rotate` advances it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvDetails {
+    pub env_id: String,
+    pub active_dek_version: u32,
+}

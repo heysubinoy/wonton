@@ -98,6 +98,8 @@ pub fn build_router(pool: SqlitePool) -> Router {
             "/stores/{store}/envs",
             get(handlers::list_envs).post(handlers::create_env),
         )
+        // User directory (any valid token — public keys, gated only to avoid enumeration)
+        .route("/users/{username}", get(handlers::get_user))
         // Objects (content-addressed; any valid token — see PROGRESS.md re: no per-object env
         // scoping in this phase)
         .route("/objects/{hash}", get(handlers::get_object))
@@ -105,14 +107,19 @@ pub fn build_router(pool: SqlitePool) -> Router {
         // Refs
         .route("/refs/{store}/{env}", get(handlers::list_refs))
         .route("/refs/{store}/{env}/{branch}", post(handlers::move_ref))
+        // Environment details
+        .route("/envs/{store}/{env}", get(handlers::get_env_details))
         // Wrapped-DEK maps
         .route(
             "/envs/{store}/{env}/keys",
             get(handlers::list_keys).post(handlers::grant_key),
         )
         .route("/envs/{store}/{env}/rotate", post(handlers::rotate))
-        // Membership (admin-only)
-        .route("/envs/{store}/{env}/members", post(handlers::add_member))
+        // Membership (list requires >= reader; add is admin-only)
+        .route(
+            "/envs/{store}/{env}/members",
+            get(handlers::list_members).post(handlers::add_member),
+        )
         .route(
             "/envs/{store}/{env}/members/{user_id}",
             delete(handlers::remove_member),

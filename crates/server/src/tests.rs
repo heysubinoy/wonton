@@ -347,6 +347,98 @@ async fn create_env_creator_can_grant_a_key_proving_admin_membership() {
     assert_eq!(status, StatusCode::OK);
 }
 
+// ---- User directory / env details / members (Phase 5a) -----------------------------------
+
+#[tokio::test]
+async fn get_user_returns_public_keys_and_404s_for_unknown() {
+    let pool = test_pool().await;
+    let ed = [7u8; 32];
+    let x = [8u8; 32];
+    let user_id = seed_user(&pool, "alice", &ed, &x).await;
+    // A second user provides the authenticated caller (any valid actor may look users up).
+    let caller_id = seed_user(&pool, "caller", &[1u8; 32], &[2u8; 32]).await;
+    let token = seed_session(&pool, &caller_id, now_unix() + 3600).await;
+    let router = build_router(pool);
+
+    let (status, body) = send_json(&router, "GET", "/users/alice", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user_id"].as_str().unwrap(), user_id);
+    assert_eq!(body["ed25519_pubkey"], json!(STANDARD.encode(ed)));
+    assert_eq!(body["x25519_pubkey"], json!(STANDARD.encode(x)));
+
+    // Unknown username -> 404.
+    let (status, _) = send_json(&router, "GET", "/users/nobody", Some(&token), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Unauthenticated -> 401 (avoids unauthenticated user enumeration).
+    let (status, _) = send_json(&router, "GET", "/users/alice", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn get_env_details_returns_active_version_for_a_reader_and_403s_for_non_members() {
+    let pool = test_pool().await;
+    let reader_id = seed_user(&pool, "reader", &[1u8; 32], &[2u8; 32]).await;
+    let outsider_id = seed_user(&pool, "outsider", &[3u8; 32], &[4u8; 32]).await;
+    let store_id = seed_store(&pool, "acme").await;
+    let env_id = seed_env(&pool, &store_id, "dev").await;
+    seed_member(&pool, &env_id, &reader_id, "reader").await;
+    // Bump the active version so we can assert a non-default value round-trips.
+    sqlx::query("UPDATE environments SET active_dek_version = 5 WHERE id = ?")
+        .bind(&env_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let reader_token = seed_session(&pool, &reader_id, now_unix() + 3600).await;
+    let outsider_token = seed_session(&pool, &outsider_id, now_unix() + 3600).await;
+    let router = build_router(pool);
+
+    let (status, body) = send_json(&router, "GET", "/envs/acme/dev", Some(&reader_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["env_id"].as_str().unwrap(), env_id);
+    assert_eq!(body["active_dek_version"], json!(5));
+
+    // A non-member is forbidden (403), even though the env exists.
+    let (status, _) = send_json(&router, "GET", "/envs/acme/dev", Some(&outsider_token), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A missing env is 404.
+    let (status, _) = send_json(&router, "GET", "/envs/acme/ghost", Some(&reader_token), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn list_members_joins_users_and_returns_x25519_keys_for_a_reader() {
+    let pool = test_pool().await;
+    let admin_id = seed_user(&pool, "admin", &[1u8; 32], &[2u8; 32]).await;
+    let reader_id = seed_user(&pool, "reader", &[3u8; 32], &[4u8; 32]).await;
+    let outsider_id = seed_user(&pool, "outsider", &[9u8; 32], &[9u8; 32]).await;
+    let store_id = seed_store(&pool, "acme").await;
+    let env_id = seed_env(&pool, &store_id, "dev").await;
+    seed_member(&pool, &env_id, &admin_id, "admin").await;
+    seed_member(&pool, &env_id, &reader_id, "reader").await;
+    let admin_token = seed_session(&pool, &admin_id, now_unix() + 3600).await;
+    let outsider_token = seed_session(&pool, &outsider_id, now_unix() + 3600).await;
+    let router = build_router(pool);
+
+    let (status, body) = send_json(&router, "GET", "/envs/acme/dev/members", Some(&admin_token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let members = body.as_array().unwrap();
+    assert_eq!(members.len(), 2);
+    // Find the reader's entry and check its role + X25519 key round-trip (ordered by user_id, so
+    // we look it up by id rather than assume position).
+    let reader_entry = members
+        .iter()
+        .find(|m| m["user_id"].as_str() == Some(reader_id.as_str()))
+        .expect("reader is listed");
+    assert_eq!(reader_entry["role"], json!("reader"));
+    assert_eq!(reader_entry["x25519_pubkey"], json!(STANDARD.encode([4u8; 32])));
+
+    // A non-member cannot list members (403).
+    let (status, _) = send_json(&router, "GET", "/envs/acme/dev/members", Some(&outsider_token), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
 // ---- Objects ----------------------------------------------------------------------------
 
 #[tokio::test]

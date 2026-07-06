@@ -20,10 +20,10 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 use wonton_objects::Hash;
 use wonton_shared::{
-    Argon2ParamsDto, EnvSummary, GrantKeyRequest, KeysMap, LoginCompleteRequest,
+    Argon2ParamsDto, EnvDetails, EnvSummary, GrantKeyRequest, KeysMap, LoginCompleteRequest,
     LoginCompleteResponse, LoginStartRequest, LoginStartResponse, MachineTokenRequest,
-    MachineTokenResponse, MemberRequest, ObjectUploadRequest, RefConflict, RefMap,
-    RefMoveRequest, Role, RotateRequest, WrappedDekEntry,
+    MachineTokenResponse, MemberInfo, MemberRequest, ObjectUploadRequest, RefConflict, RefMap,
+    RefMoveRequest, Role, RotateRequest, UserPublicInfo, WrappedDekEntry,
 };
 
 use crate::auth::{hash_token, mint_nonce, mint_token};
@@ -379,6 +379,32 @@ pub async fn create_env(
     Ok(Json(CreateEnvResponse { env_id }))
 }
 
+// ---- User directory -------------------------------------------------------------------
+
+/// `GET /users/:username` — a user's public identity keys (all non-secret: public keys + a
+/// server-assigned id). Requires any valid actor: usernames are already known to whoever is
+/// sharing and the keys are non-secret, but auth is still required to avoid unauthenticated user
+/// enumeration. 404 if the username doesn't exist.
+pub async fn get_user(
+    State(st): State<AppState>,
+    _actor: Actor,
+    Path(username): Path<String>,
+) -> Result<Json<UserPublicInfo>, ApiError> {
+    let row = sqlx::query("SELECT id, ed25519_pubkey, x25519_pubkey FROM users WHERE username = ?")
+        .bind(&username)
+        .fetch_optional(&st.pool)
+        .await?
+        .ok_or(ApiError::NotFound("user"))?;
+    let user_id: String = row.get("id");
+    let ed: Vec<u8> = row.get("ed25519_pubkey");
+    let x: Vec<u8> = row.get("x25519_pubkey");
+    Ok(Json(UserPublicInfo {
+        user_id,
+        ed25519_pubkey: STANDARD.encode(ed),
+        x25519_pubkey: STANDARD.encode(x),
+    }))
+}
+
 // ---- Objects --------------------------------------------------------------------------
 
 /// `GET /objects/:hash` — opaque bytes, 404 if absent. Any valid token (no per-object env
@@ -547,6 +573,59 @@ async fn current_ref(
         .fetch_optional(pool)
         .await?;
     Ok(row.map(|r| r.get::<String, _>("commit_hash")))
+}
+
+// ---- Environment details / members ----------------------------------------------------
+
+/// `GET /envs/:store/:env` — environment metadata (its id + current active DEK version).
+/// Requires >= reader. `share` reads the version to grant at it; `rotate` to pick the next one.
+pub async fn get_env_details(
+    State(st): State<AppState>,
+    actor: Actor,
+    Path((store, env)): Path<(String, String)>,
+) -> Result<Json<EnvDetails>, ApiError> {
+    let env_id = authorize_env(&st.pool, &store, &env, &actor, Role::Reader).await?;
+    let row = sqlx::query("SELECT active_dek_version FROM environments WHERE id = ?")
+        .bind(&env_id)
+        .fetch_optional(&st.pool)
+        .await?
+        .ok_or(ApiError::NotFound("environment"))?;
+    let active_dek_version: i64 = row.get("active_dek_version");
+    Ok(Json(EnvDetails {
+        env_id,
+        active_dek_version: active_dek_version as u32,
+    }))
+}
+
+/// `GET /envs/:store/:env/members` — every member's id, role, and X25519 public key (joining
+/// `env_members` × `users`). Requires >= reader. `key rotate` re-wraps the new DEK for each.
+pub async fn list_members(
+    State(st): State<AppState>,
+    actor: Actor,
+    Path((store, env)): Path<(String, String)>,
+) -> Result<Json<Vec<MemberInfo>>, ApiError> {
+    let env_id = authorize_env(&st.pool, &store, &env, &actor, Role::Reader).await?;
+    let rows = sqlx::query(
+        "SELECT em.user_id AS user_id, em.role AS role, u.x25519_pubkey AS x25519_pubkey \
+         FROM env_members em JOIN users u ON u.id = em.user_id \
+         WHERE em.env_id = ? ORDER BY em.user_id",
+    )
+    .bind(&env_id)
+    .fetch_all(&st.pool)
+    .await?;
+
+    let out = rows
+        .iter()
+        .map(|r| {
+            let x: Vec<u8> = r.get("x25519_pubkey");
+            MemberInfo {
+                user_id: r.get("user_id"),
+                role: parse_role(&r.get::<String, _>("role")),
+                x25519_pubkey: STANDARD.encode(x),
+            }
+        })
+        .collect();
+    Ok(Json(out))
 }
 
 // ---- Wrapped-DEK maps -----------------------------------------------------------------
