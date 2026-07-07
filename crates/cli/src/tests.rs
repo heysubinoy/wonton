@@ -227,18 +227,34 @@ async fn store_and_env_create_bootstrap_a_freshly_usable_environment() {
     let _ = std::fs::remove_file(&out);
 }
 
-/// A second store creation with the same name must surface the server's 409 clearly, not panic
-/// or silently succeed. Also exercises `--identity` being omitted entirely: with exactly one
-/// identity logged in, it must be inferred without error.
+/// A second `store create` with the same name must be an idempotent no-op (`mkdir -p` style),
+/// not an error — a repeated onboarding flow needs to be safe to re-run. Also exercises
+/// `--identity` being omitted entirely: with exactly one identity logged in, it must be inferred
+/// without error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn store_create_reports_a_duplicate_name_clearly() {
+async fn store_create_is_idempotent_on_a_duplicate_name() {
     let base = start_server().await;
     let machine = login_only("dupstore", &base).await;
     commands::store_create(&machine.config_path, None, "acme").await.unwrap();
-    let err = commands::store_create(&machine.config_path, None, "acme")
+    commands::store_create(&machine.config_path, None, "acme")
         .await
-        .unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("acme"), "got: {err}");
+        .expect("re-creating an existing store must be a no-op, not an error");
+}
+
+/// `env create` on an environment that already exists must be a no-op too, and — critically —
+/// must NOT attempt the DEK self-grant bootstrap (that would be wrong: the caller didn't just
+/// create this environment, so self-granting into it isn't theirs to do).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn env_create_is_idempotent_and_skips_bootstrap_on_an_existing_env() {
+    let base = start_server().await;
+    let machine = login_only("dupenv", &base).await;
+    commands::store_create(&machine.config_path, None, "acme").await.unwrap();
+    commands::env_create(&machine.config_path, &machine.socket, None, "acme", "dev")
+        .await
+        .expect("first creation succeeds and self-grants");
+    commands::env_create(&machine.config_path, &machine.socket, None, "acme", "dev")
+        .await
+        .expect("re-creating an existing env must be a no-op, not an error");
 }
 
 /// With more than one identity cached in the same config, omitting `--identity` must be a clear

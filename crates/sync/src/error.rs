@@ -74,3 +74,14 @@ pub enum SyncError {
     #[error("server error ({0}): {1}")]
     ServerError(StatusCode, String),
 }
+
+impl SyncError {
+    /// Whether this is a generic HTTP 409 (`ApiError::Conflict`, e.g. "store already exists" /
+    /// "environment already exists") as opposed to the ref-move-specific
+    /// [`SyncError::Conflict`] variant, which carries structured CAS data instead of a plain
+    /// message. Lets a caller treat "already exists" as an idempotent no-op without matching on
+    /// `reqwest::StatusCode` directly.
+    pub fn is_already_exists(&self) -> bool {
+        matches!(self, SyncError::ServerError(status, _) if status.as_u16() == 409)
+    }
+}

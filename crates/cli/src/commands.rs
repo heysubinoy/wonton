@@ -392,7 +392,9 @@ fn resolve_identity_name<'a>(config: &'a Config, given: Option<&'a str>) -> anyh
 }
 
 /// `wonton store create <name> [--identity <identity>]` — create a new store on the server.
-/// `--identity` is only required if more than one identity is logged in locally.
+/// `--identity` is only required if more than one identity is logged in locally. Idempotent:
+/// a store that already exists is treated as success, not an error (`mkdir -p` style), so a
+/// repeated onboarding flow can safely re-run this.
 pub async fn store_create(
     config_path: &Path,
     identity_name: Option<&str>,
@@ -404,11 +406,11 @@ pub async fn store_create(
         anyhow!("no identity named '{identity_name}'; run `wonton login {identity_name}` first")
     })?;
     let client = authed_client(identity);
-    client
-        .create_store(&CreateStoreRequest { name: name.to_string() })
-        .await
-        .with_context(|| format!("could not create store '{name}'"))?;
-    println!("Created store '{name}'.");
+    match client.create_store(&CreateStoreRequest { name: name.to_string() }).await {
+        Ok(_) => println!("Created store '{name}'."),
+        Err(e) if e.is_already_exists() => println!("Store '{name}' already exists; nothing to do."),
+        Err(e) => return Err(e).with_context(|| format!("could not create store '{name}'")),
+    }
     Ok(())
 }
 
@@ -419,6 +421,11 @@ pub async fn store_create(
 /// at version 1. No context needs to exist yet for this — a scratch label stages the DEK in the
 /// agent just long enough to wrap it. `--identity` is only required if more than one identity is
 /// logged in locally.
+///
+/// Idempotent, but only in the sense that re-running it is safe: if the environment already
+/// exists, this is a no-op that does **not** attempt the DEK bootstrap (self-granting into an
+/// environment you didn't just create would be wrong — you either already have access, or you
+/// need an admin to `wonton share` you in).
 pub async fn env_create(
     config_path: &Path,
     socket_path: &Path,
@@ -433,10 +440,20 @@ pub async fn env_create(
     })?;
     let client = authed_client(identity);
 
-    client
-        .create_env(store, &CreateEnvRequest { name: env.to_string() })
-        .await
-        .with_context(|| format!("could not create environment '{store}@{env}'"))?;
+    match client.create_env(store, &CreateEnvRequest { name: env.to_string() }).await {
+        Ok(_) => {}
+        Err(e) if e.is_already_exists() => {
+            println!(
+                "Environment '{store}@{env}' already exists; skipping creation and DEK bootstrap."
+            );
+            println!(
+                "If you don't already have access, ask an admin to run `wonton share <you> \
+                 --context <context>`."
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e).with_context(|| format!("could not create environment '{store}@{env}'")),
+    }
 
     let temp_ctx = format!("{store}-{env}::init");
     agent::generate_dek(socket_path, temp_ctx.clone())
