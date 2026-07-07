@@ -466,6 +466,43 @@ async fn diff_reports_added_and_changed_but_not_unchanged() {
         !entries.iter().any(|e| matches!(e, DiffEntry::Changed(k) if k == "A")),
         "re-committing the same value must not show Changed"
     );
+
+    // `diff` must accept an unambiguous hash *prefix* too, not just the full 64-char hex hash
+    // (git-style abbreviation) -- exercise a short one on both arguments.
+    let entries_short = commands::diff(
+        &fx.config_path,
+        &fx.state_path,
+        &fx.socket,
+        "acme-dev",
+        Some(c1.to_hex()[..10].to_string()),
+        Some(c2.to_hex()[..10].to_string()),
+    )
+    .await
+    .expect("an unambiguous 10-char prefix must resolve");
+    assert_eq!(entries_short, entries, "prefix and full-hash forms must resolve to the same diff");
+}
+
+/// A hash prefix that matches nothing, and one that's simply malformed, must both be clear
+/// errors — never a panic or a silent empty diff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diff_rejects_an_unknown_prefix_and_malformed_input() {
+    let fx = ready_fixture("prefixerr", None, true).await;
+    commands::set(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", vec![("K".into(), "v".into())])
+        .await
+        .unwrap();
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", "root".into())
+        .await
+        .unwrap();
+
+    let err = commands::diff(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", Some("deadbeef00".into()), None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no commit matches"), "got: {err}");
+
+    let err = commands::diff(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", Some("not-hex!!".into()), None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not a valid commit hash"), "got: {err}");
 }
 
 /// `run` injects the effective secrets as env vars into a child process (never touching disk) and

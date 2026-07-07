@@ -22,7 +22,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use uuid::Uuid;
 use wonton_crypto::{generate_identity, EncryptedValue};
-use wonton_objects::{Blob, Commit, Hash, LocalObjectStore, Tree};
+use wonton_objects::{Blob, Commit, Hash, LocalObjectStore, Tree, HASH_LEN};
 use wonton_shared::{
     Argon2ParamsDto, CreateEnvRequest, CreateStoreRequest, GrantKeyRequest, LoginCompleteRequest,
     LoginStartRequest, MemberRequest, ObjectUploadRequest, RegisterRequest, Role, RotateRequest,
@@ -782,13 +782,20 @@ pub async fn log(config_path: &Path, state_path: &Path, ctx_name: &str) -> anyho
 
     let history = wonton_vcs::log(&store, tip, |author_id| signers.get(&author_id).copied())?;
     for vc in &history {
-        println!("commit {}", vc.hash.to_hex());
+        println!("commit {} ({})", short_hash(&vc.hash), vc.hash.to_hex());
         println!("  author:  {}", vc.commit.fields.author_id);
         println!("  date:    {}", vc.commit.fields.timestamp);
         println!("  message: {}", vc.commit.fields.message);
         println!();
     }
     Ok(())
+}
+
+/// Abbreviate a hash to its first 12 hex characters (48 bits) for scannable display — `diff` and
+/// every other command that accepts a commit hash also accepts any unambiguous prefix, so this
+/// is always enough to paste back in, and the full hash is still printed alongside it in `log`.
+fn short_hash(hash: &Hash) -> String {
+    hash.to_hex()[..12].to_string()
 }
 
 /// `wonton diff [a] [b]` — key-level diff (returns entries for `main.rs` to print).
@@ -813,9 +820,9 @@ pub async fn diff(
     let cipher = AgentCipher::new(socket_path, ctx.name.clone());
 
     let (from_hash, to_hash) = match (a, b) {
-        (Some(a), Some(b)) => (Some(parse_commit_hash(&a)?), parse_commit_hash(&b)?),
+        (Some(a), Some(b)) => (Some(parse_commit_hash(&store, &a)?), parse_commit_hash(&store, &b)?),
         // A single positional argument is the `to` commit; diff it against the empty tree.
-        (Some(a), None) => (None, parse_commit_hash(&a)?),
+        (Some(a), None) => (None, parse_commit_hash(&store, &a)?),
         (None, _) => {
             let tip = cs
                 .tips
@@ -1702,9 +1709,41 @@ fn decode_ed25519_pubkey(b64: &str) -> anyhow::Result<[u8; 32]> {
         .map_err(|_| anyhow!("stored ed25519 pubkey is not 32 bytes"))
 }
 
-/// Parse a hex commit hash argument.
-fn parse_commit_hash(s: &str) -> anyhow::Result<Hash> {
-    Hash::from_hex(s).map_err(|_| anyhow!("'{s}' is not a valid commit hash"))
+/// Parse a commit hash argument, accepting either the full 64-char hex hash or an unambiguous
+/// prefix of it (git-style abbreviation). A prefix is resolved against `store`, then filtered to
+/// hashes that are actually `Commit` objects (a prefix that happens to also match a tree/blob is
+/// not a valid commit reference). Fails closed on no match or on ambiguity, listing candidates
+/// rather than silently picking one.
+fn parse_commit_hash(store: &LocalObjectStore, s: &str) -> anyhow::Result<Hash> {
+    if s.len() == HASH_LEN * 2 {
+        return Hash::from_hex(s).map_err(|_| anyhow!("'{s}' is not a valid commit hash"));
+    }
+    if s.is_empty() || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("'{s}' is not a valid commit hash or hash prefix");
+    }
+    let candidates = store.resolve_prefix(s)?;
+    let commit_matches: Vec<Hash> = candidates
+        .into_iter()
+        .filter(|h| {
+            store
+                .get(h)
+                .ok()
+                .flatten()
+                .is_some_and(|bytes| Commit::from_bytes(&bytes).is_ok())
+        })
+        .collect();
+    match commit_matches.as_slice() {
+        [] => bail!("no commit matches hash prefix '{s}'"),
+        [only] => Ok(*only),
+        many => {
+            let list: Vec<String> = many.iter().map(|h| h.to_hex()).collect();
+            bail!(
+                "hash prefix '{s}' is ambiguous ({} matching commits): {}",
+                many.len(),
+                list.join(", ")
+            )
+        }
+    }
 }
 
 /// Load and deserialize the [`Tree`] a commit points at (reading `wonton_objects` directly, since
