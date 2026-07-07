@@ -1,4 +1,4 @@
-//! Tests for the key agent (PLAN.md §8.2, §14). These bind a real `UnixListener` to a unique
+//! Tests for the key agent. These bind a real `UnixListener` to a unique
 //! temp-directory socket per test and spawn the daemon's accept loop in-process, then talk to it
 //! over the same socket via the client — no `std::process::Command` auto-spawn (that path is for
 //! the "am I already running" UX, not for these behavioral tests).

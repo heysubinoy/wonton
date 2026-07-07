@@ -1,6 +1,6 @@
 //! # wonton-sync
 //!
-//! The client half of Wonton's sync protocol (PLAN.md §9): a typed REST client for the blind
+//! The client half of Wonton's sync protocol: a typed REST client for the blind
 //! `wonton-server`, plus [`pull`] / [`push`] built on top of it.
 //!
 //! ## What this crate is (and is not) responsible for
@@ -8,10 +8,10 @@
 //! (the documented dependency-direction rule: "sync moves opaque bytes only") and never
 //! decrypts a value, unwraps a DEK, or verifies an authorship signature. It *does* deserialize
 //! `Commit`/`Tree` objects to walk the DAG — that is plaintext structural metadata (hashes,
-//! parent links, key names), none of which is secret (PLAN.md §3 "accepted leakage").
+//! parent links, key names), none of which is secret (accepted metadata leakage).
 //!
 //! ### Integrity: content-hash, not authorship
-//! The integrity guarantee here is exactly PLAN.md §9's "every pulled object is verified before
+//! The integrity guarantee here is exactly "every pulled object is verified before
 //! use": [`SyncClient::fetch_object`] checks `Hash::of(bytes) == requested_hash` before
 //! returning, and [`pull`] additionally re-verifies via `LocalObjectStore::put`. A mismatch
 //! aborts and reports a possibly-hostile server. This is **content-hash integrity** — every

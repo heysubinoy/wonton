@@ -1,5 +1,5 @@
 //! The single source of randomness for this crate. Every nonce, salt, DEK, and identity
-//! seed is filled from the operating system CSPRNG via `OsRng` (PLAN.md §12.2). Routing all
+//! seed is filled from the operating system CSPRNG via `OsRng`. Routing all
 //! randomness through one helper makes it auditable that nothing here ever uses a
 //! predictable or caller-supplied source.
 

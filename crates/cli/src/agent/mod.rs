@@ -1,12 +1,12 @@
-//! `wonton-agent` — the ssh-agent-style key agent (PLAN.md §8.2).
+//! `wonton-agent` — the ssh-agent-style key agent.
 //!
 //! `wonton login` unlocks a user's identity ONCE per session into this long-lived daemon; every
 //! later command borrows the unlocked capability without re-prompting for a passphrase and —
 //! critically — **without any raw secret key material ever leaving the agent process.** The
 //! agent performs operations (sign a message, unwrap/cache a DEK, encrypt/decrypt a value under
 //! a cached DEK) and returns only non-secret results (a signature, a plaintext value). It never
-//! hands back the identity seed or a raw `Dek`. This is what makes PLAN.md §12.4/§12.5 (secrets
-//! off disk, key material confined and zeroized) tractable: raw key material stays in one place.
+//! hands back the identity seed or a raw `Dek`. This is what makes keeping secrets off disk and
+//! key material confined and zeroized tractable: raw key material stays in one place.
 //!
 //! Submodules: [`protocol`] (the shared wire types), [`daemon`] (the resident process), and
 //! [`client`] (connect / auto-start / typed request wrappers).

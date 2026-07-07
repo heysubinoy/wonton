@@ -1,4 +1,4 @@
-//! Axum request handlers for every route in `PROGRESS.md` §3.4.
+//! Axum request handlers for every route this server exposes.
 //!
 //! Every handler except the three `/auth/*` routes takes an `Actor` extractor, which enforces
 //! a valid bearer token (401 otherwise). Role-gated handlers additionally call
@@ -159,7 +159,7 @@ pub async fn login_complete(
     }))
 }
 
-/// `POST /auth/machine/token` — no auth for this phase (hardening gap, see PROGRESS.md).
+/// `POST /auth/machine/token` — no auth for this phase (a known hardening gap).
 pub async fn machine_token(
     State(st): State<AppState>,
     Json(req): Json<MachineTokenRequest>,
@@ -325,8 +325,8 @@ pub async fn create_store(
 /// store doesn't exist; 409 if an env with that name already exists in the store.
 ///
 /// Only human users can hold `env_members` rows (`env_members.user_id` references `users`), so
-/// a machine identity creating an environment is rejected with 400 — see PROGRESS.md open items
-/// (machine identities creating environments isn't supported yet).
+/// a machine identity creating an environment is rejected with 400 (machine identities creating
+/// environments isn't supported yet).
 pub async fn create_env(
     State(st): State<AppState>,
     actor: Actor,
@@ -792,7 +792,7 @@ pub async fn add_member(
 }
 
 /// `DELETE /envs/:store/:env/members/:user_id` — remove a member. Requires admin. Does NOT
-/// trigger rotation (per PLAN.md §4.4, revocation rotation is a separate explicit call).
+/// trigger rotation (revocation rotation is a separate explicit call).
 pub async fn remove_member(
     State(st): State<AppState>,
     actor: Actor,

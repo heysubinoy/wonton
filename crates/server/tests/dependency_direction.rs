@@ -1,4 +1,4 @@
-//! Enforces the PLAN.md §7/§12 "server is blind" architecture rule: `wonton-server` must never
+//! Enforces the "server is blind" architecture rule: `wonton-server` must never
 //! be able to receive a DEK or private key, which is guaranteed at compile time by forbidding
 //! `wonton-crypto` anywhere in its dependency graph (normal, dev, or build). This walks the real
 //! `Cargo.toml` files of `wonton-server` and every workspace path-dependency reachable from it,
@@ -63,7 +63,7 @@ fn server_never_depends_on_wonton_crypto_directly_or_transitively() {
     assert!(
         !all_dep_names.contains(FORBIDDEN),
         "wonton-server's dependency graph must never contain `{FORBIDDEN}` (server-blindness \
-         rule, PLAN.md §7/§12) — found it. The server must never be able to hold or receive a \
+         rule) — found it. The server must never be able to hold or receive a \
          DEK or private key.",
     );
 }

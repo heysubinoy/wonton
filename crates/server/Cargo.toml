@@ -15,7 +15,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 hex.workspace = true
-# Access-control / transport plumbing only — NOT value cryptography (PLAN.md §12.7):
+# Access-control / transport plumbing only — NOT value cryptography:
 getrandom = "0.2"          # CSPRNG bytes for session / machine bearer tokens
 blake2 = "0.10"            # hash bearer tokens before storing (like a password hash)
 ed25519-dalek = "2"        # verify a login challenge signature against a stored PUBLIC key

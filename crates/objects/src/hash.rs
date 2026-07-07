@@ -17,7 +17,7 @@ pub struct Hash([u8; HASH_LEN]);
 
 impl Hash {
     /// Hash arbitrary bytes with BLAKE2b-256. This is the sole hashing entry point for
-    /// content addressing (§5.2/§16 of PLAN.md) — never hash with anything else.
+    /// content addressing — never hash with anything else.
     pub fn of(bytes: &[u8]) -> Self {
         let mut hasher = Blake2b256::new();
         hasher.update(bytes);

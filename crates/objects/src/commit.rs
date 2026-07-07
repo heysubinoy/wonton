@@ -26,7 +26,7 @@ impl CommitFields {
 
 /// An immutable, content-addressed commit: signed fields plus the Ed25519 signature over
 /// them. The commit's own hash covers the signature too, so tampering with either the
-/// fields or the signature changes the address (§5.2/§6 of PLAN.md).
+/// fields or the signature changes the address.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Commit {
     pub fields: CommitFields,

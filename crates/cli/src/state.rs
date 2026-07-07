@@ -1,12 +1,11 @@
-//! Local VCS state (PROGRESS.md §3.6): the per-context branch pointer, last-known ref tips, and
+//! Local VCS state: the per-context branch pointer, last-known ref tips, and
 //! staging area — plus resolution of the on-disk object store directory.
 //!
 //! ## `state.toml` (`<data_local_dir>/wonton/state.toml`)
 //! A single TOML file mirroring [`crate::config::Config`]'s load/save pattern. It holds **only
-//! non-secret metadata**: plaintext key names (plaintext by design, PLAN.md §16) and content
+//! non-secret metadata**: plaintext key names (plaintext by design) and content
 //! hashes (which address ciphertext blobs in the object store). No plaintext secret value and no
-//! ciphertext bytes are ever stored inline here, satisfying the no-plaintext-on-disk invariant
-//! (PLAN.md §14).
+//! ciphertext bytes are ever stored inline here, satisfying the no-plaintext-on-disk invariant.
 //!
 //! ## Object store (`<data_local_dir>/wonton/objects/`)
 //! One shared [`wonton_objects::LocalObjectStore`] across every context/branch — a single flat,
@@ -76,9 +75,8 @@ pub struct ContextState {
     pub staged: BTreeMap<String, StagedEntry>,
     /// A `wonton merge` paused on unresolved conflicts, resumed via `wonton merge --continue`.
     /// `None` when no merge is in progress. Holds only content hashes and key/branch names —
-    /// never plaintext (PROGRESS.md §3.8: reuses the exact hash-only mechanism `StagedEntry`
-    /// already uses, instead of PLAN.md §6's plaintext-conflict-file suggestion, which would
-    /// violate rule #5).
+    /// never plaintext (reuses the exact hash-only mechanism `StagedEntry` already uses, instead
+    /// of a plaintext-conflict-file approach, which would violate the no-plaintext-on-disk rule).
     #[serde(default)]
     pub merge: Option<MergeState>,
 }

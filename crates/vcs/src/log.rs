@@ -1,6 +1,6 @@
-//! Verified history walk (PLAN.md §6, "Log / history"): walk the parent chain from a tip,
+//! Verified history walk: walk the parent chain from a tip,
 //! verifying each commit's content hash and Ed25519 signature, and report tampering loudly by
-//! aborting the walk. A bad commit is **never** skipped (PLAN.md §6/§12.3).
+//! aborting the walk. A bad commit is **never** skipped.
 
 use std::collections::BTreeSet;
 

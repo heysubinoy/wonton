@@ -7,9 +7,9 @@ use crate::ObjectError;
 /// A local, content-addressed object store: files are laid out git-style
 /// (`<root>/<first-2-hex-chars>/<remaining-62-hex-chars>`) so no directory ever holds an
 /// unreasonable number of entries. Every `put` verifies the caller's claimed hash matches
-/// the bytes (mirrors the server-side rule in §7: reject a push whose hash doesn't match
+/// the bytes (mirrors the server-side rule: reject a push whose hash doesn't match
 /// its content) and every `get` re-verifies on the way out — a corrupted or tampered file
-/// on disk must be detected, never silently returned (§12.3, fail closed).
+/// on disk must be detected, never silently returned (fail closed).
 pub struct LocalObjectStore {
     root: PathBuf,
 }

@@ -1,4 +1,4 @@
-//! Client-side, key-level diff (PLAN.md §6, "Diff"): decrypt both trees locally and compare
+//! Client-side, key-level diff: decrypt both trees locally and compare
 //! at the key level → `Added` / `Removed` / `Changed`. **Never a byte diff of ciphertext.**
 
 use std::collections::BTreeSet;
@@ -9,7 +9,7 @@ use wonton_objects::{Hash, LocalObjectStore};
 use crate::{decrypt_blob, load_tree_of_commit, ValueDecryptor, VcsError};
 
 /// One key-level difference between two commits. Carries only the (plaintext) key name, which
-/// is fine because key names are plaintext metadata by design (PLAN.md §16 decision).
+/// is fine because key names are plaintext metadata by design.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiffEntry {
     /// Present in `to`, absent in `from`.
@@ -30,7 +30,7 @@ pub enum DiffEntry {
 /// *signatures* — the caller supplies no expected signer here; a caller that needs signature
 /// guarantees for this history should run [`crate::log`] first.
 ///
-/// ## The one correctness rule that matters (PLAN.md §6)
+/// ## The one correctness rule that matters
 /// For a key present in both trees:
 /// - **equal blob hashes ⇒ unchanged** (fast-path, skipped without decrypting): identical
 ///   ciphertext can only arise from the identical `(key, nonce, plaintext)` or an
@@ -69,7 +69,7 @@ pub fn diff(
                     continue;
                 }
                 // Different blob hash is NOT proof of change: decrypt both and compare
-                // plaintext (PLAN.md §6, "Never a byte diff of ciphertext").
+                // plaintext ("Never a byte diff of ciphertext").
                 let from_plain = decrypt_blob(store, dec, from_hash)?;
                 let to_plain = decrypt_blob(store, dec, to_hash)?;
                 if from_plain != to_plain {

@@ -1,5 +1,5 @@
-//! User identity: keypair generation and the portable, passphrase-encrypted private key
-//! (PLAN.md §4.3). A user has one long-term Ed25519 signing key and one X25519 wrapping key,
+//! User identity: keypair generation and the portable, passphrase-encrypted private key.
+//! A user has one long-term Ed25519 signing key and one X25519 wrapping key,
 //! both derived from a single 32-byte seed. The seed is encrypted under the Argon2id-derived
 //! unlock key and stored server-side as an opaque blob, so the identity is portable: unlock
 //! with the passphrase on any machine and you regain both keys.
@@ -13,8 +13,8 @@
 //!
 //! Domain separation via the `"wonton-x25519-v1"` label means the two keys are
 //! cryptographically independent (recovering one does not reveal the other) even though both
-//! are recoverable from the single seed. This is the "may be derived from one seed" option in
-//! PLAN.md §4.3, made concrete. The `-v1` suffix reserves room to change the derivation later
+//! are recoverable from the single seed. This is the "may be derived from one seed" option,
+//! made concrete. The `-v1` suffix reserves room to change the derivation later
 //! without silently colliding with existing keys.
 
 use blake2::digest::consts::U32;
@@ -36,14 +36,14 @@ const SEED_LEN: usize = 32;
 const X25519_DOMAIN: &[u8] = b"wonton-x25519-v1";
 
 /// The public half of an identity: the two public keys, safe to publish. Contains no secret
-/// material (PLAN.md §4.3, "no secrets").
+/// material.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicIdentity {
     pub ed25519_pubkey: [u8; 32],
     pub x25519_pubkey: [u8; 32],
 }
 
-/// The portable, passphrase-encrypted private key (PLAN.md §4.3). The `ciphertext` is the
+/// The portable, passphrase-encrypted private key. The `ciphertext` is the
 /// 32-byte identity seed encrypted with XChaCha20-Poly1305 under the Argon2id-derived unlock
 /// key. Holds only ciphertext and public KDF parameters, so it is safe to store on the blind
 /// server and to serialize.
@@ -165,7 +165,7 @@ pub fn generate_identity(passphrase: &[u8]) -> (PublicIdentity, WrappedPrivateKe
 ///
 /// Fails closed with [`CryptoError::DecryptionFailed`] on a wrong passphrase or tampered
 /// ciphertext: Argon2id cannot itself distinguish a wrong passphrase, but the wrong derived
-/// key fails the XChaCha20-Poly1305 auth-tag check, which is what rejects it (PLAN.md §12.3).
+/// key fails the XChaCha20-Poly1305 auth-tag check, which is what rejects it.
 pub fn unlock(
     wrapped: &WrappedPrivateKey,
     passphrase: &[u8],

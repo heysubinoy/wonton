@@ -1,11 +1,11 @@
-//! [`SyncClient`] — a thin, typed REST client over the `wonton-server` API (`PROGRESS.md`
-//! §3.4). One method per route, using the exact `wonton_shared` wire DTOs. Every non-success
+//! [`SyncClient`] — a thin, typed REST client over the `wonton-server` API.
+//! One method per route, using the exact `wonton_shared` wire DTOs. Every non-success
 //! status is mapped to a [`SyncError`] variant (parsing the `{"error": ...}` body for a
 //! message when present).
 //!
 //! The only method that does more than transport is [`SyncClient::fetch_object`], which
 //! verifies the returned bytes hash to the requested [`Hash`] before handing them back — the
-//! transport-layer half of PLAN.md §9's "every pulled object is verified before use."
+//! transport-layer half of "every pulled object is verified before use."
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;

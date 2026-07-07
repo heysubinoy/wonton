@@ -1,8 +1,7 @@
-//! Argon2id passphrase key derivation (PLAN.md §4.1/§4.3): turn a human passphrase into a
+//! Argon2id passphrase key derivation: turn a human passphrase into a
 //! 32-byte symmetric "unlock key" that encrypts the user's private-key seed. The KDF
 //! parameters (salt, memory, iterations, parallelism) are returned/stored alongside the
-//! ciphertext so any machine can re-derive the same key from the same passphrase (PLAN.md
-//! §12.6 — "store them with the wrapped key").
+//! ciphertext so any machine can re-derive the same key from the same passphrase.
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use serde::{Deserialize, Serialize};
@@ -19,7 +18,7 @@ pub const SALT_LEN: usize = 16;
 /// Default memory cost in KiB. **19456 KiB = 19 MiB.**
 ///
 /// This is OWASP's current (2024) recommended Argon2id configuration
-/// (m = 19 MiB, t = 2, p = 1), chosen as our documented minimum per PLAN.md §12.6. It
+/// (m = 19 MiB, t = 2, p = 1), chosen as our documented minimum. It
 /// resists GPU/ASIC attacks far better than PBKDF2 while remaining fast enough (<1s) to
 /// derive interactively on commodity hardware. Because the parameters are stored per wrapped
 /// key, they can be raised later without breaking old keys — each key re-derives with the
@@ -59,7 +58,7 @@ impl Argon2Params {
 }
 
 /// A 32-byte key derived from a passphrase via Argon2id. Used to encrypt/decrypt the private
-/// key seed. Wiped on drop and never printed (PLAN.md §12.5/§12.7).
+/// key seed. Wiped on drop and never printed.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct UnlockKey([u8; KEY_LEN]);
 

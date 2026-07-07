@@ -94,10 +94,6 @@ commit Ed25519-signed by its author. `push`/`pull` move encrypted objects and co
 branch refs; every object is content-hash-verified and every commit's signature is verified on
 the client before it's trusted — the server is never in the trust path.
 
-For the full design spec (threat model, cryptographic architecture, wire protocol, security
-rules) see [`PLAN.md`](PLAN.md). For the live implementation status and build log, see
-[`PROGRESS.md`](PROGRESS.md).
-
 ## Installation
 
 Requires a stable Rust toolchain (2021 edition).
@@ -113,7 +109,7 @@ cargo build --release --workspace
 
 This assumes a `wonton-server` is already running somewhere and a store/environment (e.g.
 `acme/dev`) has already been provisioned for you — provisioning a brand-new environment is an
-administrative action outside the CLI's command surface (see `PLAN.md` §8).
+administrative action outside the CLI's command surface.
 
 ```console
 # Unlock your identity into the local key agent (registers on first use).
@@ -199,13 +195,11 @@ malicious server) can't tamper with history undetected, thanks to the hash-chain
 and per-commit signatures.
 
 **Accepted metadata leakage:** the server does see the number of stores/environments and how
-many secrets each holds, key *names* (plaintext by design — see `PLAN.md` §16), timing/frequency
+many secrets each holds, key *names* (plaintext by design), timing/frequency
 of pushes and who made them, and branch/ref names and topology. It never sees a value.
 
 **Out of scope (v1):** traffic-analysis resistance, a compromised client that already holds an
 unlocked key, or a legitimately authorized user exfiltrating values they can already read.
-
-See `PLAN.md` §3 for the full threat model.
 
 ## Status
 
@@ -213,7 +207,7 @@ Core functionality (Phases 0–5 of the build plan) is complete and tested: cryp
 local commit/log/diff, the server + sync layer, the full CLI command surface, sharing/revocation/
 key rotation, and three-way client-side merge with conflict resolution. A metadata/leakage audit
 and an extended security test pass have also been done. Recovery (a lost-passphrase story) and
-deeper machine-identity hardening remain intentionally deferred — see `PROGRESS.md` §0 and §5.
+deeper machine-identity hardening remain intentionally deferred.
 
 ## Testing
 

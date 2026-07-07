@@ -1,4 +1,4 @@
-//! The key-agent daemon (PLAN.md §8.2) — an ssh-agent-style process that holds all raw key
+//! The key-agent daemon — an ssh-agent-style process that holds all raw key
 //! material and performs operations on behalf of short-lived CLI invocations.
 //!
 //! # Security model
@@ -70,7 +70,7 @@ pub async fn run() -> anyhow::Result<()> {
 /// If the path is already in use we distinguish a *live* daemon (connect succeeds — bail, we
 /// don't want two) from a *stale* socket file left by a dead daemon (connect fails — remove the
 /// file and rebind). This is deliberately "good enough for local dev", not production-grade
-/// process management (no pidfile, no signal handling — see PROGRESS.md open items).
+/// process management (no pidfile, no signal handling).
 pub async fn bind_listener(path: &Path) -> anyhow::Result<UnixListener> {
     match UnixListener::bind(path) {
         Ok(listener) => {

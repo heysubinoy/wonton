@@ -1,4 +1,4 @@
-//! Wire protocol shared by the agent daemon and the agent client (PLAN.md §8.2).
+//! Wire protocol shared by the agent daemon and the agent client.
 //!
 //! The transport is **newline-delimited JSON** over a Unix domain socket: exactly one JSON
 //! object per line for each request, and one JSON object per line for each response. Defining

@@ -1,5 +1,5 @@
 //! [`AgentCipher`] — the agent-backed adapter implementing `wonton-vcs`'s per-value
-//! [`ValueEncryptor`] / [`ValueDecryptor`] / [`CommitSigner`] seams (PROGRESS.md §3.6).
+//! [`ValueEncryptor`] / [`ValueDecryptor`] / [`CommitSigner`] seams.
 //!
 //! Every encrypt / decrypt / sign is delegated to the resident `wonton-agent` over its Unix
 //! socket, using the DEK already cached for `context` (via a prior `wonton use`). **The raw DEK

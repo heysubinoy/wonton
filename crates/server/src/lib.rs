@@ -1,19 +1,19 @@
-//! `wonton-server` — the blind blob + ref store (PLAN.md §7).
+//! `wonton-server` — the blind blob + ref store.
 //!
 //! # Blind by construction
 //! This crate stores and moves **opaque bytes** and enforces **metadata-level** access
 //! control. It deliberately does NOT depend on `wonton-crypto` and holds no code path that
-//! receives a DEK or a private key (PLAN.md §12.7). It depends on `wonton-objects` solely to
+//! receives a DEK or a private key. It depends on `wonton-objects` solely to
 //! recompute an uploaded object's BLAKE2b-256 hash and reject a push whose hash doesn't match
 //! its content — that is hash *verification of opaque bytes*, not decryption. It uses
 //! `ed25519-dalek` to verify a login-challenge signature against a stored PUBLIC key, and
 //! `blake2` to hash bearer tokens for storage — neither is value cryptography.
 //!
 //! # Authentication (challenge-response — a deliberate design decision this phase makes)
-//! PLAN.md §7 only sketched a single-step `POST /auth/login`. Because the server never sees a
-//! passphrase or a private key, this implementation authenticates a login with a
-//! **challenge-response over the user's Ed25519 public key** (which the server already
-//! stores, and which is not secret):
+//! The original sketch for this API only described a single-step `POST /auth/login`. Because
+//! the server never sees a passphrase or a private key, this implementation authenticates a
+//! login with a **challenge-response over the user's Ed25519 public key** (which the server
+//! already stores, and which is not secret):
 //! 1. `POST /auth/login/start { username }` returns the (ciphertext) wrapped private key, the
 //!    Argon2id parameters, and a fresh random `challenge_nonce`. No auth required — all three
 //!    are non-secret.
@@ -21,8 +21,6 @@
 //!    calls `POST /auth/login/complete { username, challenge_nonce, signature }`. The server
 //!    verifies the signature against the stored public key, consumes the challenge, and mints
 //!    a session bearer token.
-//!
-//! See `PROGRESS.md` for the rationale and how to revise it.
 
 mod auth;
 mod error;
@@ -85,8 +83,8 @@ pub fn build_router(pool: SqlitePool) -> Router {
     Router::new()
         // Auth (the routes that do NOT require a bearer token: register + the two login steps +
         // machine-token issuance). Machine-token issuance is
-        // intentionally unauthenticated for this phase — see PROGRESS.md open items (a Phase 6
-        // hardening gap: real deployments would gate it behind an authenticated admin).
+        // intentionally unauthenticated for this phase (a known hardening gap: real
+        // deployments would gate it behind an authenticated admin).
         .route("/auth/register", post(handlers::register))
         .route("/auth/login/start", post(handlers::login_start))
         .route("/auth/login/complete", post(handlers::login_complete))
@@ -101,8 +99,7 @@ pub fn build_router(pool: SqlitePool) -> Router {
         // User directory (any valid token — public keys, gated only to avoid enumeration)
         .route("/users/{username}", get(handlers::get_user))
         .route("/users/by-id/{user_id}", get(handlers::get_user_by_id))
-        // Objects (content-addressed; any valid token — see PROGRESS.md re: no per-object env
-        // scoping in this phase)
+        // Objects (content-addressed; any valid token — no per-object env scoping in this phase)
         .route("/objects/{hash}", get(handlers::get_object))
         .route("/objects", post(handlers::upload_object))
         // Refs
@@ -187,8 +184,7 @@ async fn resolve_env(pool: &SqlitePool, store: &str, env: &str) -> Result<String
 ///
 /// Returns the env id on success. 404 if the env doesn't exist; 403 if the actor is not a
 /// member or holds an insufficient role. (Note: machine identities are not rows in `users`,
-/// so they currently match no `env_members` row and are denied on role-gated routes — see
-/// PROGRESS.md open items.)
+/// so they currently match no `env_members` row and are denied on role-gated routes.)
 async fn authorize_env(
     pool: &SqlitePool,
     store: &str,

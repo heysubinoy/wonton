@@ -1,4 +1,4 @@
-//! The agent client (PLAN.md §8.2): connects to the daemon's Unix socket, sends a single
+//! The agent client: connects to the daemon's Unix socket, sends a single
 //! newline-delimited request, and parses the matching response.
 //!
 //! Two connection strategies:

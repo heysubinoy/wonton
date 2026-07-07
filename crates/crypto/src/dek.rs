@@ -1,12 +1,12 @@
-//! Asymmetric DEK wrapping via the X25519 `crypto_box` sealed box (PLAN.md §4.1/§4.4). A
+//! Asymmetric DEK wrapping via the X25519 `crypto_box` sealed box. A
 //! sealed box is an *anonymous-sender* construction (libsodium `crypto_box_seal`): it
 //! encrypts a DEK to a recipient's X25519 public key using an ephemeral sender keypair, so
 //! anyone holding the recipient's public key can wrap a DEK for them, but only the recipient
 //! (with the matching secret key) can unwrap it.
 //!
-//! This is how access control is expressed *in the cryptography* (PLAN.md §1): granting user
+//! This is how access control is expressed *in the cryptography*: granting user
 //! U access to an environment means sealing that environment's DEK for U's public key. No
-//! value re-encryption, O(1). Revocation requires rotating to a new DEK (see PLAN.md §4.4),
+//! value re-encryption, O(1). Revocation requires rotating to a new DEK,
 //! which is a higher-layer operation built on top of this primitive.
 
 use crypto_box::{PublicKey, SecretKey};
@@ -39,8 +39,8 @@ pub fn wrap_dek(dek: &Dek, recipient_x25519_pubkey: &[u8; 32]) -> SealedDek {
 /// Unwrap a [`SealedDek`] with the recipient's unlocked identity (its X25519 secret key).
 ///
 /// Fails closed with [`CryptoError::UnwrapFailed`] if the sealed box was tampered with or was
-/// sealed for a *different* recipient's public key — the wrong secret key cannot open it
-/// (PLAN.md §12.3). This is the mechanism that denies a revoked or unauthorized user: with no
+/// sealed for a *different* recipient's public key — the wrong secret key cannot open it.
+/// This is the mechanism that denies a revoked or unauthorized user: with no
 /// sealed DEK they can open, they get an error, never undecryptable-but-plausible bytes.
 pub fn unwrap_dek(sealed: &SealedDek, recipient: &UnlockedIdentity) -> Result<Dek, CryptoError> {
     let secret: SecretKey = recipient.x25519_secret();
@@ -81,8 +81,7 @@ mod tests {
 
     #[test]
     fn dek_survives_full_envelope_round_trip() {
-        // encrypt value -> wrap DEK for B -> unwrap with B -> decrypt (PLAN.md §13 Phase 1
-        // exit criteria).
+        // encrypt value -> wrap DEK for B -> unwrap with B -> decrypt (full envelope round trip).
         let bob = identity(b"bob pass");
         let dek = generate_dek();
         let ct = encrypt_value(&dek, b"DATABASE_URL=postgres://...");

@@ -1,6 +1,6 @@
 //! `pull` — fetch missing history for a branch's remote tip, verify every object, store it
 //! locally, and report whether the result is a clean fast-forward or a divergence that a human
-//! must reconcile (PLAN.md §9). This crate never auto-clobbers a divergence.
+//! must reconcile. This crate never auto-clobbers a divergence.
 //!
 //! ## Integrity boundary (read this)
 //! `pull` guarantees **content-hash integrity**: every object it stores was fetched via

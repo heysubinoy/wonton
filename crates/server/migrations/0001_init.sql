@@ -1,13 +1,13 @@
--- Wonton server schema, v1 (PROGRESS.md §3.3).
+-- Wonton server schema, v1.
 --
--- The server is a blind, content-addressed blob + ref store (PLAN.md §7). It stores only
+-- The server is a blind, content-addressed blob + ref store. It stores only
 -- opaque ciphertext (objects.body, wrapped_deks.sealed_box, users.wrapped_privkey) plus
--- non-secret metadata it is allowed to see (§3 "accepted leakage": object sizes/kinds/counts,
+-- non-secret metadata it is allowed to see (accepted leakage: object sizes/kinds/counts,
 -- plaintext key names inside trees, ref topology, who pushed and when). No column here ever
 -- holds a DEK or a private key in unwrapped form.
 --
--- Note: `users.username` is NOT in the original PROGRESS.md §3.3 sketch. It was added here
--- because the challenge-response login flow (PROGRESS.md §3.4 / this phase's auth design)
+-- Note: `users.username` is NOT in the original schema sketch. It was added here
+-- because the challenge-response login flow (this phase's auth design)
 -- looks a user up by a human-facing name before it has a session. It is non-secret metadata.
 
 CREATE TABLE users (
@@ -23,7 +23,7 @@ CREATE TABLE users (
     created_at          INTEGER NOT NULL             -- unix seconds
 );
 
-CREATE TABLE machine_identities (                    -- CI/server identities (§10)
+CREATE TABLE machine_identities (                    -- CI/server identities
     id                  TEXT PRIMARY KEY,
     label               TEXT NOT NULL,
     ed25519_pubkey      BLOB NOT NULL,
@@ -48,14 +48,14 @@ CREATE TABLE environments (
     UNIQUE(store_id, name)
 );
 
-CREATE TABLE env_members (                           -- metadata-level RBAC (§10)
+CREATE TABLE env_members (                           -- metadata-level RBAC
     env_id      TEXT NOT NULL REFERENCES environments(id),
     user_id     TEXT NOT NULL REFERENCES users(id),
     role        TEXT NOT NULL CHECK (role IN ('admin', 'writer', 'reader')),
     PRIMARY KEY (env_id, user_id)
 );
 
-CREATE TABLE wrapped_deks (                          -- §4.2/§4.4: the crypto access boundary
+CREATE TABLE wrapped_deks (                          -- the crypto access boundary
     env_id        TEXT NOT NULL REFERENCES environments(id),
     user_id       TEXT NOT NULL REFERENCES users(id),
     dek_version   INTEGER NOT NULL,

@@ -1,4 +1,4 @@
-//! End-to-end tests for the identity / context commands (PLAN.md §8, §14). Each test drives the
+//! End-to-end tests for the identity / context commands. Each test drives the
 //! command *logic* in `crate::commands` directly (not the compiled binary) against BOTH a real
 //! `wonton-server` (bound to an ephemeral port over a temp-file SQLite DB, mirroring
 //! `wonton-sync`'s integration tests) and a real in-process agent daemon (over a temp socket,
@@ -1019,8 +1019,8 @@ async fn key_rotate_alone_advances_tip_and_reencrypts() {
 // ---- Phase 5b: three-way merge ------------------------------------------------------------
 
 /// Fork a new local branch named `branch` off `at` (the commit both histories will share as
-/// their merge base) within `ctx_name`. There's no `checkout -b` porcelain command (PLAN.md v1
-/// only has `switch` to an already-known branch), so this directly seeds `state.toml`'s `tips`
+/// their merge base) within `ctx_name`. There's no `checkout -b` porcelain command (v1 only has
+/// `switch` to an already-known branch), so this directly seeds `state.toml`'s `tips`
 /// map the same way `pull` would after fetching a peer's branch.
 fn fork_branch(state_path: &std::path::Path, ctx_name: &str, branch: &str, at: Hash) {
     let mut state = LocalState::load_from(state_path).unwrap();
@@ -1212,7 +1212,7 @@ async fn merge_unknown_branch_errors() {
     assert!(err.to_string().contains("unknown branch"), "got: {err}");
 }
 
-// ---- §14 no-plaintext-on-disk -------------------------------------------------------------
+// ---- no-plaintext-on-disk ------------------------------------------------------------------
 
 /// Recursively collects every regular file under `root` (missing dirs yield an empty list).
 fn all_files(root: &std::path::Path) -> Vec<PathBuf> {
@@ -1233,8 +1233,8 @@ fn all_files(root: &std::path::Path) -> Vec<PathBuf> {
     files
 }
 
-/// PLAN.md rule #5 (§8.6): plaintext secrets must never touch disk except through the two named
-/// exits (`wonton run`'s child-process environment and `wonton export`'s named file). This drives
+/// The no-plaintext-on-disk rule: plaintext secrets must never touch disk except through the two
+/// named exits (`wonton run`'s child-process environment and `wonton export`'s named file). This drives
 /// a full `set` -> `commit` -> `run` cycle (the same cycle `share_grants_access_without_re_encryption`
 /// above uses to actually read a secret back) and then scans every file under both the state
 /// directory (object store + `state.toml`, including any paused-merge state) and the config

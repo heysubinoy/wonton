@@ -1,4 +1,4 @@
-//! Three-way client-side merge (PLAN.md §6, "Merge"; PROGRESS.md §3.8). Entirely offline and
+//! Three-way client-side merge. Entirely offline and
 //! client-side, like the rest of this crate: the server never sees plaintext, a merge base, or a
 //! conflict — it only ever sees the final signed merge commit's ciphertext objects.
 //!
@@ -82,7 +82,7 @@ pub enum MergeEntry {
 }
 
 /// The one rule that covers add/change/remove uniformly for every key in the union of `base`,
-/// `ours`, and `theirs` (PLAN.md §6, generalized):
+/// `ours`, and `theirs`:
 /// - unchanged on our side (`ours == base`, including "absent in both") → take theirs, whatever
 ///   it is (an addition, a change, or a deletion).
 /// - unchanged on their side (`theirs == base`) → take ours.

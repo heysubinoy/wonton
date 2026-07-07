@@ -1,6 +1,6 @@
-//! Ed25519 signing over commit objects (PLAN.md §4.1/§6). Signing proves a commit was
+//! Ed25519 signing over commit objects. Signing proves a commit was
 //! authored by the holder of a given identity; verification on every history read is what
-//! makes the commit DAG tamper-evident (PLAN.md §6, "verify each commit's signature").
+//! makes the commit DAG tamper-evident.
 
 use ed25519_dalek::{Signature, Signer, VerifyingKey};
 
@@ -20,8 +20,8 @@ pub fn sign(unlocked: &UnlockedIdentity, message: &[u8]) -> [u8; SIGNATURE_LEN] 
 /// Verify an Ed25519 `signature` over `message` against `pubkey`.
 ///
 /// Returns `Err(CryptoError::SignatureInvalid)` — never a `bool` — so a caller cannot
-/// accidentally ignore a failed verification by treating a `false` as success (PLAN.md
-/// §12.3, fail closed). Uses `verify_strict`, which additionally rejects signatures made
+/// accidentally ignore a failed verification by treating a `false` as success (fail closed).
+/// Uses `verify_strict`, which additionally rejects signatures made
 /// under non-canonical or small-order public keys.
 pub fn verify(
     pubkey: &[u8; 32],

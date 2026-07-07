@@ -1,8 +1,8 @@
 //! The in-memory staging area a caller builds up before [`crate::commit`].
 //!
 //! A `WorkingSet` holds `key -> plaintext value`. It **deliberately never touches disk in
-//! plaintext** (PLAN.md §12.4): it is a pure in-memory struct. Persisting staged changes is a
-//! later phase's concern (PLAN.md §8.1 describes an *encrypted* staging cache), out of scope
+//! plaintext**: it is a pure in-memory struct. Persisting staged changes is a
+//! later phase's concern (an *encrypted* staging cache), out of scope
 //! for Phase 2.
 
 use std::collections::BTreeMap;
@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 /// iteration order, which keeps the tree built by [`crate::commit`] stable.
 ///
 /// Values are plaintext and live only in memory. This type intentionally does not implement
-/// on-disk persistence; a future phase's encrypted staging cache (PLAN.md §8.1) will handle
+/// on-disk persistence; a future phase's encrypted staging cache will handle
 /// durability without ever writing plaintext.
 #[derive(Clone, Debug, Default)]
 pub struct WorkingSet {

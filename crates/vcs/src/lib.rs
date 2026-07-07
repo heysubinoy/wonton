@@ -1,25 +1,25 @@
 //! # wonton-vcs
 //!
-//! The client-side git-like layer of Wonton (PLAN.md §6), Phase 2 scope: local commit
+//! The client-side git-like layer of Wonton, Phase 2 scope: local commit
 //! creation, verified history (`log`), and client-side key-level `diff`. Everything here
-//! runs on the client *after* decryption — the blind server (PLAN.md §2/§7) never sees any
+//! runs on the client *after* decryption — the blind server never sees any
 //! of it. There is deliberately **no ref/branch/config management yet** (that is Phase 4)
 //! and **no server/sync** (Phase 3): this crate's API operates directly on commit [`Hash`]es
 //! the caller already holds (e.g. "the previous tip", if any).
 //!
 //! ## What this crate guarantees
-//! - **Fail closed on every read (PLAN.md §12.3).** Every object fetched from the store is
+//! - **Fail closed on every read.** Every object fetched from the store is
 //!   hash-verified (the store does this on `get`; [`log`]/[`diff`] re-check the commit hash
 //!   as defense in depth). [`log`] additionally verifies each commit's Ed25519 signature
 //!   against the caller-supplied signer key and aborts the whole walk on the first failure —
 //!   a bad commit is never skipped.
-//! - **Never a byte-diff of ciphertext (PLAN.md §6).** [`diff`] treats equal blob hashes as
+//! - **Never a byte-diff of ciphertext.** [`diff`] treats equal blob hashes as
 //!   "definitely unchanged" (a safe fast-path) but never treats *unequal* blob hashes as
 //!   proof of change: re-encrypting identical plaintext yields a different blob every time
 //!   (fresh random nonce), so [`diff`] decrypts both sides and compares plaintext before
 //!   ever reporting a key as `Changed`.
 //!
-//! ## Phase-2 simplifications (temporary — see PROGRESS.md §8)
+//! ## Phase-2 simplifications (temporary)
 //! - **Placeholder author id.** `wonton-crypto` identities have no `Uuid`; Phase 2 has no
 //!   user registry (that is Phase 3+). [`author_id_from_identity`] derives a *deterministic*
 //!   UUIDv5 from the Ed25519 public key so the same identity always commits under the same
@@ -120,12 +120,12 @@ impl ValueDecryptor for Dek {
 
 /// Errors from every fallible path in this crate. Wraps the underlying [`ObjectError`] and
 /// [`CryptoError`] (so a corrupted/tampered object on disk or a failed decrypt/verify
-/// propagates as a clean `Err`, never a panic — PLAN.md §12.3) and adds VCS-specific cases.
+/// propagates as a clean `Err`, never a panic) and adds VCS-specific cases.
 #[derive(Debug, thiserror::Error)]
 pub enum VcsError {
     /// An underlying object-store / (de)serialization failure. Notably, a
     /// [`ObjectError::HashMismatch`] surfaced here means on-disk tampering or corruption of a
-    /// stored object and must be treated as hostile (PLAN.md §12.3), not swallowed.
+    /// stored object and must be treated as hostile, not swallowed.
     #[error(transparent)]
     Object(#[from] ObjectError),
 
@@ -179,7 +179,7 @@ pub enum VcsError {
 
     /// [`log`]'s signer resolver returned `None` for a commit's `author_id`: the caller has no
     /// known public key for that author, so the signature cannot be verified at all. This is a
-    /// hard failure (fail closed, PLAN.md §12.3), never treated as "assume valid" or silently
+    /// hard failure (fail closed), never treated as "assume valid" or silently
     /// skipped.
     #[error("no known public key for commit author {0}; cannot verify signature")]
     UnknownSigner(Uuid),
@@ -196,8 +196,8 @@ pub fn author_id_from_identity(public: &PublicIdentity) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_OID, &public.ed25519_pubkey)
 }
 
-/// Current wall-clock time as unix seconds (PLAN.md commit schema: `timestamp: i64`). Uses
-/// `std::time` only (no `chrono`/`time` crate, per the build spec). A clock set before the
+/// Current wall-clock time as unix seconds (the commit schema's `timestamp: i64`). Uses
+/// `std::time` only (no `chrono`/`time` crate). A clock set before the
 /// unix epoch yields `0` rather than erroring — the timestamp is descriptive metadata, not a
 /// security boundary.
 pub(crate) fn current_unix_seconds() -> i64 {
@@ -235,7 +235,7 @@ pub(crate) fn load_commit(store: &LocalObjectStore, hash: &Hash) -> Result<Commi
 /// Fails closed: a wrong-length signature becomes [`VcsError::BadSignatureLength`] (never a
 /// panic on `try_into`), and a cryptographic verification failure becomes
 /// [`CryptoError::SignatureInvalid`] wrapped in [`VcsError::Crypto`]. Callers must treat any
-/// `Err` as fatal and never continue past a bad commit (PLAN.md §6/§12.3).
+/// `Err` as fatal and never continue past a bad commit.
 pub(crate) fn verify_commit_signature(
     commit: &Commit,
     commit_hash: &Hash,

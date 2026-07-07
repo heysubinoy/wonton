@@ -1,7 +1,7 @@
 //! Wire DTOs shared between `wonton-server` and the (future) `wonton-sync` HTTP client.
 //!
 //! This crate is **pure data**: serde `Serialize`/`Deserialize` structs describing the JSON
-//! request/response shapes of the REST API in `PROGRESS.md` §3.4. It has no logic, no
+//! request/response shapes of the REST API. It has no logic, no
 //! database access, and no HTTP-framework dependency, so both sides of the wire can depend on
 //! exactly the same types instead of hand-duplicating them.
 //!
@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Metadata-level RBAC role within one environment (PLAN.md §10). Ordering (for "at least"
+/// Metadata-level RBAC role within one environment. Ordering (for "at least"
 /// checks) is enforced server-side, not encoded here — this stays pure data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -26,7 +26,7 @@ pub enum Role {
 }
 
 // ---------------------------------------------------------------------------------------
-// Auth (challenge-response login + machine tokens) — PROGRESS.md §3.4
+// Auth (challenge-response login + machine tokens)
 // ---------------------------------------------------------------------------------------
 
 /// `POST /auth/login/start` request. No authentication required for this step.
@@ -99,7 +99,7 @@ pub struct RegisterResponse {
     pub user_id: String,
 }
 
-/// `POST /auth/machine/token` request (CI/server identities, §10).
+/// `POST /auth/machine/token` request (CI/server identities).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineTokenRequest {
     pub label: String,
@@ -194,7 +194,7 @@ pub struct RefConflict {
 }
 
 // ---------------------------------------------------------------------------------------
-// Wrapped-DEK maps (the crypto access boundary, §4.2/§4.4)
+// Wrapped-DEK maps (the crypto access boundary)
 // ---------------------------------------------------------------------------------------
 
 /// One wrapped-DEK entry for a user in an environment.

@@ -11,3 +11,6 @@
 .env
 .env.*
 !.env.example
+
+# Internal planning/progress docs -- kept locally, never tracked or published
+/local-docs/

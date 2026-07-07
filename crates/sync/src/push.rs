@@ -1,5 +1,5 @@
 //! `push` — upload a caller-selected set of local objects, then compare-and-swap the branch
-//! ref from `old_hash` to `new_hash` (PLAN.md §9).
+//! ref from `old_hash` to `new_hash`.
 //!
 //! Which objects to upload is the *caller's* decision (e.g. the set discovered by walking local
 //! history since the last known remote tip — orchestration that belongs to the CLI, not here).
@@ -15,7 +15,7 @@ use crate::error::SyncError;
 ///
 /// - Uploads are idempotent server-side, so re-pushing an object the server already has is
 ///   harmless. This crate does **not** check existence first (there is no bulk-exists endpoint;
-///   see PROGRESS.md open items for the possible future optimization) — it simply re-uploads.
+///   a possible future optimization) — it simply re-uploads.
 /// - A lost CAS is surfaced as [`SyncError::Conflict`] carrying the ref's actual current value,
 ///   so the caller can pull-then-merge-then-retry (Phase 5). `push` never resolves the conflict
 ///   or clobbers the ref itself.
@@ -50,7 +50,7 @@ pub async fn push(
 /// one. We sniff it by attempting the most-specific deserializations first: a `Commit` (has
 /// `fields` + `signature`), then a `Tree` (has `entries`), else fall back to `"blob"`. The three
 /// shapes have disjoint required fields, so this is unambiguous — a pragmatic heuristic, not a
-/// self-describing format (noted in PROGRESS.md open items).
+/// self-describing format.
 fn sniff_kind(bytes: &[u8]) -> &'static str {
     if Commit::from_bytes(bytes).is_ok() {
         "commit"

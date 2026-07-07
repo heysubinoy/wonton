@@ -1,4 +1,4 @@
-//! Local commit creation (PLAN.md §6, "Commit"): encrypt the staged working set under the
+//! Local commit creation: encrypt the staged working set under the
 //! environment DEK, build and store the blob/tree/commit objects, and sign the commit with
 //! the author's Ed25519 key. Entirely offline and client-side.
 
@@ -10,7 +10,7 @@ use crate::{current_unix_seconds, CommitSigner, ValueEncryptor, VcsError, Workin
 /// Create a signed, content-addressed commit from a staged [`WorkingSet`] and return its
 /// [`Hash`].
 ///
-/// Steps (PLAN.md §6):
+/// Steps:
 /// 1. Encrypt every staged value via `enc` (a fresh random nonce per value), wrap each as a
 ///    [`Blob`], hash it, and `put` it into `store`.
 /// 2. Build a [`Tree`] mapping each (plaintext) key name to its blob hash; hash and `put` it.
@@ -27,7 +27,7 @@ use crate::{current_unix_seconds, CommitSigner, ValueEncryptor, VcsError, Workin
 /// [`CommitSigner`].
 ///
 /// The DEK, identity, and plaintext never leave the client; only ciphertext objects are
-/// stored (PLAN.md §2).
+/// stored.
 pub fn commit(
     store: &LocalObjectStore,
     enc: &impl ValueEncryptor,

@@ -1,12 +1,12 @@
-//! Per-value symmetric encryption with XChaCha20-Poly1305 (PLAN.md §4.1). This is the
-//! primitive behind every secret value in Wonton's data model: PLAN.md §5.2 defines a
-//! `blob` as `nonce || ciphertext || tag`, which is exactly what [`EncryptedValue`] holds
+//! Per-value symmetric encryption with XChaCha20-Poly1305. This is the
+//! primitive behind every secret value in Wonton's data model: a
+//! `blob` is `nonce || ciphertext || tag`, which is exactly what [`EncryptedValue`] holds
 //! (the 16-byte Poly1305 tag is appended to `ciphertext` in AEAD "combined" mode).
 //!
 //! The 24-byte extended nonce is what makes random nonce generation safe here: with 192 bits
 //! of nonce space, `OsRng` collisions are negligible, so — unlike AES-GCM's 96-bit nonce —
-//! we can and do generate a fresh random nonce per call without a counter (PLAN.md §4.1,
-//! §12.2). Callers never supply a nonce.
+//! we can and do generate a fresh random nonce per call without a counter. Callers never
+//! supply a nonce.
 
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
@@ -21,12 +21,11 @@ pub(crate) const NONCE_LEN: usize = 24;
 /// DEK / AEAD key length (256 bits).
 pub(crate) const KEY_LEN: usize = 32;
 
-/// A 256-bit Data Encryption Key (DEK). One per environment in the data model (PLAN.md
-/// §4.2): all of an environment's values are encrypted under it, and it is itself wrapped
-/// per-user via [`crate::wrap_dek`].
+/// A 256-bit Data Encryption Key (DEK). One per environment in the data model: all of an
+/// environment's values are encrypted under it, and it is itself wrapped per-user via
+/// [`crate::wrap_dek`].
 ///
-/// The raw key is wiped from memory on drop (`ZeroizeOnDrop`) and never exposed to `Debug`
-/// (PLAN.md §12.5/§12.7).
+/// The raw key is wiped from memory on drop (`ZeroizeOnDrop`) and never exposed to `Debug`.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Dek([u8; KEY_LEN]);
 
@@ -44,7 +43,7 @@ impl Dek {
     }
 }
 
-/// Redacted `Debug` so a DEK can never be accidentally printed into a log (PLAN.md §12.7).
+/// Redacted `Debug` so a DEK can never be accidentally printed into a log.
 impl core::fmt::Debug for Dek {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("Dek(<redacted>)")
@@ -52,7 +51,7 @@ impl core::fmt::Debug for Dek {
 }
 
 /// An encrypted secret value: the random nonce plus AEAD ciphertext-with-appended-tag. This
-/// is the wire/at-rest form of a PLAN.md §5.2 `blob` (`nonce || ciphertext || tag`). It
+/// is the wire/at-rest form of a `blob` (`nonce || ciphertext || tag`). It
 /// holds no secret material in the clear, so it derives `Serialize`/`Deserialize` for
 /// storage and sync.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,15 +61,14 @@ pub struct EncryptedValue {
     pub ciphertext: Vec<u8>,
 }
 
-/// Generate a fresh random 256-bit DEK from the OS CSPRNG (PLAN.md §4.2, "256-bit random").
+/// Generate a fresh random 256-bit DEK from the OS CSPRNG.
 pub fn generate_dek() -> Dek {
     Dek(random_array::<KEY_LEN>())
 }
 
 /// Encrypt `plaintext` under `dek` with a freshly generated random nonce, returning the
 /// nonce and ciphertext+tag. A new nonce is generated on every call, so the same plaintext
-/// encrypts to different ciphertext each time and a `(key, nonce)` pair is never reused
-/// (PLAN.md §12.2).
+/// encrypts to different ciphertext each time and a `(key, nonce)` pair is never reused.
 pub fn encrypt_value(dek: &Dek, plaintext: &[u8]) -> EncryptedValue {
     let (nonce, ciphertext) = xchacha_encrypt(dek.as_bytes(), plaintext);
     EncryptedValue { nonce, ciphertext }
@@ -78,7 +76,7 @@ pub fn encrypt_value(dek: &Dek, plaintext: &[u8]) -> EncryptedValue {
 
 /// Decrypt an [`EncryptedValue`] under `dek`. Fails closed with [`CryptoError::DecryptionFailed`]
 /// on any authentication failure — wrong key, tampered ciphertext, or a swapped nonce — and
-/// never returns partial or unauthenticated plaintext (PLAN.md §12.3).
+/// never returns partial or unauthenticated plaintext.
 pub fn decrypt_value(dek: &Dek, value: &EncryptedValue) -> Result<Vec<u8>, CryptoError> {
     xchacha_decrypt(dek.as_bytes(), &value.nonce, &value.ciphertext)
 }

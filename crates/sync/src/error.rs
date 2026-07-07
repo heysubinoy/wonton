@@ -1,6 +1,6 @@
 //! The one error type for `wonton-sync`.
 //!
-//! HTTP status codes from the server (see `PROGRESS.md` §3.4) are mapped to distinct variants
+//! HTTP status codes from the server are mapped to distinct variants
 //! so a caller can react precisely: retry after login on [`SyncError::Unauthorized`], ask for a
 //! grant on [`SyncError::Forbidden`], reconcile a race on [`SyncError::Conflict`], etc. The
 //! catch-all [`SyncError::ServerError`] preserves the raw status + parsed `{"error": ...}`
@@ -32,12 +32,12 @@ pub enum SyncError {
 
     /// 409 — a compare-and-swap ref move lost the race; `current` is the ref's actual value
     /// (or `None` if it does not exist). Only produced by the ref-move route. The caller should
-    /// pull, merge (Phase 5), and retry — this crate never auto-clobbers (PLAN.md §9).
+    /// pull, merge (Phase 5), and retry — this crate never auto-clobbers.
     #[error("ref move conflict (409): remote tip is now {:?}", .0.current)]
     Conflict(RefConflict),
 
-    /// A pulled object's bytes did not hash to the value they were fetched by. Per PLAN.md §9,
-    /// this aborts the sync and flags a possibly-hostile (or buggy) server — the mismatch is
+    /// A pulled object's bytes did not hash to the value they were fetched by. This
+    /// aborts the sync and flags a possibly-hostile (or buggy) server — the mismatch is
     /// never silently accepted. This is *content-hash* integrity only; authorship/signature
     /// verification of pulled commits is a separate concern (`wonton_vcs::log`).
     #[error(

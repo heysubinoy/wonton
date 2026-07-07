@@ -6,7 +6,7 @@ use crate::hash::Hash;
 use crate::ObjectError;
 
 /// A snapshot of `key_name -> blob_hash` for one commit. Key names are plaintext by design
-/// (§16 decision, §5.2 of PLAN.md) — never put a secret value in a key name.
+/// (a deliberate decision) — never put a secret value in a key name.
 ///
 /// `BTreeMap` keeps entries in sorted order, which is what makes `hash()` deterministic
 /// regardless of insertion order.

@@ -1,9 +1,7 @@
-//! `wonton` — the CLI porcelain and crypto engine (PLAN.md §8).
+//! `wonton` — the CLI porcelain and crypto engine.
 //!
 //! This binary hosts the identity / context-switching commands (`login`, `context`, `use`,
-//! `link`) built on top of the ssh-agent-style key daemon (the hidden `agent` subcommand group,
-//! PLAN.md §8.2). The remaining verbs (`switch`/`status`/`set`/`unset`/`commit`/`log`/`diff`/
-//! `pull`/`push`/`run`/`export`) are a later task.
+//! `link`) built on top of the ssh-agent-style key daemon (the hidden `agent` subcommand group).
 
 mod agent;
 mod commands;

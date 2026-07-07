@@ -1,4 +1,4 @@
-//! The identity / context-switching commands (PLAN.md §8): `login`, `context add|list`,
+//! The identity / context-switching commands: `login`, `context add|list`,
 //! `context` (show), `use`, and `link`.
 //!
 //! Each command's *logic* is a free function taking explicit `config_path` / `socket_path` /
@@ -574,7 +574,7 @@ pub async fn commit(
 /// expected signer by its own `author_id` rather than assuming the local caller's own identity
 /// authored the whole history: a history shared with (or received from) another user contains
 /// commits authored by *their* identity too, and those must verify against *their* pubkey, not
-/// ours (found by manual end-to-end testing — see PROGRESS.md). Author pubkeys are resolved via
+/// ours (found by manual end-to-end testing). Author pubkeys are resolved via
 /// the server's global user directory (`get_user_by_id`), not just current env membership, so a
 /// since-revoked member's past commits remain verifiable.
 pub async fn log(config_path: &Path, state_path: &Path, ctx_name: &str) -> anyhow::Result<()> {
@@ -747,7 +747,7 @@ pub async fn push(config_path: &Path, state_path: &Path, ctx_name: &str) -> anyh
 }
 
 /// Decrypt an entire commit's tree into a plaintext `key -> value` map. `tip = None` yields an
-/// empty map (used for a merge base of `None`, i.e. disjoint histories — PROGRESS.md §3.8).
+/// empty map (used for a merge base of `None`, i.e. disjoint histories).
 fn tree_to_plaintext_map(
     store: &LocalObjectStore,
     cipher: &AgentCipher,
@@ -797,7 +797,7 @@ enum PromptOutcome {
 }
 
 /// Prompt for a single conflicting key's resolution via `reader`/`writer` (injectable so this is
-/// testable without real stdin/stdout — PROGRESS.md §3.8). Re-prompts on an unrecognized line;
+/// testable without real stdin/stdout). Re-prompts on an unrecognized line;
 /// EOF at any point is treated as `Skip` (a closed/non-interactive stdin must never hang or panic).
 fn prompt_conflict_resolution(
     reader: &mut impl BufRead,
@@ -840,7 +840,7 @@ fn prompt_conflict_resolution(
 
 /// Run the interactive one-key-at-a-time conflict prompt over `conflicts`, moving each resolved
 /// key into `resolved`. Calls `persist` after **every single resolution** so an interrupted
-/// `--continue` loses at most the one answer in flight (PROGRESS.md §3.8). Stops — leaving that
+/// `--continue` loses at most the one answer in flight. Stops — leaving that
 /// key and every key after it in `conflicts` — on `Skip`.
 fn resolve_conflicts_interactively(
     store: &LocalObjectStore,
@@ -929,7 +929,7 @@ fn finalize_merge_commit(
     Ok(hash)
 }
 
-/// `wonton merge <branch>` — three-way merge `branch` into the current branch (PROGRESS.md §3.8).
+/// `wonton merge <branch>` — three-way merge `branch` into the current branch.
 /// Entirely offline/client-side: the server never sees plaintext, a merge base, or a conflict.
 pub async fn merge(
     config_path: &Path,
@@ -1233,7 +1233,7 @@ pub async fn export(
 }
 
 // =====================================================================================
-// Phase 5a: sharing, revocation, and DEK rotation (PLAN.md §4.4/§8.3).
+// Phase 5a: sharing, revocation, and DEK rotation.
 //
 // `share` is O(1) — it wraps a COPY of the already-cached DEK for a new recipient, no value
 // re-encryption. `revoke` and `key rotate` both run `perform_rotation`: a fresh DEK is generated
@@ -1244,7 +1244,7 @@ pub async fn export(
 
 /// `wonton share <user> --env <ctx> [--role ...]` — grant `target_username` access to the
 /// context's environment by wrapping a copy of the currently-cached DEK for their X25519 public
-/// key. O(1): no value re-encryption, no rotation (PLAN.md §4.4).
+/// key. O(1): no value re-encryption, no rotation.
 pub async fn share(
     config_path: &Path,
     state_path: &Path,
@@ -1314,7 +1314,7 @@ pub async fn share(
 }
 
 /// `wonton revoke <user> --env <ctx>` — remove the target's membership, then rotate the DEK.
-/// Revocation *is* rotation (PLAN.md §4.4): the target may have cached the old DEK, so the only
+/// Revocation *is* rotation: the target may have cached the old DEK, so the only
 /// way to actually deny them is to move to a new one they don't hold.
 pub async fn revoke(
     config_path: &Path,
@@ -1357,7 +1357,7 @@ pub async fn rotate(
     perform_rotation(state_path, socket_path, &ctx, &identity).await
 }
 
-/// The shared 8-step rotation both `revoke` and `key rotate` run (PROGRESS.md §3.7). Assumes the
+/// The shared 8-step rotation both `revoke` and `key rotate` run. Assumes the
 /// caller already resolved + guarded the context (old DEK cached under `ctx.name`).
 ///
 /// Known edge case (not specially handled): if `revoke` removed the last *other* member, the

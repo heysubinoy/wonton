@@ -4,8 +4,8 @@
 //! hash (`token_hash`), so a stolen database yields no usable live tokens — the same reasoning
 //! as storing a password hash instead of a password. This BLAKE2b use is deliberately kept
 //! separate from `wonton_objects::Hash` (content addressing) and from `wonton-crypto` (value
-//! cryptography): it is an unrelated, server-local use of the same primitive family (PLAN.md
-//! §12.7 / task spec). The server never touches a DEK or a private key here.
+//! cryptography): it is an unrelated, server-local use of the same primitive family. The
+//! server never touches a DEK or a private key here.
 
 use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;

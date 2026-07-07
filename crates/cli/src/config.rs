@@ -1,11 +1,11 @@
-//! Local CLI state (PLAN.md §8.1) — the kubeconfig-style config file plus `.wonton` marker
+//! Local CLI state — the kubeconfig-style config file plus `.wonton` marker
 //! discovery.
 //!
 //! ## Config file (`~/.config/wonton/config.toml`)
 //! A single TOML file (kubeconfig-style) holding the user's known [`Identity`]s and
 //! [`Context`]s and which context is current. It caches the *ciphertext* wrapped private key
-//! and Argon2id parameters (safe to store, like an OpenSSH encrypted private key file — see
-//! PLAN.md §12.4/§8.1) and a short-lived session bearer token, so most commands avoid a network
+//! and Argon2id parameters (safe to store, like an OpenSSH encrypted private key file) and a
+//! short-lived session bearer token, so most commands avoid a network
 //! round-trip. It never stores the passphrase or any plaintext secret.
 //!
 //! ## `.wonton` marker

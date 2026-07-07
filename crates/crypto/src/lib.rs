@@ -1,11 +1,11 @@
 //! # wonton-crypto
 //!
-//! The cryptographic core of Wonton (PLAN.md §4). This crate implements envelope
+//! The cryptographic core of Wonton. This crate implements envelope
 //! encryption and nothing else: it knows how to derive keys from a passphrase, generate and
 //! wrap Data Encryption Keys (DEKs), encrypt/decrypt individual secret values, and sign/
 //! verify commit objects. It has **zero internal dependencies** and is usable standalone.
 //!
-//! ## Primitives (PLAN.md §4.1 — use exactly these, never substitute)
+//! ## Primitives (use exactly these, never substitute)
 //! - **Value encryption:** XChaCha20-Poly1305 (AEAD), 24-byte random nonce per message.
 //! - **DEK wrapping:** X25519 `crypto_box` sealed box (anonymous sender, libsodium
 //!   `crypto_box_seal` semantics).
@@ -14,7 +14,7 @@
 //! - **Hashing (key derivation only):** BLAKE2b-256, for deriving the X25519 seed from the
 //!   Ed25519 seed. Content-addressing hashing lives in `wonton-objects`, not here.
 //!
-//! ## Security posture (PLAN.md §12)
+//! ## Security posture
 //! - Nonces are always generated internally via `OsRng`; callers can never supply one for a
 //!   value. A `(key, nonce)` pair is never reused.
 //! - Every decrypt/verify fails closed: a bad auth tag or bad signature returns
@@ -41,8 +41,8 @@ pub use sign::{sign, verify};
 
 /// Errors returned by every fallible operation in this crate. Decryption, unwrapping,
 /// unlocking, and verification all funnel their failures through here so callers get a
-/// `Result` and can never accidentally proceed on a cryptographic failure (PLAN.md §12.3,
-/// "fail closed"). The variants are intentionally coarse — they never leak *why* a
+/// `Result` and can never accidentally proceed on a cryptographic failure ("fail closed").
+/// The variants are intentionally coarse — they never leak *why* a
 /// decryption failed (e.g. which byte), only that it did.
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {

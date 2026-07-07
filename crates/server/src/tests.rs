@@ -324,7 +324,7 @@ async fn create_env_bootstraps_creator_as_admin_and_rejects_duplicate_and_unknow
 async fn create_env_creator_can_grant_a_key_proving_admin_membership() {
     // A tighter proof than the membership listing: the creator can immediately call the
     // existing writer+-gated grant-key route on the env they just created, which requires a
-    // real membership row (403 otherwise). This is the exact bootstrap PLAN.md §8.2 depends on.
+    // real membership row (403 otherwise). This is the exact bootstrap the key agent depends on.
     let pool = test_pool().await;
     let user_id = seed_user(&pool, "alice", &[1u8; 32], &[2u8; 32]).await;
     let token = seed_session(&pool, &user_id, now_unix() + 3600).await;
