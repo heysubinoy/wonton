@@ -73,6 +73,8 @@ enum Command {
     },
     /// Show the current context, branch, DEK-cache status, and staged changes.
     Status,
+    /// Show which identity/identities are logged in locally, and which server each points at.
+    Whoami,
     /// Stage one or more `KEY=VALUE` secrets in the current context.
     Set {
         /// `KEY=VALUE` pairs to stage.
@@ -288,6 +290,10 @@ async fn main() -> anyhow::Result<()> {
             let state_path = state::default_state_path()?;
             let ctx = resolve_ctx()?;
             commands::switch(&state_path, &ctx, &branch, create)
+        }
+        Command::Whoami => {
+            let config_path = config::default_config_path()?;
+            commands::whoami(&config_path)
         }
         Command::Status => {
             let config_path = config::default_config_path()?;

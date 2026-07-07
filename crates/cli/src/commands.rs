@@ -78,6 +78,11 @@ pub async fn login(
         Ok(start) => (start.wrapped_privkey, start.argon2_params, start.challenge_nonce),
         Err(SyncError::NotFound(_)) => {
             // First-time registration: generate a fresh identity locally and frame the blob.
+            eprintln!(
+                "wonton: registering a new identity for '{username}'. There is no passphrase \
+                 recovery — if you forget it, this identity's data is unrecoverable and you'll \
+                 need to re-provision a new one. Store it somewhere safe."
+            );
             let (public, wrapped) = generate_identity(passphrase.as_bytes());
             let blob = [wrapped.nonce.as_slice(), wrapped.ciphertext.as_slice()].concat();
             let wrapped_b64 = STANDARD.encode(&blob);
@@ -231,6 +236,48 @@ pub async fn context_show(config_path: &Path, socket_path: &Path, cwd: &Path) ->
     println!("  environment: {}", ctx.environment);
     println!("  identity:    {}", ctx.identity);
     println!("  DEK cached:  {}", if cached { "yes" } else { "no" });
+    Ok(())
+}
+
+/// `wonton whoami` — show which locally-logged-in identity/identities are cached, without
+/// needing a resolvable context (unlike `wonton context`, which requires one). Useful right
+/// after `login`, before any `context add` has happened, and for quickly checking which server
+/// an identity points at without digging into `config.toml`.
+pub fn whoami(config_path: &Path) -> anyhow::Result<()> {
+    let config = Config::load_from(config_path)?;
+    let mut out = std::io::stdout();
+    whoami_report(&config, &mut out)?;
+    Ok(())
+}
+
+/// The actual reporting logic behind [`whoami`], writing to an injectable `impl Write` so tests
+/// can assert on the exact content rather than just "did it not crash". `pub(crate)` (not
+/// private) so `tests.rs`'s integration tests — which need the real server/agent fixtures that
+/// already live there — can call it directly instead of duplicating that fixture setup in a
+/// same-file test module.
+pub(crate) fn whoami_report(config: &Config, out: &mut impl Write) -> anyhow::Result<()> {
+    match config.identities.as_slice() {
+        [] => writeln!(out, "Not logged in. Run `wonton login <username> --server <url>` first.")?,
+        [only] => {
+            writeln!(out, "{} (username '{}') on {}", only.name, only.username, only.server_url)?;
+            writeln!(out, "  user id: {}", only.user_id)?;
+        }
+        many => {
+            writeln!(out, "Logged-in identities:")?;
+            for identity in many {
+                writeln!(
+                    out,
+                    "  {} (username '{}') on {}",
+                    identity.name, identity.username, identity.server_url
+                )?;
+            }
+            writeln!(
+                out,
+                "\nMore than one identity is cached — pass --identity where a command needs one \
+                 to disambiguate."
+            )?;
+        }
+    }
     Ok(())
 }
 

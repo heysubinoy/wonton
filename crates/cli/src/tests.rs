@@ -638,6 +638,57 @@ async fn login_registers_new_user_and_caches_session() {
     assert!(status.unlocked, "agent should be unlocked after login");
 }
 
+/// `whoami` with no identities logged in must say so clearly, not print nothing or error.
+#[tokio::test]
+async fn whoami_reports_not_logged_in_with_no_identities() {
+    let config_path = temp_config_path();
+    Config::default().save_to(&config_path).unwrap();
+    let config = Config::load_from(&config_path).unwrap();
+    let mut out = Vec::new();
+    commands::whoami_report(&config, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("Not logged in"), "got: {text}");
+}
+
+/// `whoami` with exactly one identity must name it, its username, and its server.
+#[tokio::test]
+async fn whoami_reports_the_sole_identity() {
+    let base = start_server().await;
+    let socket = spawn_agent().await;
+    let config_path = temp_config_path();
+    commands::login(&config_path, &socket, Some(base.clone()), "solo", "pw-solo".into())
+        .await
+        .unwrap();
+
+    let config = Config::load_from(&config_path).unwrap();
+    let mut out = Vec::new();
+    commands::whoami_report(&config, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("solo"), "got: {text}");
+    assert!(text.contains(&base), "got: {text}");
+}
+
+/// `whoami` with more than one identity must list all of them and flag the ambiguity, not just
+/// pick one silently.
+#[tokio::test]
+async fn whoami_lists_every_identity_when_there_are_several() {
+    let base = start_server().await;
+    let socket = spawn_agent().await;
+    let config_path = temp_config_path();
+    commands::login(&config_path, &socket, Some(base.clone()), "first", "pw-first".into())
+        .await
+        .unwrap();
+    commands::login(&config_path, &socket, Some(base), "second", "pw-second".into())
+        .await
+        .unwrap();
+
+    let config = Config::load_from(&config_path).unwrap();
+    let mut out = Vec::new();
+    commands::whoami_report(&config, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("first") && text.contains("second"), "got: {text}");
+}
+
 /// `login` on an already-registered username does NOT re-register (no duplicate-username 409)
 /// and still ends up with a valid token. Also exercises omitting `--server` on a repeat login
 /// (the stored server URL is reused).
