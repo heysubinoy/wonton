@@ -52,6 +52,16 @@ enum Command {
         /// The context name to link.
         name: String,
     },
+    /// Provision a new store on the server.
+    Store {
+        #[command(subcommand)]
+        command: StoreCommand,
+    },
+    /// Provision a new environment within a store, self-granting its first DEK.
+    Env {
+        #[command(subcommand)]
+        command: EnvCommand,
+    },
     /// Switch the current context to a different branch (purely local; no unwrap).
     Switch {
         /// The branch to switch to.
@@ -169,6 +179,32 @@ enum ContextCommand {
     List,
 }
 
+#[derive(Debug, Subcommand)]
+enum StoreCommand {
+    /// Create a new store on the server.
+    Create {
+        /// The store's name.
+        name: String,
+        /// The local identity to create it as (must already be logged in).
+        #[arg(long)]
+        identity: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EnvCommand {
+    /// Create a new environment within a store and self-grant its first DEK.
+    Create {
+        /// The store the environment belongs to.
+        store: String,
+        /// The environment's name.
+        name: String,
+        /// The local identity to create it as (must already be logged in).
+        #[arg(long)]
+        identity: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -220,6 +256,19 @@ async fn main() -> anyhow::Result<()> {
             let cwd = current_dir()?;
             commands::link(&config_path, &cwd, &name)
         }
+        Command::Store { command } => match command {
+            StoreCommand::Create { name, identity } => {
+                let config_path = config::default_config_path()?;
+                commands::store_create(&config_path, &identity, &name).await
+            }
+        },
+        Command::Env { command } => match command {
+            EnvCommand::Create { store, name, identity } => {
+                let config_path = config::default_config_path()?;
+                let socket = agent::client::ensure_running().await?;
+                commands::env_create(&config_path, &socket, &identity, &store, &name).await
+            }
+        },
         Command::Switch { branch } => {
             let state_path = state::default_state_path()?;
             let ctx = resolve_ctx()?;

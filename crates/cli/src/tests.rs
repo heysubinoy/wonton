@@ -164,6 +164,82 @@ async fn ready_fixture(
     }
 }
 
+/// The full self-service bootstrap flow, using ONLY real CLI commands (no raw `SyncClient`
+/// bypass like `ready_fixture` uses): register/login, `store create`, `env create` (which
+/// self-grants DEK v1), `context add`, `use`, and finally `set`/`commit`/`run` to prove the
+/// freshly-created environment is genuinely usable end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn store_and_env_create_bootstrap_a_freshly_usable_environment() {
+    let base = start_server().await;
+    let machine = login_only("bootstrapper", &base).await;
+
+    commands::store_create(&machine.config_path, "bootstrapper", "widgets")
+        .await
+        .expect("store create");
+    commands::env_create(
+        &machine.config_path,
+        &machine.socket,
+        "bootstrapper",
+        "widgets",
+        "prod",
+    )
+    .await
+    .expect("env create should create the env and self-grant DEK v1");
+
+    commands::context_add(&machine.config_path, "widgets-prod", "widgets", "prod", "bootstrapper")
+        .unwrap();
+    commands::use_context(&machine.config_path, &machine.state_path, &machine.socket, "widgets-prod")
+        .await
+        .expect("use should find the self-granted DEK via list_keys, no separate share needed");
+
+    commands::set(
+        &machine.config_path,
+        &machine.state_path,
+        &machine.socket,
+        "widgets-prod",
+        vec![("WIDGET_KEY".into(), "sk-widget-123".into())],
+    )
+    .await
+    .unwrap();
+    commands::commit(
+        &machine.config_path,
+        &machine.state_path,
+        &machine.socket,
+        "widgets-prod",
+        "first commit in a freshly bootstrapped env".into(),
+    )
+    .await
+    .unwrap();
+
+    let out = unique("bootstrapout");
+    let out_str = out.to_string_lossy().to_string();
+    let code = commands::run(
+        &machine.config_path,
+        &machine.state_path,
+        &machine.socket,
+        "widgets-prod",
+        vec!["sh".into(), "-c".into(), format!("printf '%s' \"$WIDGET_KEY\" > {out_str}")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "sk-widget-123");
+    let _ = std::fs::remove_file(&out);
+}
+
+/// A second store creation with the same name must surface the server's 409 clearly, not panic
+/// or silently succeed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn store_create_reports_a_duplicate_name_clearly() {
+    let base = start_server().await;
+    let machine = login_only("dupstore", &base).await;
+    commands::store_create(&machine.config_path, "dupstore", "acme").await.unwrap();
+    let err = commands::store_create(&machine.config_path, "dupstore", "acme")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("acme"), "got: {err}");
+}
+
 /// `switch` is purely local: no server, no agent, and it persists the branch.
 #[tokio::test]
 async fn switch_is_local_and_persists() {

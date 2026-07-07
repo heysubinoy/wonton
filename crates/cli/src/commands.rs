@@ -24,8 +24,8 @@ use uuid::Uuid;
 use wonton_crypto::{generate_identity, EncryptedValue};
 use wonton_objects::{Blob, Commit, Hash, LocalObjectStore, Tree};
 use wonton_shared::{
-    Argon2ParamsDto, GrantKeyRequest, LoginCompleteRequest, LoginStartRequest, MemberRequest,
-    ObjectUploadRequest, RegisterRequest, Role, RotateRequest,
+    Argon2ParamsDto, CreateEnvRequest, CreateStoreRequest, GrantKeyRequest, LoginCompleteRequest,
+    LoginStartRequest, MemberRequest, ObjectUploadRequest, RegisterRequest, Role, RotateRequest,
 };
 use wonton_sync::{PullOutcome, SyncClient, SyncError};
 use wonton_vcs::{DiffEntry, MergeEntry, ValueDecryptor, ValueEncryptor, WorkingSet};
@@ -364,6 +364,79 @@ pub fn link(config_path: &Path, cwd: &Path, name: &str) -> anyhow::Result<()> {
     std::fs::write(&marker, format!("context = \"{name}\"\n"))
         .with_context(|| format!("writing {}", marker.display()))?;
     println!("Linked this directory to context '{name}' (wrote .wonton).");
+    Ok(())
+}
+
+// =====================================================================================
+// Provisioning: create a store/environment. Any authenticated identity can create a store
+// (stores have no membership of their own); creating an environment additionally bootstraps and
+// self-grants its first DEK, since only a client holding key material can do that — the server
+// can never generate or wrap a DEK on anyone's behalf.
+// =====================================================================================
+
+/// `wonton store create <name> --identity <identity>` — create a new store on the server.
+pub async fn store_create(config_path: &Path, identity_name: &str, name: &str) -> anyhow::Result<()> {
+    let config = Config::load_from(config_path)?;
+    let identity = config.find_identity(identity_name).ok_or_else(|| {
+        anyhow!("no identity named '{identity_name}'; run `wonton login {identity_name}` first")
+    })?;
+    let client = authed_client(identity);
+    client
+        .create_store(&CreateStoreRequest { name: name.to_string() })
+        .await
+        .with_context(|| format!("could not create store '{name}'"))?;
+    println!("Created store '{name}'.");
+    Ok(())
+}
+
+/// `wonton env create <store> <env> --identity <identity>` — create a new environment within
+/// `store` (the caller becomes its first admin member, same as the server already does for
+/// `POST /stores/{{store}}/envs`), then immediately bootstrap the environment's first DEK:
+/// generate it in the agent, wrap it for the caller's own X25519 public key, and self-grant it
+/// at version 1. No context needs to exist yet for this — a scratch label stages the DEK in the
+/// agent just long enough to wrap it.
+pub async fn env_create(
+    config_path: &Path,
+    socket_path: &Path,
+    identity_name: &str,
+    store: &str,
+    env: &str,
+) -> anyhow::Result<()> {
+    let config = Config::load_from(config_path)?;
+    let identity = config.find_identity(identity_name).ok_or_else(|| {
+        anyhow!("no identity named '{identity_name}'; run `wonton login {identity_name}` first")
+    })?;
+    let client = authed_client(identity);
+
+    client
+        .create_env(store, &CreateEnvRequest { name: env.to_string() })
+        .await
+        .with_context(|| format!("could not create environment '{store}@{env}'"))?;
+
+    let temp_ctx = format!("{store}-{env}::init");
+    agent::generate_dek(socket_path, temp_ctx.clone())
+        .await
+        .context("agent could not generate the environment's first DEK (are you logged in?)")?;
+    let sealed = agent::wrap_dek_for_recipient(socket_path, temp_ctx, identity.x25519_pubkey_b64.clone())
+        .await
+        .context("agent could not wrap the DEK for self-grant")?;
+    client
+        .grant_key(
+            store,
+            env,
+            &GrantKeyRequest {
+                user_id: identity.user_id.clone(),
+                dek_version: 1,
+                sealed_box: sealed,
+            },
+        )
+        .await
+        .context("could not self-grant the environment's first DEK")?;
+
+    println!("Created environment '{store}@{env}' and granted yourself DEK v1.");
+    println!(
+        "Next: wonton context add <name> --store {store} --env {env} --identity {identity_name}"
+    );
     Ok(())
 }
 
