@@ -1313,6 +1313,74 @@ async fn merge_conflict_pauses_with_hash_only_state_then_continue_resolves() {
     assert_eq!(read_via_run(&owner, "KEY").await, "main-value", "resolved to ours (main-value)");
 }
 
+/// `merge --abort` discards a paused merge entirely: the merge state is cleared, no commit is
+/// ever created, the branch tip is untouched, and ordinary work (a fresh commit) continues to
+/// work normally afterward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_abort_discards_a_paused_merge_without_a_trace() {
+    let owner = ready_fixture("p5babort", None, true).await;
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("KEY".into(), "base-value".into())])
+        .await
+        .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "root".into())
+        .await
+        .unwrap();
+    let root_tip = tip_of(&owner.state_path);
+
+    fork_branch(&owner.state_path, "acme-dev", "feature", root_tip);
+    commands::switch(&owner.state_path, "acme-dev", "feature", false).unwrap();
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("KEY".into(), "feature-value".into())])
+        .await
+        .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "feature edit".into())
+        .await
+        .unwrap();
+
+    commands::switch(&owner.state_path, "acme-dev", "main", false).unwrap();
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("KEY".into(), "main-value".into())])
+        .await
+        .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "main edit".into())
+        .await
+        .unwrap();
+    let main_tip_before_merge = tip_of(&owner.state_path);
+
+    commands::merge(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "feature")
+        .await
+        .expect("pauses on the KEY conflict");
+    let state = LocalState::load_from(&owner.state_path).unwrap();
+    assert!(state.context("acme-dev").unwrap().merge.is_some(), "a merge must be paused");
+
+    commands::merge_abort(&owner.state_path, "acme-dev")
+        .await
+        .expect("abort must succeed while a merge is paused");
+
+    let state = LocalState::load_from(&owner.state_path).unwrap();
+    assert!(state.context("acme-dev").unwrap().merge.is_none(), "merge state must be cleared");
+    assert_eq!(
+        tip_of(&owner.state_path),
+        main_tip_before_merge,
+        "aborting must not create or move to any merge commit"
+    );
+
+    // Ordinary work continues to function normally after an abort.
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("AFTER_ABORT".into(), "still-works".into())])
+        .await
+        .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "post-abort commit".into())
+        .await
+        .unwrap();
+    assert_eq!(read_via_run(&owner, "AFTER_ABORT").await, "still-works");
+}
+
+/// `merge --abort` with nothing paused is a clear user error, not a silent no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_abort_without_a_paused_merge_errors() {
+    let owner = ready_fixture("p5babort2", None, true).await;
+    let err = commands::merge_abort(&owner.state_path, "acme-dev").await.unwrap_err();
+    assert!(err.to_string().contains("no merge in progress"), "got: {err}");
+}
+
 /// `merge --continue` with nothing paused is a clear user error, not a silent no-op.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn merge_continue_without_a_paused_merge_errors() {

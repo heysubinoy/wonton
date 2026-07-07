@@ -1267,6 +1267,26 @@ pub async fn merge_continue(
     Ok(())
 }
 
+/// `wonton merge --abort` — discard a paused merge entirely. Safe by construction: a paused
+/// merge has never produced a commit (that only happens once every conflict is resolved and
+/// `merge`/`merge --continue` finalizes it), so there is nothing to unwind except the persisted
+/// `MergeState` itself. The branch tip and all prior history are untouched.
+pub async fn merge_abort(state_path: &Path, ctx_name: &str) -> anyhow::Result<()> {
+    let mut state = LocalState::load_from(state_path)?;
+    let cs = state.context(ctx_name).cloned().unwrap_or_default();
+    let merge_state = cs
+        .merge
+        .ok_or_else(|| anyhow!("no merge in progress; nothing to abort"))?;
+    state.context_mut(ctx_name).merge = None;
+    state.save_to(state_path)?;
+    println!(
+        "Aborted the merge of '{}' ({} unresolved conflict(s) discarded).",
+        merge_state.branch,
+        merge_state.conflicts.len()
+    );
+    Ok(())
+}
+
 /// `wonton run -- <cmd> [args...]` — decrypt the effective working tree into env vars, spawn the
 /// child with them injected (stdio inherited), and return the child's exit code for `main.rs` to
 /// propagate. **Never writes any decrypted value to disk.**
