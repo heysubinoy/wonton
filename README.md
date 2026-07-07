@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/wonton-solo.png" alt="" width="140">
+  <img src="assets/wonton.png" alt="" width="140">
 
   <h1>Wonton</h1>
 
