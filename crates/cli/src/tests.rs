@@ -264,9 +264,41 @@ async fn store_create_without_identity_errors_clearly_when_ambiguous() {
 #[tokio::test]
 async fn switch_is_local_and_persists() {
     let state_path = temp_state_path();
-    commands::switch(&state_path, "acme-dev", "feature").unwrap();
+    commands::switch(&state_path, "acme-dev", "feature", true).unwrap();
     let state = crate::state::LocalState::load_from(&state_path).unwrap();
     assert_eq!(state.context("acme-dev").unwrap().branch, "feature");
+}
+
+/// A typo'd branch name must be a clear error, not a silently-created empty branch — `--create`
+/// is required to switch to one with no local history yet.
+#[tokio::test]
+async fn switch_without_create_rejects_an_unknown_branch() {
+    let state_path = temp_state_path();
+    let err = commands::switch(&state_path, "acme-dev", "mian", false).unwrap_err();
+    assert!(err.to_string().contains("--create"), "got: {err}");
+    let state = crate::state::LocalState::load_from(&state_path).unwrap();
+    assert!(
+        state.context("acme-dev").is_none(),
+        "a rejected switch must not create or mutate any context state"
+    );
+}
+
+/// Switching back to a branch already recorded in `tips` (or the branch already selected) must
+/// not require `--create` — this is the common case (going back and forth between branches you
+/// already have local history on).
+#[tokio::test]
+async fn switch_without_create_allows_an_already_known_branch() {
+    let state_path = temp_state_path();
+    // A fresh context defaults to "main" -- switching to the branch you're already on needs no
+    // --create even before anything has ever been committed.
+    commands::switch(&state_path, "acme-dev", "main", false)
+        .expect("switching to the already-selected default branch needs no --create");
+
+    // Seed "feature" directly into tips (as a `pull` or a merge-base fork would), simulating a
+    // branch we already have local history for -- switching to it needs no --create either.
+    fork_branch(&state_path, "acme-dev", "feature", Hash::of(b"root"));
+    commands::switch(&state_path, "acme-dev", "feature", false)
+        .expect("switching to a branch already present in tips needs no --create");
 }
 
 /// `set` stages an encrypted blob; `status` runs; `unset` overwrites it with a tombstone.
@@ -1158,7 +1190,7 @@ async fn merge_with_no_conflicts_produces_a_two_parent_commit() {
     let root_tip = tip_of(&owner.state_path);
 
     fork_branch(&owner.state_path, "acme-dev", "feature", root_tip);
-    commands::switch(&owner.state_path, "acme-dev", "feature").unwrap();
+    commands::switch(&owner.state_path, "acme-dev", "feature", false).unwrap();
     commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("FEATURE_KEY".into(), "feature-value".into())])
         .await
         .unwrap();
@@ -1166,7 +1198,7 @@ async fn merge_with_no_conflicts_produces_a_two_parent_commit() {
         .await
         .unwrap();
 
-    commands::switch(&owner.state_path, "acme-dev", "main").unwrap();
+    commands::switch(&owner.state_path, "acme-dev", "main", false).unwrap();
     commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("MAIN_KEY".into(), "main-value".into())])
         .await
         .unwrap();
@@ -1215,7 +1247,7 @@ async fn merge_conflict_pauses_with_hash_only_state_then_continue_resolves() {
     let root_tip = tip_of(&owner.state_path);
 
     fork_branch(&owner.state_path, "acme-dev", "feature", root_tip);
-    commands::switch(&owner.state_path, "acme-dev", "feature").unwrap();
+    commands::switch(&owner.state_path, "acme-dev", "feature", false).unwrap();
     commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("KEY".into(), "feature-value".into())])
         .await
         .unwrap();
@@ -1223,7 +1255,7 @@ async fn merge_conflict_pauses_with_hash_only_state_then_continue_resolves() {
         .await
         .unwrap();
 
-    commands::switch(&owner.state_path, "acme-dev", "main").unwrap();
+    commands::switch(&owner.state_path, "acme-dev", "main", false).unwrap();
     commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("KEY".into(), "main-value".into())])
         .await
         .unwrap();

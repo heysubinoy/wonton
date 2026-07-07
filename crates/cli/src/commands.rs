@@ -519,8 +519,17 @@ async fn ready_context(
 
 /// `wonton switch <branch>` — purely local: set the current context's branch. No DEK unwrap, no
 /// network. This is the Phase-4 exit criterion "switching branch needs no unwrap".
-pub fn switch(state_path: &Path, ctx_name: &str, branch: &str) -> anyhow::Result<()> {
+pub fn switch(state_path: &Path, ctx_name: &str, branch: &str, create: bool) -> anyhow::Result<()> {
     let mut state = LocalState::load_from(state_path)?;
+    let cs = state.context(ctx_name).cloned().unwrap_or_default();
+    let known = cs.branch == branch || cs.tips.contains_key(branch);
+    if !known && !create {
+        bail!(
+            "no local record of branch '{branch}' in context '{ctx_name}'; pass --create if \
+             you're starting a brand new branch, or if you're about to `wonton pull` a branch \
+             that exists on the remote but you haven't fetched yet"
+        );
+    }
     state.context_mut(ctx_name).branch = branch.to_string();
     state.save_to(state_path)?;
     println!("Switched context '{ctx_name}' to branch '{branch}'.");

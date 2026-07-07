@@ -66,6 +66,10 @@ enum Command {
     Switch {
         /// The branch to switch to.
         branch: String,
+        /// Allow switching to a branch with no local history yet — either to start a brand
+        /// new branch, or because you're about to `wonton pull` one that exists remotely.
+        #[arg(long)]
+        create: bool,
     },
     /// Show the current context, branch, DEK-cache status, and staged changes.
     Status,
@@ -126,9 +130,11 @@ enum Command {
     Share {
         /// The username to share with.
         user: String,
-        /// The context to share (a context name, per `wonton context list`).
+
+        /// The context to share (a context name, per `wonton context list` — not the server-side
+        /// environment name).
         #[arg(long)]
-        env: String,
+        context: String,
         /// The role to grant.
         #[arg(long, default_value = "reader")]
         role: String,
@@ -137,9 +143,10 @@ enum Command {
     Revoke {
         /// The username to revoke.
         user: String,
-        /// The context to revoke access to (a context name).
+        /// The context to revoke access to (a context name, not the server-side environment
+        /// name).
         #[arg(long)]
-        env: String,
+        context: String,
     },
     /// Data-key management for a context's environment.
     Key {
@@ -155,9 +162,10 @@ enum Command {
 enum KeyCommand {
     /// Rotate the environment's DEK, re-encrypting history and re-wrapping for members.
     Rotate {
-        /// The context whose environment DEK to rotate (a context name).
+        /// The context whose environment DEK to rotate (a context name, not the server-side
+        /// environment name).
         #[arg(long)]
-        env: String,
+        context: String,
     },
 }
 
@@ -271,10 +279,10 @@ async fn main() -> anyhow::Result<()> {
                 commands::env_create(&config_path, &socket, identity.as_deref(), &store, &name).await
             }
         },
-        Command::Switch { branch } => {
+        Command::Switch { branch, create } => {
             let state_path = state::default_state_path()?;
             let ctx = resolve_ctx()?;
-            commands::switch(&state_path, &ctx, &branch)
+            commands::switch(&state_path, &ctx, &branch, create)
         }
         Command::Status => {
             let config_path = config::default_config_path()?;
@@ -368,25 +376,25 @@ async fn main() -> anyhow::Result<()> {
                 (None, false) => anyhow::bail!("usage: `wonton merge <branch>` or `wonton merge --continue`"),
             }
         }
-        Command::Share { user, env, role } => {
+        Command::Share { user, context, role } => {
             let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
             let socket = agent::client::ensure_running().await?;
             let role = parse_role(&role)?;
-            commands::share(&config_path, &state_path, &socket, &env, &user, role).await
+            commands::share(&config_path, &state_path, &socket, &context, &user, role).await
         }
-        Command::Revoke { user, env } => {
+        Command::Revoke { user, context } => {
             let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
             let socket = agent::client::ensure_running().await?;
-            commands::revoke(&config_path, &state_path, &socket, &env, &user).await
+            commands::revoke(&config_path, &state_path, &socket, &context, &user).await
         }
         Command::Key { command } => match command {
-            KeyCommand::Rotate { env } => {
+            KeyCommand::Rotate { context } => {
                 let config_path = config::default_config_path()?;
                 let state_path = state::default_state_path()?;
                 let socket = agent::client::ensure_running().await?;
-                commands::rotate(&config_path, &state_path, &socket, &env).await
+                commands::rotate(&config_path, &state_path, &socket, &context).await
             }
         },
         Command::Agent(command) => agent::run(command).await,
