@@ -374,9 +374,32 @@ pub fn link(config_path: &Path, cwd: &Path, name: &str) -> anyhow::Result<()> {
 // can never generate or wrap a DEK on anyone's behalf.
 // =====================================================================================
 
-/// `wonton store create <name> --identity <identity>` — create a new store on the server.
-pub async fn store_create(config_path: &Path, identity_name: &str, name: &str) -> anyhow::Result<()> {
+/// Resolve which identity a provisioning command should act as: the caller-supplied `--identity`
+/// if given, else the sole cached identity if there's exactly one, else a clear error naming the
+/// choices (0 identities: log in first; 2+: ambiguous, must disambiguate).
+fn resolve_identity_name<'a>(config: &'a Config, given: Option<&'a str>) -> anyhow::Result<&'a str> {
+    if let Some(name) = given {
+        return Ok(name);
+    }
+    match config.identities.as_slice() {
+        [] => bail!("no identity logged in; run `wonton login <username> --server <url>` first"),
+        [only] => Ok(only.name.as_str()),
+        many => {
+            let names: Vec<&str> = many.iter().map(|i| i.name.as_str()).collect();
+            bail!("multiple identities are logged in ({}); pass --identity to disambiguate", names.join(", "))
+        }
+    }
+}
+
+/// `wonton store create <name> [--identity <identity>]` — create a new store on the server.
+/// `--identity` is only required if more than one identity is logged in locally.
+pub async fn store_create(
+    config_path: &Path,
+    identity_name: Option<&str>,
+    name: &str,
+) -> anyhow::Result<()> {
     let config = Config::load_from(config_path)?;
+    let identity_name = resolve_identity_name(&config, identity_name)?;
     let identity = config.find_identity(identity_name).ok_or_else(|| {
         anyhow!("no identity named '{identity_name}'; run `wonton login {identity_name}` first")
     })?;
@@ -389,20 +412,22 @@ pub async fn store_create(config_path: &Path, identity_name: &str, name: &str) -
     Ok(())
 }
 
-/// `wonton env create <store> <env> --identity <identity>` — create a new environment within
+/// `wonton env create <store> <env> [--identity <identity>]` — create a new environment within
 /// `store` (the caller becomes its first admin member, same as the server already does for
 /// `POST /stores/{{store}}/envs`), then immediately bootstrap the environment's first DEK:
 /// generate it in the agent, wrap it for the caller's own X25519 public key, and self-grant it
 /// at version 1. No context needs to exist yet for this — a scratch label stages the DEK in the
-/// agent just long enough to wrap it.
+/// agent just long enough to wrap it. `--identity` is only required if more than one identity is
+/// logged in locally.
 pub async fn env_create(
     config_path: &Path,
     socket_path: &Path,
-    identity_name: &str,
+    identity_name: Option<&str>,
     store: &str,
     env: &str,
 ) -> anyhow::Result<()> {
     let config = Config::load_from(config_path)?;
+    let identity_name = resolve_identity_name(&config, identity_name)?;
     let identity = config.find_identity(identity_name).ok_or_else(|| {
         anyhow!("no identity named '{identity_name}'; run `wonton login {identity_name}` first")
     })?;

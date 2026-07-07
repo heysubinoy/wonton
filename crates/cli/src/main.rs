@@ -185,9 +185,10 @@ enum StoreCommand {
     Create {
         /// The store's name.
         name: String,
-        /// The local identity to create it as (must already be logged in).
+        /// The local identity to create it as. Only needed if more than one identity is
+        /// logged in locally.
         #[arg(long)]
-        identity: String,
+        identity: Option<String>,
     },
 }
 
@@ -199,9 +200,10 @@ enum EnvCommand {
         store: String,
         /// The environment's name.
         name: String,
-        /// The local identity to create it as (must already be logged in).
+        /// The local identity to create it as. Only needed if more than one identity is
+        /// logged in locally.
         #[arg(long)]
-        identity: String,
+        identity: Option<String>,
     },
 }
 
@@ -259,14 +261,14 @@ async fn main() -> anyhow::Result<()> {
         Command::Store { command } => match command {
             StoreCommand::Create { name, identity } => {
                 let config_path = config::default_config_path()?;
-                commands::store_create(&config_path, &identity, &name).await
+                commands::store_create(&config_path, identity.as_deref(), &name).await
             }
         },
         Command::Env { command } => match command {
             EnvCommand::Create { store, name, identity } => {
                 let config_path = config::default_config_path()?;
                 let socket = agent::client::ensure_running().await?;
-                commands::env_create(&config_path, &socket, &identity, &store, &name).await
+                commands::env_create(&config_path, &socket, identity.as_deref(), &store, &name).await
             }
         },
         Command::Switch { branch } => {

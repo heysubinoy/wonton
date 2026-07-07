@@ -173,13 +173,13 @@ async fn store_and_env_create_bootstrap_a_freshly_usable_environment() {
     let base = start_server().await;
     let machine = login_only("bootstrapper", &base).await;
 
-    commands::store_create(&machine.config_path, "bootstrapper", "widgets")
+    commands::store_create(&machine.config_path, Some("bootstrapper"), "widgets")
         .await
         .expect("store create");
     commands::env_create(
         &machine.config_path,
         &machine.socket,
-        "bootstrapper",
+        Some("bootstrapper"),
         "widgets",
         "prod",
     )
@@ -228,16 +228,36 @@ async fn store_and_env_create_bootstrap_a_freshly_usable_environment() {
 }
 
 /// A second store creation with the same name must surface the server's 409 clearly, not panic
-/// or silently succeed.
+/// or silently succeed. Also exercises `--identity` being omitted entirely: with exactly one
+/// identity logged in, it must be inferred without error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn store_create_reports_a_duplicate_name_clearly() {
     let base = start_server().await;
     let machine = login_only("dupstore", &base).await;
-    commands::store_create(&machine.config_path, "dupstore", "acme").await.unwrap();
-    let err = commands::store_create(&machine.config_path, "dupstore", "acme")
+    commands::store_create(&machine.config_path, None, "acme").await.unwrap();
+    let err = commands::store_create(&machine.config_path, None, "acme")
         .await
         .unwrap_err();
     assert!(err.to_string().to_lowercase().contains("acme"), "got: {err}");
+}
+
+/// With more than one identity cached in the same config, omitting `--identity` must be a clear
+/// error naming the ambiguity rather than silently picking one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn store_create_without_identity_errors_clearly_when_ambiguous() {
+    let base = start_server().await;
+    let socket = spawn_agent().await;
+    let config_path = temp_config_path();
+    commands::login(&config_path, &socket, Some(base.clone()), "multi-a", "pw-a".into())
+        .await
+        .unwrap();
+    commands::login(&config_path, &socket, Some(base), "multi-b", "pw-b".into())
+        .await
+        .unwrap();
+
+    let err = commands::store_create(&config_path, None, "acme").await.unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("multi-a") && msg.contains("multi-b"), "got: {msg}");
 }
 
 /// `switch` is purely local: no server, no agent, and it persists the branch.
