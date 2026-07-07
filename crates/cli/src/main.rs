@@ -237,7 +237,16 @@ async fn main() -> anyhow::Result<()> {
         Command::Login { username, server } => {
             let config_path = config::default_config_path()?;
             let socket = agent::client::ensure_running().await?;
-            let passphrase = rpassword::prompt_password("Passphrase: ")?;
+            let passphrase = match std::env::var("WONTON_PASSPHRASE") {
+                Ok(p) => {
+                    eprintln!(
+                        "wonton: reading passphrase from WONTON_PASSPHRASE — for automation \
+                         only; the interactive prompt (omit the env var) is safer for everyday use."
+                    );
+                    p
+                }
+                Err(_) => rpassword::prompt_password("Passphrase: ")?,
+            };
             commands::login(&config_path, &socket, server, &username, passphrase).await
         }
         Command::Context { command } => match command {
