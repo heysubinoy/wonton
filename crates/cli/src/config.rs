@@ -68,6 +68,14 @@ pub struct Config {
     /// this is only ever a bootstrapping convenience for commands with no project context yet.
     #[serde(default)]
     pub default_server: Option<String>,
+    /// The local nickname of the most-recently-logged-in identity. The underlying agent daemon
+    /// only ever holds ONE identity's key material unlocked at a time (like `ssh-agent` with a
+    /// single loaded key) — `login` always replaces whichever identity was previously resident —
+    /// so this mirrors that at the config layer: it's the default identity used by
+    /// `--identity`-accepting commands when more than one is cached, instead of demanding
+    /// disambiguation every time. An explicit `--identity` always overrides it.
+    #[serde(default)]
+    pub current_identity: Option<String>,
     #[serde(default)]
     pub identities: Vec<Identity>,
 }
@@ -165,6 +173,17 @@ impl Config {
             Some(existing) => *existing = identity,
             None => self.identities.push(identity),
         }
+    }
+
+    /// Remove the identity named `name`, clearing `current_identity` too if it pointed at the
+    /// removed one. Returns `true` if an identity was actually removed.
+    pub fn forget_identity(&mut self, name: &str) -> bool {
+        let before = self.identities.len();
+        self.identities.retain(|i| i.name != name);
+        if self.current_identity.as_deref() == Some(name) {
+            self.current_identity = None;
+        }
+        self.identities.len() != before
     }
 }
 
@@ -332,6 +351,22 @@ mod tests {
         config.upsert_identity(updated);
         assert_eq!(config.identities.len(), 1);
         assert_eq!(config.find_identity("alice").unwrap().user_id, "uid-999");
+    }
+
+    #[test]
+    fn forget_identity_removes_it_and_clears_current_if_it_matched() {
+        let mut config = Config::default();
+        config.upsert_identity(sample_identity("alice"));
+        config.upsert_identity(sample_identity("bob"));
+        config.current_identity = Some("alice".to_string());
+
+        assert!(config.forget_identity("alice"));
+        assert!(config.find_identity("alice").is_none());
+        assert!(config.find_identity("bob").is_some(), "bob should be untouched");
+        assert_eq!(config.current_identity, None, "current_identity should be cleared");
+
+        // Forgetting a name that isn't cached is a no-op, not an error.
+        assert!(!config.forget_identity("nobody"));
     }
 
     #[test]

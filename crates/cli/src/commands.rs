@@ -183,6 +183,9 @@ pub async fn login(
         session_token: Some(complete.token),
         session_expires_at: Some(complete.expires_at),
     });
+    // `login` always replaces whichever identity the agent had resident (see the module docs on
+    // `Config::current_identity`), so mirror that here as the default for disambiguation.
+    config.current_identity = Some(name.to_string());
     config.save_to(config_path)?;
 
     println!("Logged in as '{name}' (username '{username}') on {server_display}.");
@@ -215,19 +218,52 @@ pub(crate) fn whoami_report(config: &Config, out: &mut impl Write) -> anyhow::Re
         many => {
             writeln!(out, "Logged-in identities:")?;
             for identity in many {
+                let marker = if config.current_identity.as_deref() == Some(identity.name.as_str()) {
+                    " (current)"
+                } else {
+                    ""
+                };
                 writeln!(
                     out,
-                    "  {} (username '{}') on {}",
+                    "  {} (username '{}') on {}{marker}",
                     identity.name, identity.username, identity.server_url
                 )?;
             }
             writeln!(
                 out,
-                "\nMore than one identity is cached — pass --identity where a command needs one \
-                 to disambiguate."
+                "\nMore than one identity is cached — commands default to the current one; pass \
+                 --identity to use another, or `wonton logout <name>` to forget one."
             )?;
         }
     }
+    Ok(())
+}
+
+/// `wonton logout [<name>]`. Forgets a cached identity's key material from the global config
+/// (irreversible locally — the account still exists server-side and can be logged back into with
+/// the same passphrase). Defaults to the sole cached identity, or the current one when several
+/// are cached (same resolution as any other `--identity`-accepting command); ambiguous otherwise.
+/// Also locks the agent if the identity being forgotten is the one currently resident there — the
+/// agent only ever holds one identity's key material at a time, and it would otherwise keep
+/// working for the rest of this session even though the CLI no longer considers it logged in.
+pub async fn logout(config_path: &Path, socket_path: &Path, name: Option<&str>) -> anyhow::Result<()> {
+    let mut config = Config::load_from(config_path)?;
+    let name = resolve_identity_name(&config, name)?.to_string();
+    let identity = config
+        .find_identity(&name)
+        .cloned()
+        .ok_or_else(|| anyhow!("no identity named '{name}' is logged in"))?;
+
+    config.forget_identity(&name);
+    config.save_to(config_path)?;
+
+    if let Ok(keys) = agent::public_identity(socket_path).await {
+        if keys.x25519_pubkey_b64 == identity.x25519_pubkey_b64 {
+            let _ = agent::lock(socket_path).await;
+        }
+    }
+
+    println!("Logged out '{name}'.");
     Ok(())
 }
 
@@ -271,8 +307,21 @@ fn resolve_identity_name<'a>(config: &'a Config, given: Option<&'a str>) -> anyh
         [] => bail!("no identity logged in; run `wonton login <username> --server <url>` first"),
         [only] => Ok(only.name.as_str()),
         many => {
+            // The agent only ever holds one identity's key material unlocked at a time (see
+            // `Config::current_identity`'s docs) — falling back to the most-recently-logged-in
+            // one here means having several identities cached doesn't force `--identity` on
+            // every command, only when you actually want a non-default one.
+            if let Some(current) = config.current_identity.as_deref() {
+                if let Some(id) = many.iter().find(|i| i.name == current) {
+                    return Ok(id.name.as_str());
+                }
+            }
             let names: Vec<&str> = many.iter().map(|i| i.name.as_str()).collect();
-            bail!("multiple identities are logged in ({}); pass --identity to disambiguate", names.join(", "))
+            bail!(
+                "multiple identities are logged in ({}); pass --identity to disambiguate, or \
+                 `wonton logout <name>` to forget ones you don't need",
+                names.join(", ")
+            )
         }
     }
 }
@@ -306,10 +355,15 @@ fn resolve_identity_for_project(config: &Config, server: &str, identity_name: Op
         ),
         [only] => Ok((*only).clone()),
         many => {
+            if let Some(current) = config.current_identity.as_deref() {
+                if let Some(id) = many.iter().find(|i| i.name == current) {
+                    return Ok((*id).clone());
+                }
+            }
             let names: Vec<&str> = many.iter().map(|i| i.name.as_str()).collect();
             bail!(
                 "multiple identities are logged in for server '{server}' ({}); pass --identity to \
-                 disambiguate",
+                 disambiguate, or `wonton logout <name>` to forget ones you don't need",
                 names.join(", ")
             )
         }

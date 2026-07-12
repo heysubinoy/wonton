@@ -112,7 +112,11 @@ A project directory is bound to a store by a committed `wonton.toml` (`server` +
 `wonton.toml`'s `server` field is authoritative for identity selection too: if you have several
 identities logged in on one machine (different servers), a directory-bound command narrows to
 the one matching this project's server automatically — `--identity` is only needed to
-disambiguate two identities on the *same* server.
+disambiguate two identities on the *same* server. The underlying key agent only ever holds one
+identity's key material unlocked at a time (like `ssh-agent` with a single loaded key) — each
+`login` becomes the new *current* identity, which is what commands fall back to instead of
+demanding `--identity` just because more than one is cached. `wonton logout [<name>]` forgets a
+cached identity entirely (and locks the agent if it was the resident one).
 
 ## Installation
 
@@ -183,6 +187,8 @@ marker directly.
 | Command | Description |
 |---|---|
 | `login <user>` | Unlock an identity into the agent, registering it on first use |
+| `logout [<name>]` | Forget a cached identity locally (defaults to the sole/current one); locks the agent if it was the resident identity |
+| `whoami` | Show cached identities, marking which one is current |
 | `config set-server <url>` | Set a default server for `login` to fall back on when `--server` is omitted |
 | `config show` | Show the currently configured default server, if any |
 | `init [org] [store] [branch]` | Bootstrap a project in the current directory — fully local |

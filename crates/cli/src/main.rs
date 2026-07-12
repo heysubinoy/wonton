@@ -39,6 +39,12 @@ enum Command {
     },
     /// Show which identity/identities are logged in locally, and which server each points at.
     Whoami,
+    /// Forget a cached identity's key material locally. Defaults to the sole/current identity if
+    /// more than one is cached. The account still exists server-side.
+    Logout {
+        /// The local identity nickname to forget. Only needed if more than one is cached.
+        name: Option<String>,
+    },
     /// Manage machine-wide defaults in the global config (`~/.config/wonton/config.toml`).
     Config {
         #[command(subcommand)]
@@ -244,6 +250,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Whoami => {
             let config_path = config::default_config_path()?;
             commands::whoami(&config_path)
+        }
+        Command::Logout { name } => {
+            let config_path = config::default_config_path()?;
+            let socket = agent::default_socket_path()?;
+            commands::logout(&config_path, &socket, name.as_deref()).await
         }
         Command::Config { command } => {
             let config_path = config::default_config_path()?;

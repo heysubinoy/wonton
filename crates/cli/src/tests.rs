@@ -349,7 +349,7 @@ async fn store_create_is_idempotent_on_a_duplicate_name() {
 /// With more than one identity cached in the same config, omitting `--identity` must be a clear
 /// error naming the ambiguity rather than silently picking one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn store_create_without_identity_errors_clearly_when_ambiguous() {
+async fn store_create_without_identity_defaults_to_the_current_identity() {
     let base = start_server().await;
     let socket = spawn_agent().await;
     let config_path = temp_config_path();
@@ -359,6 +359,33 @@ async fn store_create_without_identity_errors_clearly_when_ambiguous() {
     commands::login(&config_path, &socket, Some(base), "multi-b", "pw-b".into())
         .await
         .unwrap();
+
+    // "multi-b" was the most recent login (the agent only ever holds one identity resident —
+    // see `Config::current_identity`'s docs), so omitting --identity must default to it instead
+    // of erroring about ambiguity.
+    commands::store_create(&config_path, None, "multi-b", "acme")
+        .await
+        .expect("should default to the current identity ('multi-b') instead of erroring");
+}
+
+/// A config with more than one cached identity and no resolvable `current_identity` (e.g.
+/// hand-edited, or inherited from another machine) must still error clearly rather than silently
+/// guess.
+#[tokio::test]
+async fn store_create_without_identity_errors_clearly_when_truly_ambiguous() {
+    let base = start_server().await;
+    let socket = spawn_agent().await;
+    let config_path = temp_config_path();
+    commands::login(&config_path, &socket, Some(base.clone()), "multi-a", "pw-a".into())
+        .await
+        .unwrap();
+    commands::login(&config_path, &socket, Some(base), "multi-b", "pw-b".into())
+        .await
+        .unwrap();
+
+    let mut config = Config::load_from(&config_path).unwrap();
+    config.current_identity = None;
+    config.save_to(&config_path).unwrap();
 
     let err = commands::store_create(&config_path, None, "multi-a", "acme").await.unwrap_err();
     let msg = err.to_string();
@@ -966,6 +993,64 @@ fn config_set_server_persists_and_show_reports_it() {
     commands::config_set_server(&config_path, "https://wonton2.example.com").unwrap();
     let config = Config::load_from(&config_path).unwrap();
     assert_eq!(config.default_server, Some("https://wonton2.example.com".to_string()));
+}
+
+/// Each `login` becomes the new `current_identity` (mirrors the agent only ever holding one
+/// identity's key material resident at a time), and a sole cached identity's `logout` forgets it
+/// entirely from config *and* locks the agent, since that identity's key is the one resident.
+#[tokio::test]
+async fn logout_forgets_the_identity_and_locks_the_resident_agent() {
+    let base = start_server().await;
+    let socket = spawn_agent().await;
+    let config_path = temp_config_path();
+    commands::login(&config_path, &socket, Some(base), "gina", "pw-gina".into())
+        .await
+        .unwrap();
+    assert_eq!(Config::load_from(&config_path).unwrap().current_identity, Some("gina".to_string()));
+    assert!(agent::status(&socket).await.unwrap().unlocked);
+
+    commands::logout(&config_path, &socket, None).await.expect("logout should succeed");
+
+    let config = Config::load_from(&config_path).unwrap();
+    assert!(config.find_identity("gina").is_none(), "identity should be forgotten");
+    assert_eq!(config.current_identity, None);
+    assert!(!agent::status(&socket).await.unwrap().unlocked, "resident agent should be locked");
+}
+
+/// Logging out an identity that is NOT the one currently resident in the agent (two identities
+/// cached; the second login replaced the first as resident) must forget it from config without
+/// disturbing the agent's actually-resident identity.
+#[tokio::test]
+async fn logout_of_a_non_resident_identity_does_not_lock_the_agent() {
+    let base = start_server().await;
+    let socket = spawn_agent().await;
+    let config_path = temp_config_path();
+    commands::login(&config_path, &socket, Some(base.clone()), "multi-a", "pw-a".into())
+        .await
+        .unwrap();
+    commands::login(&config_path, &socket, Some(base), "multi-b", "pw-b".into())
+        .await
+        .unwrap(); // agent is now resident as multi-b
+
+    commands::logout(&config_path, &socket, Some("multi-a")).await.unwrap();
+
+    let config = Config::load_from(&config_path).unwrap();
+    assert!(config.find_identity("multi-a").is_none());
+    assert!(config.find_identity("multi-b").is_some(), "multi-b should be untouched");
+    assert_eq!(config.current_identity, Some("multi-b".to_string()));
+    assert!(
+        agent::status(&socket).await.unwrap().unlocked,
+        "multi-b's key is still resident and should remain unlocked"
+    );
+}
+
+/// `logout` with nothing cached at all is a clear error, not a panic.
+#[tokio::test]
+async fn logout_with_no_identities_errors_clearly() {
+    let socket = spawn_agent().await;
+    let config_path = temp_config_path();
+    let err = commands::logout(&config_path, &socket, None).await.unwrap_err();
+    assert!(err.to_string().contains("no identity logged in"), "got: {err}");
 }
 
 /// A directory with no `wonton.toml` anywhere in its ancestry is a clear error pointing at
