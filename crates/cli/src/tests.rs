@@ -750,6 +750,41 @@ async fn export_writes_dotenv_matching_the_working_tree() {
     let _ = std::fs::remove_file(&out);
 }
 
+/// `view` returns the same committed + staged effective values `export`/`run` would use,
+/// decrypted, sorted by key — nothing written to disk, no subprocess.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn view_returns_the_decrypted_working_tree_sorted_by_key() {
+    let fx = ready_fixture("kelly", None).await;
+
+    commands::set(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, vec![("ZKEY".into(), "z-value".into())])
+        .await
+        .unwrap();
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "c1".into())
+        .await
+        .unwrap();
+    commands::set(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, vec![("AKEY".into(), "a-value".into())])
+        .await
+        .unwrap(); // staged, not yet committed — must still show up
+
+    let entries = commands::view(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir).await.unwrap();
+    assert_eq!(
+        entries,
+        vec![
+            ("AKEY".to_string(), b"a-value".to_vec()),
+            ("ZKEY".to_string(), b"z-value".to_vec()),
+        ],
+        "sorted by key, committed + staged"
+    );
+}
+
+/// On a branch with nothing set, `view` returns an empty list rather than an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn view_on_an_empty_branch_returns_no_entries() {
+    let fx = ready_fixture("liam", None).await;
+    let entries = commands::view(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir).await.unwrap();
+    assert!(entries.is_empty(), "got: {entries:?}");
+}
+
 /// End-to-end: machine A commits + pushes; a second, fresh directory (`clone`, same account —
 /// mirrors "two machines sharing one account") auto-unwraps the self-granted DEK and
 /// auto-pulls the history immediately, seeing the same tip and the same decrypted value with

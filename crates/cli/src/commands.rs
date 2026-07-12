@@ -1663,6 +1663,24 @@ pub async fn run(config_path: &Path, state_path: &Path, socket_path: &Path, cwd:
     Ok(status.code().unwrap_or(1))
 }
 
+/// `wonton view` — the current branch's effective (committed + any staged) secrets as sorted
+/// `(key, plaintext value)` pairs, decrypted in-process. Nothing ever touches disk (unlike
+/// `export`) and no subprocess is needed just to see what you have (unlike `run`); returns data
+/// rather than printing so callers (`main.rs`, tests) decide the presentation, mirroring `diff`.
+pub async fn view(config_path: &Path, state_path: &Path, socket_path: &Path, cwd: &Path) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let ws = resolve_workspace(config_path, cwd, None)?;
+    ready_workspace(state_path, socket_path, &ws).await?;
+    let key = ws.key();
+    let obj_store = open_object_store(&object_store_dir_for(state_path))?;
+    let cipher = AgentCipher::new(socket_path, key.clone());
+
+    let state = LocalState::load_from(state_path)?;
+    let bs = state.branch(&key).cloned().unwrap_or_default();
+    let working_set = effective_working_set(&obj_store, &cipher, bs.tip, &bs.staged)?;
+
+    Ok(working_set.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+}
+
 /// `wonton export --format dotenv <path>` — decrypt the effective working tree and write it to a
 /// file the user names. **Prints an explicit plaintext warning to stderr before writing.** Only
 /// ever runs on direct request, never as a side effect of another command.

@@ -207,6 +207,7 @@ marker directly.
 | `push` | Upload local commits and move the branch ref; first push on a branch provisions it |
 | `merge <branch>` / `merge --continue` | Three-way merge another branch (own DEK) in, or resume one paused on conflicts |
 | `run -- <cmd>` | Run a command with secrets injected as env vars — never written to disk |
+| `view [--keys-only]` | Print the current branch's decrypted secrets to stdout — nothing touches disk |
 | `export --format dotenv <path>` | Export secrets to a file (plaintext — prints a warning) |
 | `share <user> [--branch <name>]` | Grant a user access to a branch (wraps the DEK; O(1)); auto-joins them to the org |
 | `revoke <user> [--branch <name>]` | Revoke a user's access (removes them and rotates the DEK) |

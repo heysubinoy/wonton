@@ -146,6 +146,12 @@ enum Command {
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Print the current branch's secrets to stdout as `KEY=VALUE` — nothing touches disk.
+    View {
+        /// List key names only, without values.
+        #[arg(long)]
+        keys_only: bool,
+    },
     /// Export the current branch's secrets to a file (plaintext — prints a warning).
     Export {
         /// Output format (only `dotenv` is supported in v1).
@@ -373,6 +379,27 @@ async fn main() -> anyhow::Result<()> {
             let cwd = current_dir()?;
             let code = commands::run(&config_path, &state_path, &socket, &cwd, cmd).await?;
             std::process::exit(code);
+        }
+        Command::View { keys_only } => {
+            let config_path = config::default_config_path()?;
+            let state_path = state::default_state_path()?;
+            let socket = agent::client::ensure_running().await?;
+            let cwd = current_dir()?;
+            let entries = commands::view(&config_path, &state_path, &socket, &cwd).await?;
+            if entries.is_empty() {
+                println!("No secrets.");
+            }
+            for (k, value) in entries {
+                if keys_only {
+                    println!("{k}");
+                } else {
+                    match std::str::from_utf8(&value) {
+                        Ok(v) => println!("{k}={v}"),
+                        Err(_) => println!("{k}=<binary value, {} bytes>", value.len()),
+                    }
+                }
+            }
+            Ok(())
         }
         Command::Export { format, path } => {
             let config_path = config::default_config_path()?;
