@@ -1,0 +1,34 @@
+[package]
+name = "wonton-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# `rlib` too (not just `cdylib`) so `cargo test -p wonton-wasm` can build and run the plain
+# `#[test]`s below natively, without needing a wasm32 target/browser for that part.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+base64 = "0.22"
+# `getrandom`'s wasm backend is selected by the FINAL cdylib crate, not by a library dependency
+# — `wonton-crypto` already depends on `rand_core`'s `getrandom` feature, this just makes sure
+# the `js` backend (the browser's `crypto.getRandomValues`) is the one that gets linked in for
+# the wasm32 build. A no-op for the native `cargo test` build below. Two major versions are
+# pulled transitively (0.2 via wonton-crypto's `rand_core`, 0.4 via `chacha20poly1305`'s newer
+# `crypto-common`) — both need their wasm backend feature enabled, hence both listed here
+# explicitly under distinct keys (neither is called by name in this crate's own code).
+getrandom = { version = "0.2", features = ["js"] }
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+# Same reason: `wonton-objects`'s `Commit::author_id: Uuid` pulls in `uuid`, which also needs an
+# explicit wasm randomness source selected by the final crate.
+uuid = { version = "1.23.4", features = ["js"] }
+wonton-crypto = { version = "0.1.0", path = "../crypto" }
+wonton-objects = { version = "0.1.0", path = "../objects" }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+uuid = { version = "1", features = ["v4"] }

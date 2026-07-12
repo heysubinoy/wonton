@@ -1,0 +1,88 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  padding: 2rem;
+}
+
+.card {
+  max-width: 720px;
+  margin: 0 auto;
+}
+
+form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  max-width: 360px;
+}
+
+form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.9rem;
+}
+
+input {
+  padding: 0.4rem;
+  font-size: 1rem;
+}
+
+button {
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+}
+
+button.link {
+  background: none;
+  border: none;
+  color: #3366cc;
+  text-decoration: underline;
+  padding: 0;
+  font-size: 1rem;
+}
+
+.error {
+  color: #cc3333;
+  white-space: pre-wrap;
+}
+
+.note {
+  background: #f5f5dc22;
+  border: 1px solid #999;
+  padding: 0.75rem;
+  border-radius: 4px;
+}
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+
+table {
+  border-collapse: collapse;
+  margin: 1rem 0;
+}
+
+td {
+  border: 1px solid #999;
+  padding: 0.3rem 0.6rem;
+  font-family: monospace;
+}
+
+.role {
+  opacity: 0.6;
+  font-size: 0.85rem;
+}
+
+.meta {
+  opacity: 0.6;
+  font-size: 0.8rem;
+  margin-left: 0.5rem;
+}
