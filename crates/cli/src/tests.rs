@@ -619,7 +619,59 @@ async fn commit_advances_tip_and_log_shows_real_author_id() {
     assert_eq!(commit.fields.author_id, uuid::Uuid::parse_str(&fx.user_id).unwrap());
     assert_eq!(commit.fields.message, "initial");
 
-    commands::log(&fx.config_path, &fx.state_path, &fx.dir).await.unwrap();
+    let entries = commands::log(&fx.config_path, &fx.state_path, &fx.dir).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].hash, tip);
+    assert_eq!(entries[0].author_id, uuid::Uuid::parse_str(&fx.user_id).unwrap());
+    // The whole point: a real username, not the raw author_id UUID re-stringified.
+    assert_eq!(entries[0].author_username, "frank");
+    assert_eq!(entries[0].message, "initial");
+}
+
+/// `log` on a branch with no commits yet returns an empty list rather than an error, mirroring
+/// `view`'s "nothing here yet" behavior.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn log_on_an_empty_branch_returns_no_entries() {
+    let fx = ready_fixture("gwen", None).await;
+    let entries = commands::log(&fx.config_path, &fx.state_path, &fx.dir).await.unwrap();
+    assert!(entries.is_empty(), "got: {entries:?}");
+}
+
+/// Two authors on the same history each show up under their OWN real username, not each
+/// other's or the raw UUID — the exact bug report this feature fixes ("log shows a hash instead
+/// of the user").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn log_shows_each_authors_own_username_across_a_shared_history() {
+    let alice = ready_fixture("p6alice", None).await;
+    commands::set(&alice.config_path, &alice.state_path, &alice.socket, &alice.dir, vec![("K".into(), "v".into())])
+        .await
+        .unwrap();
+    commands::commit(&alice.config_path, &alice.state_path, &alice.socket, &alice.dir, "alice's commit".into())
+        .await
+        .unwrap();
+    commands::push(&alice.config_path, &alice.state_path, &alice.socket, &alice.dir).await.unwrap();
+
+    let bob = login_only("p6bob", &alice.base).await;
+    commands::share(&alice.config_path, &alice.state_path, &alice.socket, &alice.dir, None, "p6bob", Role::Writer)
+        .await
+        .unwrap();
+    let bob_dir = temp_dir();
+    commands::clone(&bob.config_path, &bob.state_path, &bob.socket, &bob_dir, "acme", "backend", Some("main"), None)
+        .await
+        .unwrap();
+    commands::set(&bob.config_path, &bob.state_path, &bob.socket, &bob_dir, vec![("K2".into(), "v2".into())])
+        .await
+        .unwrap();
+    commands::commit(&bob.config_path, &bob.state_path, &bob.socket, &bob_dir, "bob's commit".into())
+        .await
+        .unwrap();
+
+    let entries = commands::log(&bob.config_path, &bob.state_path, &bob_dir).await.unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].author_username, "p6bob");
+    assert_eq!(entries[0].message, "bob's commit");
+    assert_eq!(entries[1].author_username, "p6alice");
+    assert_eq!(entries[1].message, "alice's commit");
 }
 
 /// `diff` between two real commits reports the right Added/Changed keys, and re-committing an
@@ -941,6 +993,56 @@ async fn clone_reports_no_access_then_works_after_share() {
     assert_eq!(code, 0);
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "top-secret");
     let _ = std::fs::remove_file(&out);
+}
+
+/// Cloning an org/store/branch that doesn't exist at all must fail immediately and clearly,
+/// without writing `wonton.toml`/`.wonton.local` — a typo will never start working no matter how
+/// long you wait, unlike "shared but access hasn't landed yet" (see
+/// `clone_reports_no_access_then_works_after_share`, which is a soft warning, not a hard error).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clone_of_a_nonexistent_store_fails_immediately_and_writes_no_markers() {
+    let base = start_server().await;
+    let machine = login_only("henrietta", &base).await;
+    let dir = temp_dir();
+
+    let err = commands::clone(&machine.config_path, &machine.state_path, &machine.socket, &dir, "ghost-org", "ghost-store", None, None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("does not exist"), "got: {err}");
+    assert!(!dir.join("wonton.toml").exists(), "no marker should be written on a hard failure");
+    assert!(!dir.join(".wonton.local").exists());
+}
+
+/// `parse_clone_target` reinterprets `wonton clone`'s positional args for both the classic
+/// `<org> <store> [branch]` form and the combined `<org>/<store> [branch]` shorthand.
+#[test]
+fn parse_clone_target_accepts_classic_and_combined_forms() {
+    // Classic: org, store, branch given separately.
+    assert_eq!(
+        commands::parse_clone_target("acme".into(), Some("backend".into()), Some("dev".into())).unwrap(),
+        ("acme".to_string(), "backend".to_string(), Some("dev".to_string()))
+    );
+    // Classic with no branch.
+    assert_eq!(
+        commands::parse_clone_target("acme".into(), Some("backend".into()), None).unwrap(),
+        ("acme".to_string(), "backend".to_string(), None)
+    );
+    // Combined, no branch: clap left `store`/`branch` both None.
+    assert_eq!(
+        commands::parse_clone_target("acme/backend".into(), None, None).unwrap(),
+        ("acme".to_string(), "backend".to_string(), None)
+    );
+    // Combined with a branch: clap put "dev" in the `store` slot since only 2 tokens were given.
+    assert_eq!(
+        commands::parse_clone_target("acme/backend".into(), Some("dev".into()), None).unwrap(),
+        ("acme".to_string(), "backend".to_string(), Some("dev".to_string()))
+    );
+    // Classic form missing its required `store` errors clearly instead of panicking.
+    let err = commands::parse_clone_target("acme".into(), None, None).unwrap_err();
+    assert!(err.to_string().contains("usage:"), "got: {err}");
+    // Combined form with too many trailing tokens (clap filled BOTH store and branch) errors.
+    let err = commands::parse_clone_target("acme/backend".into(), Some("dev".into()), Some("extra".into())).unwrap_err();
+    assert!(err.to_string().contains("too many arguments"), "got: {err}");
 }
 
 // ---- login / whoami --------------------------------------------------------------------------

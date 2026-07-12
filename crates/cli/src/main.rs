@@ -114,14 +114,17 @@ enum Command {
     /// Bind the current directory to an existing org/store you already have access to.
     ///
     /// Use this for a directory that isn't a git checkout already carrying a `wonton.toml` — for
-    /// example an empty directory someone shared a store with you into. Writes the same markers
-    /// `init` would, then immediately tries to unwrap the branch's DEK and pull its history, so
-    /// you find out right away if you don't have access yet rather than on the next command.
+    /// example an empty directory someone shared a store with you into. Confirms the org/store/
+    /// branch actually exists first (a hard failure, no markers written, if it doesn't — a typo
+    /// will never start working no matter how long you wait), then writes the same markers
+    /// `init` would and immediately tries to unwrap the branch's DEK and pull its history, so you
+    /// find out right away if you're not shared in *yet* (a soft warning, since that might
+    /// resolve itself shortly) rather than on the next unrelated command.
     Clone {
-        /// The org the store belongs to.
+        /// The org, or `org/store` as a single argument.
         org: String,
-        /// The store (repo) name.
-        store: String,
+        /// The store (repo) name. Omit if `org` was given as `org/store`.
+        store: Option<String>,
         /// The branch to start on. Defaults to "main".
         branch: Option<String>,
         /// The local identity to act as. Only needed if more than one identity is logged in.
@@ -145,7 +148,7 @@ enum Command {
         #[arg(short = 'b', value_name = "NAME")]
         create: Option<String>,
         /// When creating with `-b`, seed the new branch's values from this existing branch.
-        #[arg(long)]
+        #[arg(short = 'f', long)]
         from: Option<String>,
         /// The local identity to act as. Only needed if more than one identity is logged in.
         #[arg(long)]
@@ -420,6 +423,7 @@ async fn main() -> anyhow::Result<()> {
             let state_path = state::default_state_path()?;
             let socket = agent::client::ensure_running().await?;
             let cwd = current_dir()?;
+            let (org, store, branch) = commands::parse_clone_target(org, store, branch)?;
             commands::clone(&config_path, &state_path, &socket, &cwd, &org, &store, branch.as_deref(), identity.as_deref()).await
         }
         Command::Branch { name, create, from, identity } => {
@@ -479,7 +483,18 @@ async fn main() -> anyhow::Result<()> {
             let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
             let cwd = current_dir()?;
-            commands::log(&config_path, &state_path, &cwd).await
+            let entries = commands::log(&config_path, &state_path, &cwd).await?;
+            if entries.is_empty() {
+                println!("No commits yet.");
+            }
+            for entry in entries {
+                println!("commit {} ({})", commands::short_hash(&entry.hash), entry.hash.to_hex());
+                println!("  author:  {} <{}>", entry.author_username, entry.author_id);
+                println!("  date:    {}", entry.timestamp);
+                println!("  message: {}", entry.message);
+                println!();
+            }
+            Ok(())
         }
         Command::Diff { a, b } => {
             let config_path = config::default_config_path()?;

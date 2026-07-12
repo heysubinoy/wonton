@@ -481,6 +481,9 @@ async fn ensure_dek_unwrapped(
     let keys = match client.list_keys(org, store, branch).await {
         Ok(k) => k,
         Err(SyncError::Forbidden) => bail!("you don't have access to {org}/{store}/{branch}"),
+        Err(SyncError::NotFound(_)) => {
+            bail!("'{org}/{store}/{branch}' does not exist on {} — check the org/store/branch name", identity.server_url)
+        }
         Err(SyncError::Unauthorized) => bail!(
             "your session for '{}' has expired; run `wonton login {}` again",
             identity.name,
@@ -617,11 +620,48 @@ pub async fn init(
     Ok(())
 }
 
+/// Reinterpret `wonton clone`'s positional args, accepting `<org> <store> [branch]` (the
+/// original form) as well as a single combined `<org>/<store> [branch]`. clap always fills
+/// `store` with whatever text comes right after `org`, so when `org` turns out to contain `/`,
+/// that text is actually the branch, not a store name — this function does that reassignment
+/// and rejects a genuinely over-long combined-form invocation (`org/store extra1 extra2`, which
+/// clap's declarative schema can't reject on its own since it can't see the slash).
+pub fn parse_clone_target(
+    org: String,
+    store: Option<String>,
+    branch: Option<String>,
+) -> anyhow::Result<(String, String, Option<String>)> {
+    match org.split_once('/') {
+        Some((real_org, real_store)) => {
+            if branch.is_some() {
+                bail!(
+                    "too many arguments for `wonton clone {real_org}/{real_store}`; usage: \
+                     `wonton clone <org>/<store> [branch]` or `wonton clone <org> <store> [branch]`"
+                );
+            }
+            Ok((real_org.to_string(), real_store.to_string(), store))
+        }
+        None => {
+            let store = store.ok_or_else(|| {
+                anyhow!(
+                    "usage: `wonton clone <org> <store> [branch]` or `wonton clone <org>/<store> \
+                     [branch]`"
+                )
+            })?;
+            Ok((org, store, branch))
+        }
+    }
+}
+
 /// `wonton clone <org> <store> [branch] [--identity <identity>]`. For a directory that isn't a
-/// git checkout carrying a `wonton.toml` already (access was communicated out-of-band): writes
-/// the marker + `.wonton.local`, then makes a best-effort attempt to confirm access and pull
-/// history right away, so the failure mode ("not shared in yet") is reported immediately instead
-/// of on the first porcelain command. No network beyond that attempt.
+/// git checkout carrying a `wonton.toml` already (access was communicated out-of-band): first
+/// confirms the target actually EXISTS on the server (a hard failure — no markers written — if
+/// it doesn't, since a typo'd/nonexistent org/store/branch will never start working no matter
+/// how long you wait), then writes the marker + `.wonton.local`, then makes a best-effort
+/// attempt to unwrap the DEK and pull history right away. That last step failing (e.g. shared
+/// with you but the grant hasn't landed yet) is a soft warning, not a hard failure — access
+/// legitimately might arrive shortly, matching the rest of the CLI's "just works once you're
+/// granted access" philosophy.
 #[allow(clippy::too_many_arguments)]
 pub async fn clone(
     config_path: &Path,
@@ -641,6 +681,15 @@ pub async fn clone(
     if marker_path.exists() {
         bail!("wonton.toml already exists in this directory; refusing to overwrite it");
     }
+
+    if let Err(SyncError::NotFound(_)) = authed_client(&identity).list_keys(org, store, branch).await {
+        bail!(
+            "'{org}/{store}' (branch '{branch}') does not exist on {} — check the org/store/branch \
+             name",
+            identity.server_url
+        );
+    }
+
     config::write_wonton_toml(&marker_path, &identity.server_url, org, store).context("writing wonton.toml")?;
     config::write_local_branch(cwd, branch).context("writing .wonton.local")?;
     println!(
@@ -1005,52 +1054,75 @@ pub async fn commit(config_path: &Path, state_path: &Path, socket_path: &Path, c
     Ok(())
 }
 
+/// One entry of `wonton log`'s verified history, already resolved to a human-readable author —
+/// returned as data (mirroring `view`/`diff`) rather than printed directly, so the caller (
+/// `main.rs`, tests) decides presentation and the username resolution is directly assertable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogEntry {
+    pub hash: Hash,
+    /// The author's server-facing username, resolved via the same global-user-directory lookup
+    /// used to verify the commit's signature — never a raw UUID unless that lookup somehow
+    /// returned no username (defensive only; the server always has one for a real user row).
+    pub author_username: String,
+    pub author_id: Uuid,
+    pub timestamp: i64,
+    pub message: String,
+}
+
 /// `wonton log` — verified first-parent history from the current tip. Resolves each commit's
 /// expected signer by its own `author_id` rather than assuming the local caller's own identity
 /// authored the whole history: a history shared with (or received from) another user contains
 /// commits authored by *their* identity too, and those must verify against *their* pubkey, not
-/// ours. Author pubkeys are resolved via the server's global user directory (`get_user_by_id`),
-/// not just current branch membership, so a since-revoked member's past commits remain
-/// verifiable.
-pub async fn log(config_path: &Path, state_path: &Path, cwd: &Path) -> anyhow::Result<()> {
+/// ours. Author pubkeys (and, alongside them, usernames — same lookup, no extra round trip) are
+/// resolved via the server's global user directory (`get_user_by_id`), not just current branch
+/// membership, so a since-revoked member's past commits remain verifiable and attributable.
+pub async fn log(config_path: &Path, state_path: &Path, cwd: &Path) -> anyhow::Result<Vec<LogEntry>> {
     let ws = resolve_workspace(config_path, cwd, None)?;
     let key = ws.key();
     let state = LocalState::load_from(state_path)?;
     let tip = match state.branch(&key).and_then(|b| b.tip) {
         Some(t) => t,
-        None => {
-            println!("No commits on branch '{}' yet.", ws.branch);
-            return Ok(());
-        }
+        None => return Ok(Vec::new()),
     };
 
     let obj_store = open_object_store(&object_store_dir_for(state_path))?;
     let author_ids = wonton_vcs::mainline_author_ids(&obj_store, tip)?;
     let client = authed_client(&ws.identity);
     let mut signers: HashMap<Uuid, [u8; 32]> = HashMap::new();
+    let mut usernames: HashMap<Uuid, String> = HashMap::new();
     for author_id in author_ids {
         let info = client
             .get_user_by_id(&author_id.to_string())
             .await
             .with_context(|| format!("could not resolve public key for commit author {author_id}"))?;
         signers.insert(author_id, decode_ed25519_pubkey(&info.ed25519_pubkey)?);
+        usernames.insert(author_id, info.username);
     }
 
+    // Every mainline author was just resolved above (a lookup failure would already have
+    // returned early), so `wonton_vcs::log`'s per-commit signer resolution here can never miss —
+    // this is purely reusing the same closure shape `mainline_author_ids` was designed to feed.
     let history = wonton_vcs::log(&obj_store, tip, |author_id| signers.get(&author_id).copied())?;
-    for vc in &history {
-        println!("commit {} ({})", short_hash(&vc.hash), vc.hash.to_hex());
-        println!("  author:  {}", vc.commit.fields.author_id);
-        println!("  date:    {}", vc.commit.fields.timestamp);
-        println!("  message: {}", vc.commit.fields.message);
-        println!();
-    }
-    Ok(())
+    Ok(history
+        .into_iter()
+        .map(|vc| {
+            let author_id = vc.commit.fields.author_id;
+            let author_username = usernames.get(&author_id).cloned().unwrap_or_else(|| "<unknown>".to_string());
+            LogEntry {
+                hash: vc.hash,
+                author_username,
+                author_id,
+                timestamp: vc.commit.fields.timestamp,
+                message: vc.commit.fields.message,
+            }
+        })
+        .collect())
 }
 
 /// Abbreviate a hash to its first 12 hex characters (48 bits) for scannable display — `diff` and
 /// every other command that accepts a commit hash also accepts any unambiguous prefix, so this
 /// is always enough to paste back in, and the full hash is still printed alongside it in `log`.
-fn short_hash(hash: &Hash) -> String {
+pub fn short_hash(hash: &Hash) -> String {
     hash.to_hex()[..12].to_string()
 }
 

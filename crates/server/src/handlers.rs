@@ -534,16 +534,18 @@ pub async fn get_user(
     _actor: Actor,
     Path(username): Path<String>,
 ) -> Result<Json<UserPublicInfo>, ApiError> {
-    let row = sqlx::query("SELECT id, ed25519_pubkey, x25519_pubkey FROM users WHERE username = ?")
+    let row = sqlx::query("SELECT id, username, ed25519_pubkey, x25519_pubkey FROM users WHERE username = ?")
         .bind(&username)
         .fetch_optional(&st.pool)
         .await?
         .ok_or(ApiError::NotFound("user"))?;
     let user_id: String = row.get("id");
+    let username: String = row.get("username");
     let ed: Vec<u8> = row.get("ed25519_pubkey");
     let x: Vec<u8> = row.get("x25519_pubkey");
     Ok(Json(UserPublicInfo {
         user_id,
+        username,
         ed25519_pubkey: STANDARD.encode(ed),
         x25519_pubkey: STANDARD.encode(x),
     }))
@@ -560,16 +562,18 @@ pub async fn get_user_by_id(
     _actor: Actor,
     Path(user_id): Path<String>,
 ) -> Result<Json<UserPublicInfo>, ApiError> {
-    let row = sqlx::query("SELECT id, ed25519_pubkey, x25519_pubkey FROM users WHERE id = ?")
+    let row = sqlx::query("SELECT id, username, ed25519_pubkey, x25519_pubkey FROM users WHERE id = ?")
         .bind(&user_id)
         .fetch_optional(&st.pool)
         .await?
         .ok_or(ApiError::NotFound("user"))?;
     let user_id: String = row.get("id");
+    let username: String = row.get("username");
     let ed: Vec<u8> = row.get("ed25519_pubkey");
     let x: Vec<u8> = row.get("x25519_pubkey");
     Ok(Json(UserPublicInfo {
         user_id,
+        username,
         ed25519_pubkey: STANDARD.encode(ed),
         x25519_pubkey: STANDARD.encode(x),
     }))

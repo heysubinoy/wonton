@@ -278,6 +278,9 @@ pub struct MemberRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserPublicInfo {
     pub user_id: String,
+    /// The server-facing login handle. Not secret — same trust level as the public keys below;
+    /// lets a client show a real name (`wonton log`) instead of a raw `author_id` UUID.
+    pub username: String,
     /// base64 of the 32-byte Ed25519 public key.
     pub ed25519_pubkey: String,
     /// base64 of the 32-byte X25519 public key.
