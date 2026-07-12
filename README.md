@@ -149,11 +149,17 @@ $ wonton commit -m "seed prod secrets"
 $ wonton push
 $ git add wonton.toml && git commit -m "wonton init" && git push   # .wonton.local stays gitignored
 
+# Look at what's on the branch right now (nothing touches disk).
+$ wonton view
+
 # Inject the decrypted values into a subprocess — never written to disk.
 $ wonton run -- ./start-server
 
-# Or materialize them explicitly (prints a plaintext warning first).
-$ wonton export --format dotenv .env
+# Load secrets into the CURRENT shell (a subprocess like `run` can never do this for its parent).
+$ eval "$(wonton export --format shell)"
+
+# Or materialize them explicitly to a file (prints a plaintext warning first; defaults to .env).
+$ wonton export
 
 # Share access (also adds bob to the org, scoped to this branch — bob must have logged in once).
 $ wonton share bob --role reader

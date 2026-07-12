@@ -740,7 +740,7 @@ async fn export_writes_dotenv_matching_the_working_tree() {
         .unwrap();
 
     let out = unique("dotenv");
-    commands::export(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, commands::ExportFormat::Dotenv, &out)
+    commands::export(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, commands::ExportFormat::Dotenv, Some(&out))
         .await
         .unwrap();
 
@@ -748,6 +748,72 @@ async fn export_writes_dotenv_matching_the_working_tree() {
     assert!(contents.contains("TOKEN=abc123\n"), "got: {contents}");
     assert!(contents.contains("EXTRA=\"with space\"\n"), "got: {contents}");
     let _ = std::fs::remove_file(&out);
+}
+
+/// `export --format dotenv` with no path writes `.env` inside the current directory (the
+/// workspace dir here) rather than requiring a path — the default a plain `wonton export` should
+/// "just work" with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn export_dotenv_with_no_path_defaults_to_dot_env_in_cwd() {
+    let fx = ready_fixture("mona", None).await;
+    commands::set(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, vec![("TOKEN".into(), "abc123".into())])
+        .await
+        .unwrap();
+
+    let result = commands::export(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, commands::ExportFormat::Dotenv, None)
+        .await
+        .unwrap();
+    assert_eq!(result, None, "writing to a file returns None, not stdout content");
+
+    let contents = std::fs::read_to_string(fx.dir.join(".env")).unwrap();
+    assert!(contents.contains("TOKEN=abc123\n"), "got: {contents}");
+}
+
+/// A `path` that names a directory — an existing one, or the literal `.`/`./` that used to fail
+/// with "is a directory" — gets the format's default filename appended instead of erroring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn export_to_a_directory_path_appends_the_default_filename() {
+    let fx = ready_fixture("nico", None).await;
+    commands::set(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, vec![("TOKEN".into(), "abc123".into())])
+        .await
+        .unwrap();
+
+    // "." resolved against the workspace dir (mirrors the CLI passing the real cwd through).
+    let dot = std::path::Path::new(".");
+    commands::export(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, commands::ExportFormat::Dotenv, Some(dot))
+        .await
+        .expect("a directory path should append .env, not fail with 'is a directory'");
+
+    let contents = std::fs::read_to_string(fx.dir.join(".env")).unwrap();
+    assert!(contents.contains("TOKEN=abc123\n"), "got: {contents}");
+}
+
+/// `export --format shell` with no path prints `export KEY='VALUE'` statements as returned
+/// content (for the caller to `print!`) rather than writing any file — this is what makes
+/// `eval "$(wonton export --format shell)"` load secrets into the CURRENT shell, since a
+/// subprocess (`wonton run`) can never mutate its parent's environment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn export_shell_with_no_path_returns_eval_able_content_and_writes_no_file() {
+    let fx = ready_fixture("oscar", None).await;
+    commands::set(
+        &fx.config_path,
+        &fx.state_path,
+        &fx.socket,
+        &fx.dir,
+        vec![("TOKEN".into(), "abc123".into()), ("QUOTED".into(), "it's here".into())],
+    )
+    .await
+    .unwrap();
+
+    let result = commands::export(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, commands::ExportFormat::Shell, None)
+        .await
+        .unwrap();
+    let contents = result.expect("shell format with no path must return content, not write a file");
+    assert!(contents.contains("export TOKEN='abc123'\n"), "got: {contents}");
+    // A single quote inside the value is escaped via the standard '\'' trick.
+    assert!(contents.contains(r"export QUOTED='it'\''s here'"), "got: {contents}");
+    assert!(!fx.dir.join(".env").exists());
+    assert!(!fx.dir.join(".env.sh").exists());
 }
 
 /// `view` returns the same committed + staged effective values `export`/`run` would use,

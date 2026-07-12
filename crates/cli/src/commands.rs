@@ -784,10 +784,15 @@ pub async fn branch_create(
 // plaintext or ciphertext bytes.
 // =====================================================================================
 
-/// The output format for `wonton export`. Only dotenv is supported in v1.
+/// The output format for `wonton export`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
+    /// `KEY=VALUE` lines, for a `.env` file.
     Dotenv,
+    /// `export KEY='VALUE'` lines (POSIX shell), for `eval`/`source` into the CURRENT shell — a
+    /// subprocess (all `wonton run` ever spawns) can never mutate its parent shell's
+    /// environment, so this is the only way to get secrets into the shell you're typing in.
+    Shell,
 }
 
 impl ExportFormat {
@@ -795,7 +800,45 @@ impl ExportFormat {
     pub fn parse(s: &str) -> anyhow::Result<Self> {
         match s.to_ascii_lowercase().as_str() {
             "dotenv" | "env" => Ok(ExportFormat::Dotenv),
-            other => bail!("unsupported export format '{other}'; only 'dotenv' is supported"),
+            "shell" | "sh" | "bash" => Ok(ExportFormat::Shell),
+            other => bail!("unsupported export format '{other}'; expected 'dotenv' or 'shell'"),
+        }
+    }
+
+    /// The filename used when a given `path` turns out to name a directory, or (for `Dotenv`)
+    /// when no `path` was given at all.
+    fn default_filename(self) -> &'static str {
+        match self {
+            ExportFormat::Dotenv => ".env",
+            ExportFormat::Shell => ".env.sh",
+        }
+    }
+}
+
+/// Resolve where `export` should write, or `None` for "print to stdout" (the `eval`/`source`
+/// path into the current shell). No `path` given: `Dotenv` defaults to `<cwd>/.env` — the
+/// filename more or less *is* the format's point — while `Shell` defaults to stdout, since
+/// `eval "$(wonton export --format shell)"` is the whole reason that format exists. A given
+/// `path` always wins over the default; if it names a directory (an existing one, or written
+/// with a trailing `/`, which covers the `.` / `./` case that used to fail with "is a
+/// directory") the format's default filename is appended rather than trying to write straight
+/// to a directory. Relative paths resolve against `cwd` (not the process's actual cwd), so this
+/// stays correctly testable against a fixture directory.
+fn resolve_export_target(cwd: &Path, format: ExportFormat, path: Option<&Path>) -> Option<PathBuf> {
+    match path {
+        None => match format {
+            ExportFormat::Dotenv => Some(cwd.join(format.default_filename())),
+            ExportFormat::Shell => None,
+        },
+        Some(p) => {
+            let resolved = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+            let looks_like_a_directory =
+                resolved.is_dir() || p.as_os_str().to_string_lossy().ends_with('/');
+            Some(if looks_like_a_directory {
+                resolved.join(format.default_filename())
+            } else {
+                resolved
+            })
         }
     }
 }
@@ -1681,10 +1724,21 @@ pub async fn view(config_path: &Path, state_path: &Path, socket_path: &Path, cwd
     Ok(working_set.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
 }
 
-/// `wonton export --format dotenv <path>` — decrypt the effective working tree and write it to a
-/// file the user names. **Prints an explicit plaintext warning to stderr before writing.** Only
-/// ever runs on direct request, never as a side effect of another command.
-pub async fn export(config_path: &Path, state_path: &Path, socket_path: &Path, cwd: &Path, format: ExportFormat, path: &Path) -> anyhow::Result<()> {
+/// `wonton export [--format dotenv|shell] [path]` — decrypt the effective working tree and
+/// either write it to a file (returning `None`) or hand back the rendered content for the
+/// caller to print to stdout (returning `Some`), mirroring how [`diff`]/[`view`] return data
+/// rather than printing directly. **Prints an explicit plaintext warning to stderr first,
+/// always** (never stdout, so `eval "$(wonton export --format shell)"` never chokes on stray
+/// output). Only ever runs on direct request, never as a side effect of another command. See
+/// [`resolve_export_target`] for the path/format defaulting rules.
+pub async fn export(
+    config_path: &Path,
+    state_path: &Path,
+    socket_path: &Path,
+    cwd: &Path,
+    format: ExportFormat,
+    path: Option<&Path>,
+) -> anyhow::Result<Option<String>> {
     let ws = resolve_workspace(config_path, cwd, None)?;
     ready_workspace(state_path, socket_path, &ws).await?;
     let key = ws.key();
@@ -1697,16 +1751,29 @@ pub async fn export(config_path: &Path, state_path: &Path, socket_path: &Path, c
 
     let contents = match format {
         ExportFormat::Dotenv => render_dotenv(&working_set)?,
+        ExportFormat::Shell => render_shell(&working_set)?,
     };
 
-    eprintln!(
-        "wonton: writing {} decrypted secret(s) to {} in plaintext — handle with care",
-        working_set.len(),
-        path.display()
-    );
-    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
-    println!("Exported {} secret(s) to {}.", working_set.len(), path.display());
-    Ok(())
+    match resolve_export_target(cwd, format, path) {
+        Some(out_path) => {
+            eprintln!(
+                "wonton: writing {} decrypted secret(s) to {} in plaintext — handle with care",
+                working_set.len(),
+                out_path.display()
+            );
+            std::fs::write(&out_path, contents)
+                .with_context(|| format!("writing {}", out_path.display()))?;
+            println!("Exported {} secret(s) to {}.", working_set.len(), out_path.display());
+            Ok(None)
+        }
+        None => {
+            eprintln!(
+                "wonton: printing {} decrypted secret(s) to stdout in plaintext",
+                working_set.len()
+            );
+            Ok(Some(contents))
+        }
+    }
 }
 
 // =====================================================================================
@@ -2152,6 +2219,21 @@ fn render_dotenv(working_set: &WorkingSet) -> anyhow::Result<String> {
         } else {
             out.push_str(&format!("{key}={value}\n"));
         }
+    }
+    Ok(out)
+}
+
+/// Render a [`WorkingSet`] as POSIX shell `export` statements, for `eval`/`source` into the
+/// current shell. Values are single-quoted (the one POSIX-portable quoting style with no
+/// escape-sequence surprises); an embedded single quote is closed, escaped, and reopened via the
+/// standard `'\''` trick. A non-UTF-8 value is a hard error, same as dotenv.
+fn render_shell(working_set: &WorkingSet) -> anyhow::Result<String> {
+    let mut out = String::new();
+    for (key, value) in working_set.iter() {
+        let value = std::str::from_utf8(value)
+            .map_err(|_| anyhow!("value for '{key}' is not valid UTF-8; cannot export as shell"))?;
+        let escaped = value.replace('\'', r"'\''");
+        out.push_str(&format!("export {key}='{escaped}'\n"));
     }
     Ok(out)
 }
