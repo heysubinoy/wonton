@@ -21,6 +21,18 @@ blake2 = "0.10"            # hash bearer tokens before storing (like a password 
 ed25519-dalek = "2"        # verify a login challenge signature against a stored PUBLIC key
 base64 = "0.22"            # base64 transport encoding of opaque binary DTO fields
 uuid = { version = "1", features = ["v4"] }  # primary keys for sessions/challenges/machines
+# OAuth registration gate (Part 1): exchanging a provider's authorization code for an id token,
+# and verifying that token's signature — still not value cryptography (Ed25519/X25519/DEKs never
+# appear here), just proving who's registering before the server creates a `users` row.
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "form"] }
+jsonwebtoken = "9"
+async-trait = "0.1"
+urlencoding = "2"
+# Part 4: the `wonton-server` binary optionally serves the dashboard's static build
+# (`ServeDir`/`ServeFile`) so a single-binary self-hosted deploy doesn't need a second static
+# host. `build_router`/`build_router_with_oauth` (the library, used by every test) never touch
+# this — it's wired up in `src/bin/wonton-server.rs` only.
+tower-http = { version = "0.6", features = ["fs"] }
 wonton-objects = { version = "0.1.0", path = "../objects" }
 wonton-shared = { version = "0.1.0", path = "../shared" }
 

@@ -1,7 +1,7 @@
 //! `wonton` — the CLI porcelain and crypto engine.
 //!
-//! This binary hosts the identity / context-switching commands (`login`, `context`, `use`,
-//! `link`) built on top of the ssh-agent-style key daemon (the hidden `agent` subcommand group).
+//! This binary hosts the identity/workspace commands (`login`, `init`, `clone`, `branch`) built
+//! on top of the ssh-agent-style key daemon (the hidden `agent` subcommand group).
 
 mod agent;
 mod commands;
@@ -37,57 +37,71 @@ enum Command {
         #[arg(long)]
         server: Option<String>,
     },
-    /// Manage and inspect contexts. With no subcommand, shows the current context.
-    Context {
+    /// Show which identity/identities are logged in locally, and which server each points at.
+    Whoami,
+    /// Manage machine-wide defaults in the global config (`~/.config/wonton/config.toml`).
+    Config {
         #[command(subcommand)]
-        command: Option<ContextCommand>,
+        command: ConfigCommand,
     },
-    /// Switch to a context, unwrapping its environment DEK into the agent.
-    Use {
-        /// The context name (see `wonton context list`).
-        name: String,
+    /// Bootstrap a new project in the current directory — fully local, zero network calls.
+    /// Server contact is deferred to the first `wonton push`.
+    Init {
+        /// The org to bind to. Defaults to your own username.
+        org: Option<String>,
+        /// The store (repo) name. Defaults to the current directory's name.
+        store: Option<String>,
+        /// The starting branch. Defaults to "main".
+        branch: Option<String>,
+        /// The local identity to act as. Only needed if more than one identity is logged in.
+        #[arg(long)]
+        identity: Option<String>,
     },
-    /// Bind the current directory to a context by writing a `.wonton` marker.
-    Link {
-        /// The context name to link.
-        name: String,
+    /// Join an existing org/store into the current directory (for a directory that isn't a git
+    /// checkout already carrying a `wonton.toml`).
+    Clone {
+        org: String,
+        store: String,
+        /// The branch to start on. Defaults to "main".
+        branch: Option<String>,
+        #[arg(long)]
+        identity: Option<String>,
     },
-    /// Provision a new store on the server.
+    /// List, switch, or create branches. `wonton branch` alone lists; `wonton branch <name>`
+    /// switches; `wonton branch -b <name> [--from <source>]` creates one.
+    Branch {
+        /// Switch to this branch.
+        name: Option<String>,
+        /// Create a new branch with this name instead of switching to an existing one.
+        #[arg(short = 'b')]
+        create: Option<String>,
+        /// When creating (`-b`), seed the new branch from this existing branch's current values.
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        identity: Option<String>,
+    },
+    /// Provision a store (repo) within an org on the server — advanced/manual path; the golden
+    /// path (`init`/`branch -b`) defers this to the first `push`.
     Store {
         #[command(subcommand)]
         command: StoreCommand,
     },
-    /// Provision a new environment within a store, self-granting its first DEK.
-    Env {
-        #[command(subcommand)]
-        command: EnvCommand,
-    },
-    /// Switch the current context to a different branch (purely local; no unwrap).
-    Switch {
-        /// The branch to switch to.
-        branch: String,
-        /// Allow switching to a branch with no local history yet — either to start a brand
-        /// new branch, or because you're about to `wonton pull` one that exists remotely.
-        #[arg(long)]
-        create: bool,
-    },
-    /// Show the current context, branch, DEK-cache status, and staged changes.
+    /// Show the current workspace, branch, DEK-cache status, and staged changes.
     Status,
-    /// Show which identity/identities are logged in locally, and which server each points at.
-    Whoami,
-    /// Stage one or more `KEY=VALUE` secrets in the current context.
+    /// Stage one or more `KEY=VALUE` secrets on the current branch.
     Set {
         /// `KEY=VALUE` pairs to stage.
         #[arg(required = true)]
         pairs: Vec<String>,
     },
-    /// Stage deletion of one or more keys in the current context.
+    /// Stage deletion of one or more keys on the current branch.
     Unset {
         /// Key names to unset.
         #[arg(required = true)]
         keys: Vec<String>,
     },
-    /// Commit the staged changes in the current context.
+    /// Commit the staged changes on the current branch.
     Commit {
         #[arg(short, long)]
         message: String,
@@ -103,9 +117,10 @@ enum Command {
     },
     /// Fetch and fast-forward the current branch from the server.
     Pull,
-    /// Upload local commits and move the branch ref on the server.
+    /// Upload local commits and move the branch ref on the server. The first push on a branch
+    /// also provisions it server-side (org/store/branch + DEK self-grant).
     Push,
-    /// Three-way merge a branch into the current branch, resume a paused merge with
+    /// Three-way merge another branch into the current branch, resume a paused merge with
     /// `--continue`, or discard one with `--abort`. Exactly one of `branch` / `--continue` /
     /// `--abort` must be given.
     Merge {
@@ -119,13 +134,13 @@ enum Command {
         #[arg(long)]
         abort: bool,
     },
-    /// Run a command with the current context's secrets injected as env vars (never on disk).
+    /// Run a command with the current branch's secrets injected as env vars (never on disk).
     Run {
         /// The command and its arguments (everything after `--`).
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
     },
-    /// Export the current context's secrets to a file (plaintext — prints a warning).
+    /// Export the current branch's secrets to a file (plaintext — prints a warning).
     Export {
         /// Output format (only `dotenv` is supported in v1).
         #[arg(long)]
@@ -133,29 +148,27 @@ enum Command {
         /// The file to write.
         path: PathBuf,
     },
-    /// Grant a user access to a context's environment (wraps the DEK for them; O(1)).
+    /// Grant a user access to a branch (wraps the DEK for them; O(1)). Also auto-joins them to
+    /// the org server-side.
     Share {
         /// The username to share with.
         user: String,
-
-        /// The context to share (a context name, per `wonton context list` — not the server-side
-        /// environment name).
+        /// The branch to share. Defaults to the current directory's branch.
         #[arg(long)]
-        context: String,
+        branch: Option<String>,
         /// The role to grant.
         #[arg(long, default_value = "reader")]
         role: String,
     },
-    /// Revoke a user's access to a context's environment (removes them and rotates the DEK).
+    /// Revoke a user's access to a branch (removes them and rotates the DEK).
     Revoke {
         /// The username to revoke.
         user: String,
-        /// The context to revoke access to (a context name, not the server-side environment
-        /// name).
+        /// The branch to revoke access to. Defaults to the current directory's branch.
         #[arg(long)]
-        context: String,
+        branch: Option<String>,
     },
-    /// Data-key management for a context's environment.
+    /// Data-key management for a branch.
     Key {
         #[command(subcommand)]
         command: KeyCommand,
@@ -167,53 +180,32 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum KeyCommand {
-    /// Rotate the environment's DEK, re-encrypting history and re-wrapping for members.
+    /// Rotate a branch's DEK, re-encrypting history and re-wrapping for members.
     Rotate {
-        /// The context whose environment DEK to rotate (a context name, not the server-side
-        /// environment name).
+        /// The branch to rotate. Defaults to the current directory's branch.
         #[arg(long)]
-        context: String,
+        branch: Option<String>,
     },
 }
 
 #[derive(Debug, Subcommand)]
-enum ContextCommand {
-    /// Add (or update) a context.
-    Add {
-        /// The context name.
-        name: String,
-        #[arg(long)]
-        store: String,
-        #[arg(long = "env")]
-        environment: String,
-        /// The local identity name this context reads with.
-        #[arg(long)]
-        identity: String,
+enum ConfigCommand {
+    /// Set (or update) the default server URL, used by `login` when `--server` is omitted and
+    /// the username isn't already a known identity.
+    SetServer {
+        url: String,
     },
-    /// List all configured contexts.
-    List,
+    /// Show the current default server, if any.
+    Show,
 }
 
 #[derive(Debug, Subcommand)]
 enum StoreCommand {
-    /// Create a new store on the server.
+    /// Create a store (repo) within an org on the server, creating the org first if needed.
     Create {
+        /// The org the store belongs to.
+        org: String,
         /// The store's name.
-        name: String,
-        /// The local identity to create it as. Only needed if more than one identity is
-        /// logged in locally.
-        #[arg(long)]
-        identity: Option<String>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum EnvCommand {
-    /// Create a new environment within a store and self-grant its first DEK.
-    Create {
-        /// The store the environment belongs to.
-        store: String,
-        /// The environment's name.
         name: String,
         /// The local identity to create it as. Only needed if more than one identity is
         /// logged in locally.
@@ -249,101 +241,95 @@ async fn main() -> anyhow::Result<()> {
             };
             commands::login(&config_path, &socket, server, &username, passphrase).await
         }
-        Command::Context { command } => match command {
-            Some(ContextCommand::Add {
-                name,
-                store,
-                environment,
-                identity,
-            }) => {
-                let config_path = config::default_config_path()?;
-                commands::context_add(&config_path, &name, &store, &environment, &identity)
-            }
-            Some(ContextCommand::List) => {
-                let config_path = config::default_config_path()?;
-                commands::context_list(&config_path)
-            }
-            None => {
-                let config_path = config::default_config_path()?;
-                // Don't auto-start the agent just to report cache status.
-                let socket = agent::default_socket_path()?;
-                let cwd = current_dir()?;
-                commands::context_show(&config_path, &socket, &cwd).await
-            }
-        },
-        Command::Use { name } => {
-            let config_path = config::default_config_path()?;
-            let state_path = state::default_state_path()?;
-            let socket = agent::client::ensure_running().await?;
-            commands::use_context(&config_path, &state_path, &socket, &name).await
-        }
-        Command::Link { name } => {
-            let config_path = config::default_config_path()?;
-            let cwd = current_dir()?;
-            commands::link(&config_path, &cwd, &name)
-        }
-        Command::Store { command } => match command {
-            StoreCommand::Create { name, identity } => {
-                let config_path = config::default_config_path()?;
-                commands::store_create(&config_path, identity.as_deref(), &name).await
-            }
-        },
-        Command::Env { command } => match command {
-            EnvCommand::Create { store, name, identity } => {
-                let config_path = config::default_config_path()?;
-                let socket = agent::client::ensure_running().await?;
-                commands::env_create(&config_path, &socket, identity.as_deref(), &store, &name).await
-            }
-        },
-        Command::Switch { branch, create } => {
-            let state_path = state::default_state_path()?;
-            let ctx = resolve_ctx()?;
-            commands::switch(&state_path, &ctx, &branch, create)
-        }
         Command::Whoami => {
             let config_path = config::default_config_path()?;
             commands::whoami(&config_path)
         }
+        Command::Config { command } => {
+            let config_path = config::default_config_path()?;
+            match command {
+                ConfigCommand::SetServer { url } => commands::config_set_server(&config_path, &url),
+                ConfigCommand::Show => commands::config_show(&config_path),
+            }
+        }
+        Command::Init { org, store, branch, identity } => {
+            let config_path = config::default_config_path()?;
+            let socket = agent::client::ensure_running().await?;
+            let cwd = current_dir()?;
+            commands::init(&config_path, &socket, &cwd, org, store, branch, identity.as_deref()).await
+        }
+        Command::Clone { org, store, branch, identity } => {
+            let config_path = config::default_config_path()?;
+            let state_path = state::default_state_path()?;
+            let socket = agent::client::ensure_running().await?;
+            let cwd = current_dir()?;
+            commands::clone(&config_path, &state_path, &socket, &cwd, &org, &store, branch.as_deref(), identity.as_deref()).await
+        }
+        Command::Branch { name, create, from, identity } => {
+            let config_path = config::default_config_path()?;
+            let state_path = state::default_state_path()?;
+            let cwd = current_dir()?;
+            match (name, create) {
+                (None, None) => commands::branch_list(&config_path, &state_path, &cwd).await,
+                (Some(n), None) => {
+                    let socket = agent::client::ensure_running().await?;
+                    commands::branch_switch(&config_path, &state_path, &socket, &cwd, &n).await
+                }
+                (None, Some(n)) => {
+                    let socket = agent::client::ensure_running().await?;
+                    commands::branch_create(&config_path, &state_path, &socket, &cwd, &n, from.as_deref(), identity.as_deref()).await
+                }
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("pass either a branch name to switch to, or -b <name> to create one, not both")
+                }
+            }
+        }
+        Command::Store { command } => match command {
+            StoreCommand::Create { org, name, identity } => {
+                let config_path = config::default_config_path()?;
+                commands::store_create(&config_path, identity.as_deref(), &org, &name).await
+            }
+        },
         Command::Status => {
             let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
             let socket = agent::default_socket_path()?;
-            let ctx = resolve_ctx()?;
-            commands::status(&config_path, &state_path, &socket, &ctx).await
+            let cwd = current_dir()?;
+            commands::status(&config_path, &state_path, &socket, &cwd).await
         }
         Command::Set { pairs } => {
             let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
             let parsed = parse_pairs(&pairs)?;
             let socket = agent::client::ensure_running().await?;
-            let ctx = resolve_ctx()?;
-            commands::set(&config_path, &state_path, &socket, &ctx, parsed).await
+            let cwd = current_dir()?;
+            commands::set(&config_path, &state_path, &socket, &cwd, parsed).await
         }
         Command::Unset { keys } => {
             let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
-            let ctx = resolve_ctx()?;
-            commands::unset(&config_path, &state_path, &ctx, keys)
+            let cwd = current_dir()?;
+            commands::unset(&config_path, &state_path, &cwd, keys)
         }
         Command::Commit { message } => {
             let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
             let socket = agent::client::ensure_running().await?;
-            let ctx = resolve_ctx()?;
-            commands::commit(&config_path, &state_path, &socket, &ctx, message).await
+            let cwd = current_dir()?;
+            commands::commit(&config_path, &state_path, &socket, &cwd, message).await
         }
         Command::Log => {
             let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
-            let ctx = resolve_ctx()?;
-            commands::log(&config_path, &state_path, &ctx).await
+            let cwd = current_dir()?;
+            commands::log(&config_path, &state_path, &cwd).await
         }
         Command::Diff { a, b } => {
             let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
             let socket = agent::client::ensure_running().await?;
-            let ctx = resolve_ctx()?;
-            let entries = commands::diff(&config_path, &state_path, &socket, &ctx, a, b).await?;
+            let cwd = current_dir()?;
+            let entries = commands::diff(&config_path, &state_path, &socket, &cwd, a, b).await?;
             if entries.is_empty() {
                 println!("No changes.");
             }
@@ -359,74 +345,77 @@ async fn main() -> anyhow::Result<()> {
         Command::Pull => {
             let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
-            let ctx = resolve_ctx()?;
-            commands::pull(&config_path, &state_path, &ctx).await
+            let cwd = current_dir()?;
+            commands::pull(&config_path, &state_path, &cwd).await
         }
         Command::Push => {
             let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
-            let ctx = resolve_ctx()?;
-            commands::push(&config_path, &state_path, &ctx).await
+            let socket = agent::client::ensure_running().await?;
+            let cwd = current_dir()?;
+            commands::push(&config_path, &state_path, &socket, &cwd).await
         }
         Command::Run { cmd } => {
             let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
             let socket = agent::client::ensure_running().await?;
-            let ctx = resolve_ctx()?;
-            let code = commands::run(&config_path, &state_path, &socket, &ctx, cmd).await?;
+            let cwd = current_dir()?;
+            let code = commands::run(&config_path, &state_path, &socket, &cwd, cmd).await?;
             std::process::exit(code);
         }
         Command::Export { format, path } => {
             let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
             let socket = agent::client::ensure_running().await?;
-            let ctx = resolve_ctx()?;
+            let cwd = current_dir()?;
             let format = commands::ExportFormat::parse(&format)?;
-            commands::export(&config_path, &state_path, &socket, &ctx, format, &path).await
+            commands::export(&config_path, &state_path, &socket, &cwd, format, &path).await
         }
         Command::Merge { branch, resume, abort } => {
+            let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
-            let ctx = resolve_ctx()?;
+            let cwd = current_dir()?;
             match (branch, resume, abort) {
-                (None, false, true) => commands::merge_abort(&state_path, &ctx).await,
+                (None, false, true) => commands::merge_abort(&config_path, &state_path, &cwd).await,
                 (Some(_), _, true) | (_, true, true) => {
                     anyhow::bail!("pass exactly one of a branch name, `--continue`, or `--abort`")
                 }
                 (Some(_), true, false) => anyhow::bail!("pass either a branch name or `--continue`, not both"),
                 (Some(branch), false, false) => {
-                    let config_path = config::default_config_path()?;
                     let socket = agent::client::ensure_running().await?;
-                    commands::merge(&config_path, &state_path, &socket, &ctx, &branch).await
+                    commands::merge(&config_path, &state_path, &socket, &cwd, &branch).await
                 }
                 (None, true, false) => {
-                    let config_path = config::default_config_path()?;
                     let socket = agent::client::ensure_running().await?;
-                    commands::merge_continue(&config_path, &state_path, &socket, &ctx).await
+                    commands::merge_continue(&config_path, &state_path, &socket, &cwd).await
                 }
                 (None, false, false) => {
                     anyhow::bail!("usage: `wonton merge <branch>`, `wonton merge --continue`, or `wonton merge --abort`")
                 }
             }
         }
-        Command::Share { user, context, role } => {
+        Command::Share { user, branch, role } => {
             let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
             let socket = agent::client::ensure_running().await?;
+            let cwd = current_dir()?;
             let role = parse_role(&role)?;
-            commands::share(&config_path, &state_path, &socket, &context, &user, role).await
+            commands::share(&config_path, &state_path, &socket, &cwd, branch.as_deref(), &user, role).await
         }
-        Command::Revoke { user, context } => {
+        Command::Revoke { user, branch } => {
             let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
             let socket = agent::client::ensure_running().await?;
-            commands::revoke(&config_path, &state_path, &socket, &context, &user).await
+            let cwd = current_dir()?;
+            commands::revoke(&config_path, &state_path, &socket, &cwd, branch.as_deref(), &user).await
         }
         Command::Key { command } => match command {
-            KeyCommand::Rotate { context } => {
+            KeyCommand::Rotate { branch } => {
                 let config_path = config::default_config_path()?;
                 let state_path = state::default_state_path()?;
                 let socket = agent::client::ensure_running().await?;
-                commands::rotate(&config_path, &state_path, &socket, &context).await
+                let cwd = current_dir()?;
+                commands::rotate(&config_path, &state_path, &socket, &cwd, branch.as_deref()).await
             }
         },
         Command::Agent(command) => agent::run(command).await,
@@ -446,16 +435,6 @@ fn parse_role(s: &str) -> anyhow::Result<wonton_shared::Role> {
 
 fn current_dir() -> anyhow::Result<PathBuf> {
     std::env::current_dir().map_err(|e| anyhow::anyhow!("cannot determine current directory: {e}"))
-}
-
-/// Resolve the current context name for the VCS porcelain commands, via the `.wonton` marker (in
-/// the cwd or an ancestor) or `config.current_context`. All these commands operate on "the current
-/// context"; there is no `--context` flag in v1.
-fn resolve_ctx() -> anyhow::Result<String> {
-    let config_path = config::default_config_path()?;
-    let config = config::Config::load_from(&config_path)?;
-    let cwd = current_dir()?;
-    config::resolve_context_name(&config, &cwd)
 }
 
 /// Parse `KEY=VALUE` positional arguments into pairs, erroring clearly on a missing `=`.

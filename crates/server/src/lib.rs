@@ -25,6 +25,7 @@
 mod auth;
 mod error;
 mod handlers;
+mod oauth;
 #[cfg(test)]
 mod tests;
 
@@ -39,11 +40,13 @@ use wonton_shared::Role;
 
 pub use auth::{Actor, ActorKind};
 pub use error::ApiError;
+pub use oauth::{GoogleProvider, OAuthProvider, OAuthProviders, VerifiedIdentity};
 
 /// Shared application state handed to every handler.
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
+    pub oauth: OAuthProviders,
 }
 
 /// Startup errors (connecting + running migrations). Distinct from the per-request `ApiError`.
@@ -79,7 +82,16 @@ pub async fn connect(url: &str) -> Result<SqlitePool, ServerError> {
 /// Build the axum router over an already-connected pool. Split out from `connect` so tests can
 /// supply their own pool (see the test helper in `handlers`).
 pub fn build_router(pool: SqlitePool) -> Router {
-    let state = AppState { pool };
+    build_router_with_oauth(pool, OAuthProviders::none())
+}
+
+/// Same as [`build_router`], but with OAuth providers registered (see `oauth` module docs) so
+/// `/auth/oauth/{provider}/authorize` and `/auth/oauth/{provider}/callback` resolve to
+/// something. The `wonton-server` binary calls this with `OAuthProviders::none()
+/// .register(GoogleProvider::from_env()...)` when Google's env vars are set; every existing
+/// caller of plain `build_router` (every test in this workspace, notably) is unaffected.
+pub fn build_router_with_oauth(pool: SqlitePool, oauth: OAuthProviders) -> Router {
+    let state = AppState { pool, oauth };
     Router::new()
         // Auth (the routes that do NOT require a bearer token: register + the two login steps +
         // machine-token issuance). Machine-token issuance is
@@ -89,37 +101,56 @@ pub fn build_router(pool: SqlitePool) -> Router {
         .route("/auth/login/start", post(handlers::login_start))
         .route("/auth/login/complete", post(handlers::login_complete))
         .route("/auth/machine/token", post(handlers::machine_token))
-        // Stores / environments. `POST /stores` and `POST /stores/{store}/envs` require any
-        // valid token; the env-creator is bootstrapped as that env's first admin member.
-        .route("/stores", post(handlers::create_store))
+        // OAuth registration gate (Part 1) — 404s for a provider name that isn't registered.
+        .route("/auth/oauth/{provider}/authorize", get(handlers::oauth_authorize))
+        .route("/auth/oauth/{provider}/callback", get(handlers::oauth_callback))
+        // Orgs. `POST /orgs` requires any valid token; the creator is bootstrapped as its first
+        // `owner` member.
+        .route("/orgs", post(handlers::create_org))
+        // Stores (repos), scoped under an org. `POST` requires the caller to already be a member
+        // of `org` (any role).
         .route(
-            "/stores/{store}/envs",
-            get(handlers::list_envs).post(handlers::create_env),
+            "/orgs/{org}/stores",
+            post(handlers::create_store),
+        )
+        // Branches — the crypto/ACL unit (was "environments"). The creator is bootstrapped as
+        // that branch's first admin member.
+        .route(
+            "/orgs/{org}/stores/{store}/branches",
+            get(handlers::list_branches).post(handlers::create_branch),
         )
         // User directory (any valid token — public keys, gated only to avoid enumeration)
         .route("/users/{username}", get(handlers::get_user))
         .route("/users/by-id/{user_id}", get(handlers::get_user_by_id))
-        // Objects (content-addressed; any valid token — no per-object env scoping in this phase)
+        // Objects (content-addressed; any valid token — no per-branch scoping in this phase)
         .route("/objects/{hash}", get(handlers::get_object))
         .route("/objects", post(handlers::upload_object))
-        // Refs
-        .route("/refs/{store}/{env}", get(handlers::list_refs))
-        .route("/refs/{store}/{env}/{branch}", post(handlers::move_ref))
-        // Environment details
-        .route("/envs/{store}/{env}", get(handlers::get_env_details))
+        // Ref — ONE per branch (no named sub-branches anymore).
+        .route(
+            "/orgs/{org}/stores/{store}/branches/{branch}/ref",
+            get(handlers::get_ref).post(handlers::move_ref),
+        )
+        // Branch details
+        .route(
+            "/orgs/{org}/stores/{store}/branches/{branch}",
+            get(handlers::get_branch_details),
+        )
         // Wrapped-DEK maps
         .route(
-            "/envs/{store}/{env}/keys",
+            "/orgs/{org}/stores/{store}/branches/{branch}/keys",
             get(handlers::list_keys).post(handlers::grant_key),
         )
-        .route("/envs/{store}/{env}/rotate", post(handlers::rotate))
-        // Membership (list requires >= reader; add is admin-only)
         .route(
-            "/envs/{store}/{env}/members",
+            "/orgs/{org}/stores/{store}/branches/{branch}/rotate",
+            post(handlers::rotate),
+        )
+        // Membership (list requires >= reader; add is admin-only and auto-joins the org)
+        .route(
+            "/orgs/{org}/stores/{store}/branches/{branch}/members",
             get(handlers::list_members).post(handlers::add_member),
         )
         .route(
-            "/envs/{store}/{env}/members/{user_id}",
+            "/orgs/{org}/stores/{store}/branches/{branch}/members/{user_id}",
             delete(handlers::remove_member),
         )
         .with_state(state)
@@ -164,44 +195,88 @@ fn parse_role(role: &str) -> Role {
     }
 }
 
-/// Resolve `(store name, env name)` to an environment id, or 404 if it doesn't exist.
-async fn resolve_env(pool: &SqlitePool, store: &str, env: &str) -> Result<String, ApiError> {
+/// Resolve an org name to its id, or 404 if it doesn't exist.
+async fn resolve_org(pool: &SqlitePool, org: &str) -> Result<String, ApiError> {
+    use sqlx::Row;
+    let row = sqlx::query("SELECT id FROM orgs WHERE name = ?")
+        .bind(org)
+        .fetch_optional(pool)
+        .await?;
+    row.map(|r| r.get::<String, _>("id")).ok_or(ApiError::NotFound("org"))
+}
+
+/// Require the actor to already be a member of `org` (any role). Returns the org id on success.
+/// 404 if the org doesn't exist; 403 if the actor isn't a member.
+async fn authorize_org_member(pool: &SqlitePool, org: &str, actor: &Actor) -> Result<String, ApiError> {
+    let org_id = resolve_org(pool, org).await?;
+    let row = sqlx::query("SELECT 1 AS one FROM org_members WHERE org_id = ? AND user_id = ?")
+        .bind(&org_id)
+        .bind(&actor.id)
+        .fetch_optional(pool)
+        .await?;
+    if row.is_some() {
+        Ok(org_id)
+    } else {
+        Err(ApiError::Forbidden)
+    }
+}
+
+/// Resolve `(org name, store name, branch name)` to a branch id, or 404 if any segment doesn't
+/// exist.
+async fn resolve_branch(pool: &SqlitePool, org: &str, store: &str, branch: &str) -> Result<String, ApiError> {
     use sqlx::Row;
     let row = sqlx::query(
-        "SELECT e.id AS id FROM environments e \
-         JOIN stores s ON e.store_id = s.id \
-         WHERE s.name = ? AND e.name = ?",
+        "SELECT b.id AS id FROM branches b \
+         JOIN stores s ON b.store_id = s.id \
+         JOIN orgs o ON s.org_id = o.id \
+         WHERE o.name = ? AND s.name = ? AND b.name = ?",
     )
+    .bind(org)
     .bind(store)
-    .bind(env)
+    .bind(branch)
     .fetch_optional(pool)
     .await?;
     row.map(|r| r.get::<String, _>("id"))
-        .ok_or(ApiError::NotFound("environment"))
+        .ok_or(ApiError::NotFound("branch"))
 }
 
-/// Resolve the env, then require the actor to hold at least `min` role on it.
+/// Resolve `(org name, store name)` to a store id, or 404 if either segment doesn't exist.
+async fn resolve_store(pool: &SqlitePool, org: &str, store: &str) -> Result<String, ApiError> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT s.id AS id FROM stores s JOIN orgs o ON s.org_id = o.id \
+         WHERE o.name = ? AND s.name = ?",
+    )
+    .bind(org)
+    .bind(store)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|r| r.get::<String, _>("id")).ok_or(ApiError::NotFound("store"))
+}
+
+/// Resolve the branch, then require the actor to hold at least `min` role on it.
 ///
-/// Returns the env id on success. 404 if the env doesn't exist; 403 if the actor is not a
+/// Returns the branch id on success. 404 if the branch doesn't exist; 403 if the actor is not a
 /// member or holds an insufficient role. (Note: machine identities are not rows in `users`,
-/// so they currently match no `env_members` row and are denied on role-gated routes.)
-async fn authorize_env(
+/// so they currently match no `branch_members` row and are denied on role-gated routes.)
+async fn authorize_branch(
     pool: &SqlitePool,
+    org: &str,
     store: &str,
-    env: &str,
+    branch: &str,
     actor: &Actor,
     min: Role,
 ) -> Result<String, ApiError> {
     use sqlx::Row;
-    let env_id = resolve_env(pool, store, env).await?;
-    let row = sqlx::query("SELECT role FROM env_members WHERE env_id = ? AND user_id = ?")
-        .bind(&env_id)
+    let branch_id = resolve_branch(pool, org, store, branch).await?;
+    let row = sqlx::query("SELECT role FROM branch_members WHERE branch_id = ? AND user_id = ?")
+        .bind(&branch_id)
         .bind(&actor.id)
         .fetch_optional(pool)
         .await?;
     let role: String = row.map(|r| r.get::<String, _>("role")).ok_or(ApiError::Forbidden)?;
     if role_rank(&role) >= required_rank(min) {
-        Ok(env_id)
+        Ok(branch_id)
     } else {
         Err(ApiError::Forbidden)
     }

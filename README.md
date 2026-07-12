@@ -3,12 +3,12 @@
 
   <h1>Wonton</h1>
 
-  <p><strong>A zero-knowledge, git-like secrets manager.</strong></p>
+  <p><strong>A zero-knowledge, GitHub-shaped secrets manager.</strong></p>
 
   <p>
-    Version, diff, branch, and merge your environment variables the way you do source code —
-    except every value is end-to-end encrypted, and the server that stores and syncs your
-    history never holds a key that can read it.
+    Org → repo → branch, exactly like GitHub — except every branch is its own encryption
+    boundary (its own key, its own access list, its own history), and the server that stores and
+    syncs it never holds a key that can read a single value.
   </p>
 
   <p>
@@ -21,10 +21,12 @@
 ---
 
 ```console
+$ wonton login alice --server https://wonton.example.com
+$ wonton init                      # fully local — zero network calls
 $ wonton set DATABASE_URL=postgres://prod-db/acme API_KEY=sk-live-...
 $ wonton commit -m "seed prod secrets"
-$ wonton push
-$ wonton share bob --env acme-dev --role reader
+$ wonton push                      # first push provisions org/store/branch on the server
+$ wonton share bob --role reader
 $ wonton run -- ./start-server
 ```
 
@@ -36,6 +38,7 @@ $ wonton run -- ./start-server
 - [Installation](#installation)
 - [Quickstart](#quickstart)
 - [Command reference](#command-reference)
+- [Dashboard](#dashboard)
 - [Project layout](#project-layout)
 - [Security model](#security-model)
 - [Status](#status)
@@ -56,14 +59,22 @@ compromised.** The server sees ciphertext, content hashes, and metadata (who pus
 - **Zero-knowledge by construction** — the server never depends on the crypto crate at all
   (enforced by Cargo *and* a compile-time test); there is no code path that could receive a key
   even by accident.
-- **Git-like workflow** — `set` / `commit` / `log` / `diff` / `branch` / `merge`, with a signed,
-  content-addressed Merkle DAG of history underneath.
-- **O(1) sharing** — granting access wraps a copy of the environment's key for the new member;
-  it never re-encrypts existing history.
+- **Org → repo → branch, GitHub-shaped** — every user belongs to an org; a store (repo) lives in
+  an org; a branch is the actual encryption/access boundary. Sharing a branch with someone who
+  isn't yet in the org adds them to it, scoped by the grant they were actually given.
+- **Local-first, like git** — `wonton init` and `wonton branch -b <name>` are 100% local (zero
+  network calls); server contact happens exactly once, at the first `wonton push` on a branch,
+  which provisions it and self-grants its key.
+- **A branch is a real key boundary, not just a pointer** — `wonton branch -b dev --from
+  staging` mints a brand-new key for `dev`, seeded from `staging`'s current values. Having
+  access to `staging` does **not** imply access to `dev` — each is shared separately.
+- **O(1) sharing** — granting access wraps a copy of the branch's key for the new member; it
+  never re-encrypts existing history.
 - **Real revocation** — revoking a member rotates the key and re-encrypts history so their
   cached copy provably can't decrypt anything committed afterward.
-- **Three-way merge** — genuine conflict detection and resolution across divergent branches,
-  including an interactive resolver for conflicting keys.
+- **Three-way merge across two different keys** — merging one branch into another reconciles
+  content encrypted under two independent DEKs, with an interactive resolver for conflicting
+  keys.
 - **A key agent, not a passphrase prompt every time** — unlock once per session; an ssh-agent-
   style daemon holds keys in memory behind a local, permission-locked Unix socket.
 - **Only two ways to touch plaintext** — `wonton run` (injects into a subprocess's environment,
@@ -72,17 +83,18 @@ compromised.** The server sees ciphertext, content hashes, and metadata (who pus
 
 ## How it works
 
-Each **environment** (e.g. `acme/backend@prod`) has its own random 256-bit **data encryption
-key (DEK)**. Every secret value is encrypted under that DEK with a fresh nonce
-(XChaCha20-Poly1305). The DEK itself is wrapped separately for every authorized user with their
-X25519 public key (`crypto_box` sealed box):
+Each **branch** (e.g. `acme/backend`'s `prod` branch) has its own random 256-bit **data
+encryption key (DEK)** — it's the crypto/ACL unit, not just a pointer into shared history.
+Every secret value is encrypted under that DEK with a fresh nonce (XChaCha20-Poly1305). The DEK
+itself is wrapped separately for every authorized user with their X25519 public key
+(`crypto_box` sealed box):
 
 ```
 passphrase --Argon2id--> unlock key --decrypts--> your private key (Ed25519 + X25519)
                                                           |
                                          unwraps (X25519 sealed box)
                                                           v
-                                    environment's Data Encryption Key (DEK)
+                                        branch's Data Encryption Key (DEK)
                                                           |
                                          encrypts (XChaCha20-Poly1305)
                                                           v
@@ -91,8 +103,16 @@ passphrase --Argon2id--> unlock key --decrypts--> your private key (Ed25519 + X2
 
 History is a content-addressed Merkle DAG of blob/tree/commit objects (BLAKE2b-256), with every
 commit Ed25519-signed by its author. `push`/`pull` move encrypted objects and compare-and-swap
-branch refs; every object is content-hash-verified and every commit's signature is verified on
-the client before it's trusted — the server is never in the trust path.
+a branch's ref; every object is content-hash-verified and every commit's signature is verified
+on the client before it's trusted — the server is never in the trust path.
+
+A project directory is bound to a store by a committed `wonton.toml` (`server` + `store =
+"org/store"`, no branch). Which branch you're on lives in an uncommitted sibling
+`.wonton.local` — the actual git-`.git/HEAD` equivalent, read fresh on every command.
+`wonton.toml`'s `server` field is authoritative for identity selection too: if you have several
+identities logged in on one machine (different servers), a directory-bound command narrows to
+the one matching this project's server automatically — `--identity` is only needed to
+disambiguate two identities on the *same* server.
 
 ## Installation
 
@@ -107,25 +127,23 @@ cargo build --release --workspace
 
 ## Quickstart
 
-This assumes a `wonton-server` is already running somewhere and a store/environment (e.g.
-`acme/dev`) has already been provisioned for you — provisioning a brand-new environment is an
-administrative action outside the CLI's command surface.
+Originating a new project — nothing needs to exist on the server beforehand:
 
 ```console
 # Unlock your identity into the local key agent (registers on first use).
 $ wonton login alice --server https://wonton.example.com
 
-# Bind a context to a store + environment, then switch to it.
-$ wonton context add acme-dev --store acme --env dev --identity alice
-$ wonton use acme-dev
+# Bootstrap a project in the current directory — org defaults to your username, store to the
+# directory name, branch to "main". Zero network calls; writes wonton.toml + .wonton.local.
+$ wonton init
 
-# Optionally bind the current directory to that context.
-$ wonton link acme-dev
-
-# Stage, commit, and push secrets.
+# Stage and commit secrets — fully local, no DEK has ever left your machine.
 $ wonton set DATABASE_URL=postgres://prod-db/acme API_KEY=sk-live-...
 $ wonton commit -m "seed prod secrets"
+
+# First push provisions org/store/branch on the server and self-grants the DEK.
 $ wonton push
+$ git add wonton.toml && git commit -m "wonton init" && git push   # .wonton.local stays gitignored
 
 # Inject the decrypted values into a subprocess — never written to disk.
 $ wonton run -- ./start-server
@@ -133,43 +151,93 @@ $ wonton run -- ./start-server
 # Or materialize them explicitly (prints a plaintext warning first).
 $ wonton export --format dotenv .env
 
-# Share access, branch, and merge like git.
-$ wonton share bob --env acme-dev --role reader
-$ wonton switch feature
+# Share access (also adds bob to the org, scoped to this branch — bob must have logged in once).
+$ wonton share bob --role reader
+
+# Branch off with its own key, seeded from the current branch's values, and merge back.
+$ wonton branch -b feature --from main
 $ wonton set FEATURE_FLAG=on
 $ wonton commit -m "enable feature flag"
-$ wonton switch main
+$ wonton push
+$ wonton branch main
 $ wonton merge feature
 
 # Revoke access (rotates the DEK; a revoked user's cached key stops working).
-$ wonton revoke bob --env acme-dev
+$ wonton revoke bob
 ```
+
+Joining an existing project (a normal `git clone` carries `wonton.toml` along for free — no
+extra command needed once you've logged in):
+
+```console
+$ git clone <repo> && cd <repo>
+$ wonton login bob --server https://wonton.example.com
+$ wonton set FOO=bar     # notices no local history yet, auto-pulls, then just works
+```
+
+For a directory that isn't a git checkout, `wonton clone <org> <store> [branch]` writes the
+marker directly.
 
 ## Command reference
 
 | Command | Description |
 |---|---|
 | `login <user>` | Unlock an identity into the agent, registering it on first use |
-| `context [add\|list]` | Manage and inspect contexts; with no subcommand, shows the current one |
-| `use <context>` | Switch to a context, unwrapping its environment DEK into the agent |
-| `link <context>` | Bind the current directory to a context via a `.wonton` marker |
-| `switch <branch>` | Switch the current context to a different branch (local only, no unwrap) |
-| `status` | Show the current context, branch, DEK-cache status, and staged changes |
-| `set KEY=VALUE ...` | Stage one or more secrets in the current context |
+| `config set-server <url>` | Set a default server for `login` to fall back on when `--server` is omitted |
+| `config show` | Show the currently configured default server, if any |
+| `init [org] [store] [branch]` | Bootstrap a project in the current directory — fully local |
+| `clone <org> <store> [branch]` | Bind the current directory to an existing org/store/branch |
+| `branch` | List branches (syncs with the server's accessible list, like `git branch -a`), marking the current one |
+| `branch <name>` | Switch branches (unwraps/auto-pulls its DEK if needed) |
+| `branch -b <name> [--from <src>]` | Create a branch with its own DEK, optionally seeded from `<src>` |
+| `store create <org> <name>` | Advanced/manual: provision a store directly (`init`/`branch -b` defer this to `push`) |
+| `status` | Show the current workspace, branch, DEK-cache status, ahead/behind vs. the remote, and staged changes |
+| `set KEY=VALUE ...` | Stage one or more secrets on the current branch |
 | `unset KEY ...` | Stage deletion of one or more keys |
 | `commit -m "..."` | Commit the staged changes |
 | `log` | Show the verified commit history of the current branch |
 | `diff [a] [b]` | Diff two commits (or the last commit's change if no args are given) |
 | `pull` | Fetch and fast-forward the current branch from the server |
-| `push` | Upload local commits and move the branch ref on the server |
-| `merge <branch>` / `merge --continue` | Three-way merge a branch, or resume one paused on conflicts |
+| `push` | Upload local commits and move the branch ref; first push on a branch provisions it |
+| `merge <branch>` / `merge --continue` | Three-way merge another branch (own DEK) in, or resume one paused on conflicts |
 | `run -- <cmd>` | Run a command with secrets injected as env vars — never written to disk |
 | `export --format dotenv <path>` | Export secrets to a file (plaintext — prints a warning) |
-| `share <user> --env <ctx>` | Grant a user access to an environment (wraps the DEK; O(1)) |
-| `revoke <user> --env <ctx>` | Revoke a user's access (removes them and rotates the DEK) |
-| `key rotate --env <ctx>` | Rotate an environment's DEK, re-encrypting history and re-wrapping it |
+| `share <user> [--branch <name>]` | Grant a user access to a branch (wraps the DEK; O(1)); auto-joins them to the org |
+| `revoke <user> [--branch <name>]` | Revoke a user's access (removes them and rotates the DEK) |
+| `key rotate [--branch <name>]` | Rotate a branch's DEK, re-encrypting history and re-wrapping it |
 
 Run `wonton --help` or `wonton <command> --help` for full details.
+
+## Dashboard
+
+A read-only web viewer lives in [`dashboard/`](dashboard/): browse orgs/stores/branches you have
+access to, see verified commit history, and view decrypted current values, all in the browser.
+No `set`/`commit`/`push`/`share` from there yet (v1 is deliberately view-only).
+
+Two things that differ from the CLI, both by design:
+- **OAuth (Google, currently) gates *registration*, not login.** It proves you control a real
+  email before the server lets you claim a username — it does not replace the passphrase-derived
+  key. Login (existing identity) is the exact same challenge-response the CLI uses, passphrase
+  only. Set `WONTON_GOOGLE_CLIENT_ID` / `WONTON_GOOGLE_CLIENT_SECRET` / `WONTON_GOOGLE_REDIRECT_URI`
+  on `wonton-server` to enable it; unset (the default) leaves registration open/unverified,
+  exactly as before.
+- **Browser key custody is honestly weaker than the CLI's.** The CLI's agent is a native process
+  behind a `0600` Unix socket; a browser tab has no equivalent isolation from other JS on the
+  same origin. The dashboard never persists an unlocked identity or DEK to
+  `localStorage`/IndexedDB — everything lives in WASM memory for the current tab's session only,
+  gone on reload. Re-entering your passphrase each session is the accepted cost of that model,
+  not an oversight.
+
+The actual crypto is `crates/wasm` (`wonton-wasm`) — `wasm-bindgen` bindings over the same,
+already-tested `wonton-crypto`/`wonton-objects`, not a reimplementation. See
+[`dashboard/README.md`](dashboard/README.md) for setup (`wasm-pack` + Node) and
+[`crates/wasm/src/lib.rs`](crates/wasm/src/lib.rs)'s module docs for why the history-walking
+orchestration lives in the dashboard's TypeScript rather than reusing `wonton-vcs::log` directly.
+
+`wonton-server` can optionally serve the dashboard's static build itself — set
+`WONTON_DASHBOARD_DIST` to `dashboard/dist` (after `npm run build` there) for a single-binary
+self-hosted deploy; leave it unset to host the dashboard separately (API-only server, needs
+nothing beyond CORS on your end).
 
 ## Project layout
 
@@ -179,9 +247,11 @@ Run `wonton --help` or `wonton <command> --help` for full details.
 | `wonton-objects` | Content-addressed blob/tree/commit objects, BLAKE2b hashing |
 | `wonton-vcs` | Local commit/log/diff/merge — the client-side history engine |
 | `wonton-sync` | Push/pull client: CAS refs, integrity verification (never touches crypto) |
-| `wonton-server` | The blind blob+ref store: auth, RBAC, wrapped-DEK maps (never touches crypto) |
+| `wonton-server` | The blind blob+ref store: auth, RBAC, wrapped-DEK maps, OAuth registration gate (never touches crypto) |
 | `wonton-shared` | Wire types shared between client and server (ciphertext only) |
 | `wonton` (cli) | The `wonton` binary: CLI porcelain, the key agent, the crypto engine |
+| `wonton-wasm` | Browser bindings over `wonton-crypto`/`wonton-objects` for the dashboard |
+| `dashboard/` | The read-only web viewer (TypeScript/Vite, not a Cargo crate) |
 
 Dependency direction is enforced by Cargo *and* a compile-time test: `wonton-server` and
 `wonton-sync` can never depend on `wonton-crypto` — the server is structurally incapable of
@@ -194,20 +264,22 @@ plaintext; an honest-but-curious operator can't read values; a network attacker 
 malicious server) can't tamper with history undetected, thanks to the hash-chained Merkle DAG
 and per-commit signatures.
 
-**Accepted metadata leakage:** the server does see the number of stores/environments and how
+**Accepted metadata leakage:** the server does see the number of orgs/stores/branches and how
 many secrets each holds, key *names* (plaintext by design), timing/frequency
-of pushes and who made them, and branch/ref names and topology. It never sees a value.
+of pushes and who made them, and org/store/branch names and topology. It never sees a value.
 
 **Out of scope (v1):** traffic-analysis resistance, a compromised client that already holds an
 unlocked key, or a legitimately authorized user exfiltrating values they can already read.
 
 ## Status
 
-Core functionality (Phases 0–5 of the build plan) is complete and tested: crypto primitives,
-local commit/log/diff, the server + sync layer, the full CLI command surface, sharing/revocation/
-key rotation, and three-way client-side merge with conflict resolution. A metadata/leakage audit
-and an extended security test pass have also been done. Recovery (a lost-passphrase story) and
-deeper machine-identity hardening remain intentionally deferred.
+Core functionality is complete and tested: crypto primitives, local commit/log/diff, the
+org/store/branch server + sync layer, the full CLI command surface (`init`/`clone`/`branch`
+included), sharing/revocation/key rotation (with automatic org membership on share), three-way
+client-side merge across two independently-keyed branches with conflict resolution, an OAuth
+registration gate, and a read-only web dashboard. Recovery (a lost-passphrase story), deeper
+machine-identity hardening, and a writable dashboard (`set`/`commit`/`push`/`share` from the
+browser) remain intentionally deferred.
 
 ## Testing
 
@@ -215,6 +287,14 @@ deeper machine-identity hardening remain intentionally deferred.
 cargo test --workspace          # or: cargo nextest run --workspace
 cargo clippy --workspace --all-targets
 cargo audit
+
+# crates/wasm: native #[test]s cover the crypto logic directly (see its module docs for why
+# wasm-bindgen's own types can't run natively for every path); wasm-pack exercises the real
+# wasm-bindgen boundary in an actual browser engine.
+cargo test -p wonton-wasm
+wasm-pack test --headless --chrome crates/wasm   # or --firefox; needs a browser installed
+
+cd dashboard && npm install && npm run build      # type-checks + builds the frontend
 ```
 
 ## Branding

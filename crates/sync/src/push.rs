@@ -10,24 +10,24 @@ use wonton_objects::{Commit, Hash, LocalObjectStore, Tree};
 use crate::client::SyncClient;
 use crate::error::SyncError;
 
-/// Upload `object_hashes` (read from `store`) and then CAS-move `branch` of `(repo, env)` from
+/// Upload `object_hashes` (read from `store`) and then CAS-move `branch` of `(org, repo)` from
 /// `old_hash` to `new_hash`.
 ///
 /// - Uploads are idempotent server-side, so re-pushing an object the server already has is
 ///   harmless. This crate does **not** check existence first (there is no bulk-exists endpoint;
 ///   a possible future optimization) — it simply re-uploads.
 /// - A lost CAS is surfaced as [`SyncError::Conflict`] carrying the ref's actual current value,
-///   so the caller can pull-then-merge-then-retry (Phase 5). `push` never resolves the conflict
-///   or clobbers the ref itself.
-// The 8-argument signature is fixed by the Phase 3 sync spec (repo/env/branch coordinates +
-// object set + CAS old/new tips); grouping them into a struct would only obscure a stable,
-// deliberately-explicit public API.
+///   so the caller can pull-then-merge-then-retry. `push` never resolves the conflict or
+///   clobbers the ref itself.
+// The 7-argument signature is fixed by the sync spec (org/repo/branch coordinates + object set +
+// CAS old/new tips); grouping them into a struct would only obscure a stable, deliberately-
+// explicit public API.
 #[allow(clippy::too_many_arguments)]
 pub async fn push(
     client: &SyncClient,
     store: &LocalObjectStore,
+    org: &str,
     repo: &str,
-    env: &str,
     branch: &str,
     object_hashes: &[Hash],
     old_hash: Option<Hash>,
@@ -41,7 +41,7 @@ pub async fn push(
         client.upload_object(hash, kind, &bytes).await?;
     }
     client
-        .move_ref(repo, env, branch, old_hash.as_ref(), &new_hash)
+        .move_ref(org, repo, branch, old_hash.as_ref(), &new_hash)
         .await
 }
 

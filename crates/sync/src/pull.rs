@@ -40,22 +40,21 @@ pub enum PullOutcome {
     Diverged { local_tip: Hash, remote_tip: Hash },
 }
 
-/// Pull `branch` of `(repo, env)` into `store`, given the caller's current `local_tip` (its
-/// ref value for this branch, or `None` if it has none / this is a clone).
+/// Pull `branch` of `(org, repo)` into `store`, given the caller's current `local_tip` (its ref
+/// value for this branch, or `None` if it has none / this is a clone).
 ///
 /// See the module docs for the integrity boundary and the divergence-detection simplification.
 pub async fn pull(
     client: &SyncClient,
     store: &LocalObjectStore,
+    org: &str,
     repo: &str,
-    env: &str,
     branch: &str,
     local_tip: Option<Hash>,
 ) -> Result<PullOutcome, SyncError> {
-    let refs = client.get_refs(repo, env).await?;
-    let remote_tip = match refs.get(branch) {
-        Some(hex) => Hash::from_hex(hex)?,
-        // The branch does not exist remotely: there is nothing to pull. Whether or not the
+    let remote_tip = match client.get_ref(org, repo, branch).await? {
+        Some(hex) => Hash::from_hex(&hex)?,
+        // The branch has never been pushed to: there is nothing to pull. Whether or not the
         // caller has a local tip, the result is "nothing to fetch" — report UpToDate.
         None => return Ok(PullOutcome::UpToDate),
     };

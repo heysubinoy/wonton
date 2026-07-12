@@ -31,8 +31,8 @@ use uuid::Uuid;
 use wonton_crypto::{generate_dek, generate_identity, sign, unlock, Dek, UnlockedIdentity};
 use wonton_objects::{Commit, Hash, LocalObjectStore};
 use wonton_shared::{
-    Argon2ParamsDto, CreateEnvRequest, CreateStoreRequest, LoginCompleteRequest, LoginStartRequest,
-    RefConflict, RegisterRequest,
+    Argon2ParamsDto, CreateBranchRequest, CreateStoreRequest, LoginCompleteRequest,
+    LoginStartRequest, RefConflict, RegisterRequest,
 };
 use wonton_sync::{pull, push, PullOutcome, SyncClient, SyncError};
 use wonton_vcs::{author_id_from_identity, commit, WorkingSet};
@@ -100,9 +100,9 @@ async fn seed_user(pool: &SqlitePool, username: &str, ed25519_pubkey: &[u8]) -> 
     id
 }
 
-async fn seed_store(pool: &SqlitePool, name: &str) -> String {
+async fn seed_org(pool: &SqlitePool, name: &str) -> String {
     let id = Uuid::new_v4().to_string();
-    sqlx::query("INSERT INTO stores (id, name, created_at) VALUES (?, ?, ?)")
+    sqlx::query("INSERT INTO orgs (id, name, created_at) VALUES (?, ?, ?)")
         .bind(&id)
         .bind(name)
         .bind(now_unix())
@@ -112,10 +112,23 @@ async fn seed_store(pool: &SqlitePool, name: &str) -> String {
     id
 }
 
-async fn seed_env(pool: &SqlitePool, store_id: &str, name: &str) -> String {
+async fn seed_store(pool: &SqlitePool, org_id: &str, name: &str) -> String {
+    let id = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO stores (id, org_id, name, created_at) VALUES (?, ?, ?, ?)")
+        .bind(&id)
+        .bind(org_id)
+        .bind(name)
+        .bind(now_unix())
+        .execute(pool)
+        .await
+        .unwrap();
+    id
+}
+
+async fn seed_branch(pool: &SqlitePool, store_id: &str, name: &str) -> String {
     let id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO environments (id, store_id, name, active_dek_version, created_at) \
+        "INSERT INTO branches (id, store_id, name, active_dek_version, created_at) \
          VALUES (?, ?, ?, 1, ?)",
     )
     .bind(&id)
@@ -128,9 +141,9 @@ async fn seed_env(pool: &SqlitePool, store_id: &str, name: &str) -> String {
     id
 }
 
-async fn seed_member(pool: &SqlitePool, env_id: &str, user_id: &str, role: &str) {
-    sqlx::query("INSERT INTO env_members (env_id, user_id, role) VALUES (?, ?, ?)")
-        .bind(env_id)
+async fn seed_branch_member(pool: &SqlitePool, branch_id: &str, user_id: &str, role: &str) {
+    sqlx::query("INSERT INTO branch_members (branch_id, user_id, role) VALUES (?, ?, ?)")
+        .bind(branch_id)
         .bind(user_id)
         .bind(role)
         .execute(pool)
@@ -275,9 +288,10 @@ async fn fetch_object_rejects_content_hash_mismatch() {
 async fn pull_fails_closed_when_server_drops_a_referenced_object() {
     let (base, pool, _db) = start_server().await;
     let user_id = seed_user(&pool, "alice", &[1u8; 32]).await;
-    let store_id = seed_store(&pool, "acme").await;
-    let env_id = seed_env(&pool, &store_id, "dev").await;
-    seed_member(&pool, &env_id, &user_id, "writer").await;
+    let org_id = seed_org(&pool, "acme").await;
+    let store_id = seed_store(&pool, &org_id, "backend").await;
+    let branch_id = seed_branch(&pool, &store_id, "dev").await;
+    seed_branch_member(&pool, &branch_id, &user_id, "writer").await;
     let token = seed_session(&pool, &user_id).await;
 
     let mut client = SyncClient::new(base);
@@ -296,7 +310,7 @@ async fn pull_fails_closed_when_server_drops_a_referenced_object() {
     let tip = commit(&src.store, &dek, &identity, author_id_from_identity(identity.public()), Some(middle), &ws, "tip").unwrap();
 
     let objects = all_object_hashes(&src.root);
-    push(&client, &src.store, "acme", "dev", "main", &objects, None, tip)
+    push(&client, &src.store, "acme", "backend", "dev", &objects, None, tip)
         .await
         .unwrap();
 
@@ -315,7 +329,7 @@ async fn pull_fails_closed_when_server_drops_a_referenced_object() {
     // A fresh client cloning the branch must fail closed when the walk reaches the dropped
     // object, not accept a truncated history.
     let dst = temp_store();
-    let err = pull(&client, &dst.store, "acme", "dev", "main", None)
+    let err = pull(&client, &dst.store, "acme", "backend", "dev", None)
         .await
         .unwrap_err();
     assert!(
@@ -334,9 +348,10 @@ async fn pull_fails_closed_when_server_drops_a_referenced_object() {
 async fn push_then_pull_round_trips_a_linear_history() {
     let (base, pool, _db) = start_server().await;
     let user_id = seed_user(&pool, "alice", &[1u8; 32]).await;
-    let store_id = seed_store(&pool, "acme").await;
-    let env_id = seed_env(&pool, &store_id, "dev").await;
-    seed_member(&pool, &env_id, &user_id, "writer").await;
+    let org_id = seed_org(&pool, "acme").await;
+    let store_id = seed_store(&pool, &org_id, "backend").await;
+    let branch_id = seed_branch(&pool, &store_id, "dev").await;
+    seed_branch_member(&pool, &branch_id, &user_id, "writer").await;
     let token = seed_session(&pool, &user_id).await;
 
     let mut client = SyncClient::new(base);
@@ -354,13 +369,13 @@ async fn push_then_pull_round_trips_a_linear_history() {
 
     // Push everything, then create the ref.
     let objects = all_object_hashes(&src.root);
-    push(&client, &src.store, "acme", "dev", "main", &objects, None, tip)
+    push(&client, &src.store, "acme", "backend", "dev", &objects, None, tip)
         .await
         .unwrap();
 
     // Machine 2: a fresh empty store, full clone.
     let dst = temp_store();
-    let outcome = pull(&client, &dst.store, "acme", "dev", "main", None)
+    let outcome = pull(&client, &dst.store, "acme", "backend", "dev", None)
         .await
         .unwrap();
     assert_eq!(outcome, PullOutcome::FastForward { new_tip: tip });
@@ -388,9 +403,10 @@ async fn push_then_pull_round_trips_a_linear_history() {
 async fn pull_reports_up_to_date_when_tips_match() {
     let (base, pool, _db) = start_server().await;
     let user_id = seed_user(&pool, "alice", &[1u8; 32]).await;
-    let store_id = seed_store(&pool, "acme").await;
-    let env_id = seed_env(&pool, &store_id, "dev").await;
-    seed_member(&pool, &env_id, &user_id, "writer").await;
+    let org_id = seed_org(&pool, "acme").await;
+    let store_id = seed_store(&pool, &org_id, "backend").await;
+    let branch_id = seed_branch(&pool, &store_id, "dev").await;
+    seed_branch_member(&pool, &branch_id, &user_id, "writer").await;
     let token = seed_session(&pool, &user_id).await;
 
     let mut client = SyncClient::new(base);
@@ -403,14 +419,14 @@ async fn pull_reports_up_to_date_when_tips_match() {
     ws.set("K", b"v".to_vec());
     let tip = commit(&src.store, &dek, &identity, author_id_from_identity(identity.public()), None, &ws, "only").unwrap();
     let objects = all_object_hashes(&src.root);
-    push(&client, &src.store, "acme", "dev", "main", &objects, None, tip)
+    push(&client, &src.store, "acme", "backend", "dev", &objects, None, tip)
         .await
         .unwrap();
 
     // A second, empty store — but local_tip already equals the remote tip, so nothing is
     // fetched and the result is UpToDate.
     let dst = temp_store();
-    let outcome = pull(&client, &dst.store, "acme", "dev", "main", Some(tip))
+    let outcome = pull(&client, &dst.store, "acme", "backend", "dev", Some(tip))
         .await
         .unwrap();
     assert_eq!(outcome, PullOutcome::UpToDate);
@@ -423,9 +439,10 @@ async fn pull_reports_up_to_date_when_tips_match() {
 async fn pull_reports_diverged_for_unrelated_histories() {
     let (base, pool, _db) = start_server().await;
     let user_id = seed_user(&pool, "alice", &[1u8; 32]).await;
-    let store_id = seed_store(&pool, "acme").await;
-    let env_id = seed_env(&pool, &store_id, "dev").await;
-    seed_member(&pool, &env_id, &user_id, "writer").await;
+    let org_id = seed_org(&pool, "acme").await;
+    let store_id = seed_store(&pool, &org_id, "backend").await;
+    let branch_id = seed_branch(&pool, &store_id, "dev").await;
+    seed_branch_member(&pool, &branch_id, &user_id, "writer").await;
     let token = seed_session(&pool, &user_id).await;
 
     let mut client = SyncClient::new(base);
@@ -443,8 +460,8 @@ async fn pull_reports_diverged_for_unrelated_histories() {
         &client,
         &remote_src.store,
         "acme",
+        "backend",
         "dev",
-        "main",
         &objects,
         None,
         remote_tip,
@@ -461,7 +478,7 @@ async fn pull_reports_diverged_for_unrelated_histories() {
     assert_ne!(local_tip, remote_tip);
 
     let dst = temp_store();
-    let outcome = pull(&client, &dst.store, "acme", "dev", "main", Some(local_tip))
+    let outcome = pull(&client, &dst.store, "acme", "backend", "dev", Some(local_tip))
         .await
         .unwrap();
     assert_eq!(
@@ -479,9 +496,10 @@ async fn pull_reports_diverged_for_unrelated_histories() {
 async fn push_with_stale_old_hash_surfaces_conflict() {
     let (base, pool, _db) = start_server().await;
     let user_id = seed_user(&pool, "alice", &[1u8; 32]).await;
-    let store_id = seed_store(&pool, "acme").await;
-    let env_id = seed_env(&pool, &store_id, "dev").await;
-    seed_member(&pool, &env_id, &user_id, "writer").await;
+    let org_id = seed_org(&pool, "acme").await;
+    let store_id = seed_store(&pool, &org_id, "backend").await;
+    let branch_id = seed_branch(&pool, &store_id, "dev").await;
+    seed_branch_member(&pool, &branch_id, &user_id, "writer").await;
     let token = seed_session(&pool, &user_id).await;
 
     let mut client = SyncClient::new(base);
@@ -497,16 +515,16 @@ async fn push_with_stale_old_hash_surfaces_conflict() {
     let b = commit(&src.store, &dek, &identity, author_id_from_identity(identity.public()), Some(a), &ws, "B").unwrap();
     let objects = all_object_hashes(&src.root);
 
-    // Establish main -> A, then advance main A -> B.
-    push(&client, &src.store, "acme", "dev", "main", &objects, None, a)
+    // Establish the branch's ref -> A, then advance A -> B.
+    push(&client, &src.store, "acme", "backend", "dev", &objects, None, a)
         .await
         .unwrap();
-    push(&client, &src.store, "acme", "dev", "main", &objects, Some(a), b)
+    push(&client, &src.store, "acme", "backend", "dev", &objects, Some(a), b)
         .await
         .unwrap();
 
     // A stale writer still thinks the tip is A and tries to move it again — the ref is now B.
-    let err = push(&client, &src.store, "acme", "dev", "main", &[], Some(a), b)
+    let err = push(&client, &src.store, "acme", "backend", "dev", &[], Some(a), b)
         .await
         .unwrap_err();
     match err {
@@ -524,9 +542,10 @@ async fn rbac_and_auth_errors_are_surfaced() {
     let (base, pool, _db) = start_server().await;
     let reader_id = seed_user(&pool, "reader", &[1u8; 32]).await;
     let outsider_id = seed_user(&pool, "outsider", &[3u8; 32]).await;
-    let store_id = seed_store(&pool, "acme").await;
-    let env_id = seed_env(&pool, &store_id, "dev").await;
-    seed_member(&pool, &env_id, &reader_id, "reader").await;
+    let org_id = seed_org(&pool, "acme").await;
+    let store_id = seed_store(&pool, &org_id, "backend").await;
+    let branch_id = seed_branch(&pool, &store_id, "dev").await;
+    seed_branch_member(&pool, &branch_id, &reader_id, "reader").await;
     let reader_token = seed_session(&pool, &reader_id).await;
     let outsider_token = seed_session(&pool, &outsider_id).await;
 
@@ -541,15 +560,15 @@ async fn rbac_and_auth_errors_are_surfaced() {
     // Forbidden: a reader may not move a ref (push).
     let mut reader = SyncClient::new(base.clone());
     reader.set_token(reader_token);
-    let err = push(&reader, &src.store, "acme", "dev", "main", &objects, None, tip)
+    let err = push(&reader, &src.store, "acme", "backend", "dev", &objects, None, tip)
         .await
         .unwrap_err();
     assert!(matches!(err, SyncError::Forbidden), "expected Forbidden, got {err:?}");
 
-    // Forbidden: a non-member cannot even read refs (so `pull` fails at get_refs).
+    // Forbidden: a non-member cannot even read the ref (so `pull` fails at get_ref).
     let mut outsider = SyncClient::new(base.clone());
     outsider.set_token(outsider_token);
-    let err = pull(&outsider, &src.store, "acme", "dev", "main", None)
+    let err = pull(&outsider, &src.store, "acme", "backend", "dev", None)
         .await
         .unwrap_err();
     assert!(matches!(err, SyncError::Forbidden), "expected Forbidden, got {err:?}");
@@ -557,20 +576,21 @@ async fn rbac_and_auth_errors_are_surfaced() {
     // Unauthorized: a bogus token.
     let mut bogus = SyncClient::new(base.clone());
     bogus.set_token("definitely-not-a-real-token");
-    let err = bogus.get_refs("acme", "dev").await.unwrap_err();
+    let err = bogus.get_ref("acme", "backend", "dev").await.unwrap_err();
     assert!(matches!(err, SyncError::Unauthorized), "expected Unauthorized, got {err:?}");
 
     // Unauthorized: no token at all.
     let none = SyncClient::new(base);
-    let err = none.get_refs("acme", "dev").await.unwrap_err();
+    let err = none.get_ref("acme", "backend", "dev").await.unwrap_err();
     assert!(matches!(err, SyncError::Unauthorized), "expected Unauthorized, got {err:?}");
 }
 
-/// The provisioning trio (`register` + `create_store` + `create_env`): a brand-new user
-/// registers, logs in with the two-step flow, then creates a store and an environment (becoming
-/// its admin). Exercises all three new `SyncClient` methods end-to-end against a real server.
+/// The provisioning trio (`register` + `create_store` + `create_branch`): a brand-new user
+/// registers, logs in with the two-step flow, creates an org (implicit prerequisite for a
+/// store), then creates a store and a branch (becoming its admin). Exercises the new
+/// `SyncClient` org/store/branch methods end-to-end against a real server.
 #[tokio::test]
-async fn register_login_and_provision_store_and_env() {
+async fn register_login_and_provision_org_store_and_branch() {
     let (base, _pool, _db) = start_server().await;
     let client = SyncClient::new(base);
 
@@ -590,12 +610,13 @@ async fn register_login_and_provision_store_and_env() {
                 t_cost: wrapped.argon2_params.t_cost,
                 p_cost: wrapped.argon2_params.p_cost,
             },
+            oauth_ticket: None,
         })
         .await
         .unwrap();
     assert!(!reg.user_id.is_empty());
 
-    // Log in to get a bearer token (needed for create_store / create_env).
+    // Log in to get a bearer token (needed for create_org / create_store / create_branch).
     let start = client
         .login_start(&LoginStartRequest {
             username: "provisioner".to_string(),
@@ -618,36 +639,51 @@ async fn register_login_and_provision_store_and_env() {
     let mut client = client;
     client.set_token(complete.token);
 
-    // Create a store, then an environment inside it.
-    let store = client
-        .create_store(&CreateStoreRequest {
-            name: "provisioned-store".to_string(),
+    // Create an org, then a store inside it, then a branch inside the store.
+    let org = client
+        .create_org(&wonton_shared::CreateOrgRequest {
+            name: "provisioned-org".to_string(),
         })
         .await
         .unwrap();
+    assert!(!org.org_id.is_empty());
+    let store = client
+        .create_store(
+            "provisioned-org",
+            &CreateStoreRequest {
+                name: "provisioned-store".to_string(),
+            },
+        )
+        .await
+        .unwrap();
     assert!(!store.store_id.is_empty());
-    let env = client
-        .create_env(
+    let branch = client
+        .create_branch(
+            "provisioned-org",
             "provisioned-store",
-            &CreateEnvRequest {
+            &CreateBranchRequest {
                 name: "prod".to_string(),
             },
         )
         .await
         .unwrap();
-    assert!(!env.env_id.is_empty());
+    assert!(!branch.branch_id.is_empty());
 
-    // The creator is admin of the new env, so it shows up in their env listing with that role.
-    let envs = client.list_envs("provisioned-store").await.unwrap();
-    assert_eq!(envs.len(), 1);
-    assert_eq!(envs[0].name, "prod");
-    assert_eq!(envs[0].role, wonton_shared::Role::Admin);
+    // The creator is admin of the new branch, so it shows up in their branch listing with that
+    // role.
+    let branches = client.list_branches("provisioned-org", "provisioned-store").await.unwrap();
+    assert_eq!(branches.len(), 1);
+    assert_eq!(branches[0].name, "prod");
+    assert_eq!(branches[0].role, wonton_shared::Role::Admin);
 
-    // A duplicate store name is a clean conflict, not a crash.
+    // A duplicate store name (within the same org) is a clean conflict, not a crash.
     let err = client
-        .create_store(&CreateStoreRequest {
-            name: "provisioned-store".to_string(),
-        })
+        .create_store(
+            "provisioned-org",
+            &CreateStoreRequest {
+                name: "provisioned-store".to_string(),
+            },
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, SyncError::ServerError(_, _) | SyncError::Conflict(_)));
@@ -662,9 +698,10 @@ async fn login_round_trip_yields_a_working_token() {
     let seed = [7u8; 32];
     let signing_key = SigningKey::from_bytes(&seed);
     let user_id = seed_user(&pool, "alice", signing_key.verifying_key().as_bytes()).await;
-    let store_id = seed_store(&pool, "acme").await;
-    let env_id = seed_env(&pool, &store_id, "dev").await;
-    seed_member(&pool, &env_id, &user_id, "reader").await;
+    let org_id = seed_org(&pool, "acme").await;
+    let store_id = seed_store(&pool, &org_id, "backend").await;
+    let branch_id = seed_branch(&pool, &store_id, "dev").await;
+    seed_branch_member(&pool, &branch_id, &user_id, "reader").await;
 
     let mut client = SyncClient::new(base);
 
@@ -691,7 +728,7 @@ async fn login_round_trip_yields_a_working_token() {
 
     client.set_token(complete.token);
     // The freshly minted token authenticates a real request.
-    let envs = client.list_envs("acme").await.unwrap();
-    assert_eq!(envs.len(), 1);
-    assert_eq!(envs[0].name, "dev");
+    let branches = client.list_branches("acme", "backend").await.unwrap();
+    assert_eq!(branches.len(), 1);
+    assert_eq!(branches[0].name, "dev");
 }

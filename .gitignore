@@ -2,6 +2,11 @@
 **/*.rs.bk
 *.pdb
 
+# Local wonton-server SQLite DBs from manual/ad-hoc runs (e.g. `cargo run --bin wonton-server`
+# from the repo root) — never a real project artifact.
+/wonton.db
+/.smoke/
+
 # Local editor/OS cruft
 .DS_Store
 .idea/
@@ -14,3 +19,11 @@
 
 # Internal planning/progress docs -- kept locally, never tracked or published
 /local-docs/
+
+# Generated wasm-pack output (regenerate via `npm run wasm:build` in dashboard/) and the
+# dashboard's own node/build artifacts.
+/crates/wasm/pkg/
+/dashboard/src/wasm-pkg/
+/dashboard/node_modules/
+/dashboard/dist/
+/dashboard/tsconfig.tsbuildinfo

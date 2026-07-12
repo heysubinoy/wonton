@@ -68,9 +68,9 @@ async fn seed_user(pool: &SqlitePool, username: &str, ed25519_pubkey: &[u8], x25
     id
 }
 
-async fn seed_store(pool: &SqlitePool, name: &str) -> String {
+async fn seed_org(pool: &SqlitePool, name: &str) -> String {
     let id = Uuid::new_v4().to_string();
-    sqlx::query("INSERT INTO stores (id, name, created_at) VALUES (?, ?, ?)")
+    sqlx::query("INSERT INTO orgs (id, name, created_at) VALUES (?, ?, ?)")
         .bind(&id)
         .bind(name)
         .bind(now_unix())
@@ -80,10 +80,33 @@ async fn seed_store(pool: &SqlitePool, name: &str) -> String {
     id
 }
 
-async fn seed_env(pool: &SqlitePool, store_id: &str, name: &str) -> String {
+async fn seed_org_member(pool: &SqlitePool, org_id: &str, user_id: &str, role: &str) {
+    sqlx::query("INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)")
+        .bind(org_id)
+        .bind(user_id)
+        .bind(role)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn seed_store(pool: &SqlitePool, org_id: &str, name: &str) -> String {
+    let id = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO stores (id, org_id, name, created_at) VALUES (?, ?, ?, ?)")
+        .bind(&id)
+        .bind(org_id)
+        .bind(name)
+        .bind(now_unix())
+        .execute(pool)
+        .await
+        .unwrap();
+    id
+}
+
+async fn seed_branch(pool: &SqlitePool, store_id: &str, name: &str) -> String {
     let id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO environments (id, store_id, name, active_dek_version, created_at) \
+        "INSERT INTO branches (id, store_id, name, active_dek_version, created_at) \
          VALUES (?, ?, ?, 1, ?)",
     )
     .bind(&id)
@@ -96,9 +119,9 @@ async fn seed_env(pool: &SqlitePool, store_id: &str, name: &str) -> String {
     id
 }
 
-async fn seed_member(pool: &SqlitePool, env_id: &str, user_id: &str, role: &str) {
-    sqlx::query("INSERT INTO env_members (env_id, user_id, role) VALUES (?, ?, ?)")
-        .bind(env_id)
+async fn seed_branch_member(pool: &SqlitePool, branch_id: &str, user_id: &str, role: &str) {
+    sqlx::query("INSERT INTO branch_members (branch_id, user_id, role) VALUES (?, ?, ?)")
+        .bind(branch_id)
         .bind(user_id)
         .bind(role)
         .execute(pool)
@@ -171,7 +194,7 @@ fn object_upload_body(kind: &str, content: &[u8]) -> Value {
     })
 }
 
-// ---- Provisioning: register / create store / create env ----------------------------------
+// ---- Provisioning: register / create org / create store / create branch -----------------
 
 fn register_body(username: &str) -> Value {
     json!({
@@ -220,50 +243,99 @@ async fn register_creates_user_and_rejects_duplicate_username() {
 }
 
 #[tokio::test]
-async fn create_store_succeeds_and_rejects_duplicate_name() {
+async fn create_org_bootstraps_creator_as_owner_and_rejects_duplicate_name() {
     let pool = test_pool().await;
     let user_id = seed_user(&pool, "alice", &[1u8; 32], &[2u8; 32]).await;
     let token = seed_session(&pool, &user_id, now_unix() + 3600).await;
     let router = build_router(pool);
 
+    let (status, body) = send_json(&router, "POST", "/orgs", Some(&token), Some(json!({ "name": "acme" }))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body["org_id"].as_str().unwrap().is_empty());
+
+    // Duplicate name -> 409.
+    let (status, _) = send_json(&router, "POST", "/orgs", Some(&token), Some(json!({ "name": "acme" }))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Unauthenticated -> 401.
+    let (status, _) = send_json(&router, "POST", "/orgs", None, Some(json!({ "name": "other" }))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // The creator is now an owner: they can create a store in the org, which requires org
+    // membership — a tighter proof than a membership listing (no such listing route exists).
+    let (status, _) = send_json(
+        &router,
+        "POST",
+        "/orgs/acme/stores",
+        Some(&token),
+        Some(json!({ "name": "backend" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn create_store_requires_org_membership_and_rejects_duplicate_name() {
+    let pool = test_pool().await;
+    let member_id = seed_user(&pool, "alice", &[1u8; 32], &[2u8; 32]).await;
+    let outsider_id = seed_user(&pool, "outsider", &[3u8; 32], &[4u8; 32]).await;
+    let org_id = seed_org(&pool, "acme").await;
+    seed_org_member(&pool, &org_id, &member_id, "owner").await;
+    let member_token = seed_session(&pool, &member_id, now_unix() + 3600).await;
+    let outsider_token = seed_session(&pool, &outsider_id, now_unix() + 3600).await;
+    let router = build_router(pool);
+
+    // 404 for an unknown org.
+    let (status, _) = send_json(
+        &router,
+        "POST",
+        "/orgs/ghost/stores",
+        Some(&member_token),
+        Some(json!({ "name": "backend" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A non-member of a real org is forbidden.
+    let (status, _) = send_json(
+        &router,
+        "POST",
+        "/orgs/acme/stores",
+        Some(&outsider_token),
+        Some(json!({ "name": "backend" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
     let (status, body) = send_json(
         &router,
         "POST",
-        "/stores",
-        Some(&token),
-        Some(json!({ "name": "acme/backend" })),
+        "/orgs/acme/stores",
+        Some(&member_token),
+        Some(json!({ "name": "backend" })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(!body["store_id"].as_str().unwrap().is_empty());
 
-    // Duplicate name -> 409.
+    // Duplicate name within the same org -> 409.
     let (status, _) = send_json(
         &router,
         "POST",
-        "/stores",
-        Some(&token),
-        Some(json!({ "name": "acme/backend" })),
+        "/orgs/acme/stores",
+        Some(&member_token),
+        Some(json!({ "name": "backend" })),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
-
-    // Unauthenticated -> 401.
-    let (status, _) = send_json(
-        &router,
-        "POST",
-        "/stores",
-        None,
-        Some(json!({ "name": "other" })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
-async fn create_env_bootstraps_creator_as_admin_and_rejects_duplicate_and_unknown_store() {
+async fn create_branch_bootstraps_creator_as_admin_and_rejects_duplicate_and_unknown_store() {
     let pool = test_pool().await;
     let user_id = seed_user(&pool, "alice", &[1u8; 32], &[2u8; 32]).await;
+    let org_id = seed_org(&pool, "acme").await;
+    seed_org_member(&pool, &org_id, &user_id, "owner").await;
     let token = seed_session(&pool, &user_id, now_unix() + 3600).await;
     let router = build_router(pool);
 
@@ -271,9 +343,9 @@ async fn create_env_bootstraps_creator_as_admin_and_rejects_duplicate_and_unknow
     let (status, _) = send_json(
         &router,
         "POST",
-        "/stores",
+        "/orgs/acme/stores",
         Some(&token),
-        Some(json!({ "name": "acme" })),
+        Some(json!({ "name": "backend" })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -282,64 +354,74 @@ async fn create_env_bootstraps_creator_as_admin_and_rejects_duplicate_and_unknow
     let (status, _) = send_json(
         &router,
         "POST",
-        "/stores/ghost/envs",
+        "/orgs/acme/stores/ghost/branches",
         Some(&token),
         Some(json!({ "name": "dev" })),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // Create the environment.
+    // Create the branch.
     let (status, body) = send_json(
         &router,
         "POST",
-        "/stores/acme/envs",
+        "/orgs/acme/stores/backend/branches",
         Some(&token),
         Some(json!({ "name": "dev" })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(!body["env_id"].as_str().unwrap().is_empty());
+    assert!(!body["branch_id"].as_str().unwrap().is_empty());
 
-    // Duplicate env name in the same store -> 409.
+    // Duplicate branch name in the same store -> 409.
     let (status, _) = send_json(
         &router,
         "POST",
-        "/stores/acme/envs",
+        "/orgs/acme/stores/backend/branches",
         Some(&token),
         Some(json!({ "name": "dev" })),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
 
-    // The creator is now an admin member: the env shows up for them via GET with role "admin",
-    // which it could not if `create_env` had failed to insert the bootstrap membership row.
-    let (status, envs) = send_json(&router, "GET", "/stores/acme/envs", Some(&token), None).await;
+    // The creator is now an admin member: the branch shows up for them via GET with role
+    // "admin", which it could not if `create_branch` had failed to insert the bootstrap
+    // membership row.
+    let (status, branches) = send_json(&router, "GET", "/orgs/acme/stores/backend/branches", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(envs[0]["name"], json!("dev"));
-    assert_eq!(envs[0]["role"], json!("admin"));
+    assert_eq!(branches[0]["name"], json!("dev"));
+    assert_eq!(branches[0]["role"], json!("admin"));
 }
 
 #[tokio::test]
-async fn create_env_creator_can_grant_a_key_proving_admin_membership() {
+async fn create_branch_creator_can_grant_a_key_proving_admin_membership() {
     // A tighter proof than the membership listing: the creator can immediately call the
-    // existing writer+-gated grant-key route on the env they just created, which requires a
+    // existing writer+-gated grant-key route on the branch they just created, which requires a
     // real membership row (403 otherwise). This is the exact bootstrap the key agent depends on.
     let pool = test_pool().await;
     let user_id = seed_user(&pool, "alice", &[1u8; 32], &[2u8; 32]).await;
+    let org_id = seed_org(&pool, "acme").await;
+    seed_org_member(&pool, &org_id, &user_id, "owner").await;
     let token = seed_session(&pool, &user_id, now_unix() + 3600).await;
     let router = build_router(pool);
 
-    let (status, _) = send_json(&router, "POST", "/stores", Some(&token), Some(json!({ "name": "acme" }))).await;
+    let (status, _) = send_json(&router, "POST", "/orgs/acme/stores", Some(&token), Some(json!({ "name": "backend" }))).await;
     assert_eq!(status, StatusCode::OK);
-    let (status, _) = send_json(&router, "POST", "/stores/acme/envs", Some(&token), Some(json!({ "name": "prod" }))).await;
-    assert_eq!(status, StatusCode::OK);
-
-    // Grant the creator (a real user row) their own wrapped DEK on the new env.
     let (status, _) = send_json(
         &router,
         "POST",
-        "/envs/acme/prod/keys",
+        "/orgs/acme/stores/backend/branches",
+        Some(&token),
+        Some(json!({ "name": "prod" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Grant the creator (a real user row) their own wrapped DEK on the new branch.
+    let (status, _) = send_json(
+        &router,
+        "POST",
+        "/orgs/acme/stores/backend/branches/prod/keys",
         Some(&token),
         Some(json!({ "user_id": user_id, "dek_version": 1, "sealed_box": STANDARD.encode(b"sealed") })),
     )
@@ -347,7 +429,7 @@ async fn create_env_creator_can_grant_a_key_proving_admin_membership() {
     assert_eq!(status, StatusCode::OK);
 }
 
-// ---- User directory / env details / members (Phase 5a) -----------------------------------
+// ---- User directory / branch details / members --------------------------------------------
 
 #[tokio::test]
 async fn get_user_returns_public_keys_and_404s_for_unknown() {
@@ -377,7 +459,7 @@ async fn get_user_returns_public_keys_and_404s_for_unknown() {
 
 /// `GET /users/by-id/:user_id` resolves the same public keys as `GET /users/:username`, but by
 /// server-assigned id — needed so a client can verify a commit's `author_id` even for a user who
-/// is no longer a member of the environment that commit lives in.
+/// is no longer a member of the branch that commit lives in.
 #[tokio::test]
 async fn get_user_by_id_returns_public_keys_and_404s_for_unknown() {
     let pool = test_pool().await;
@@ -418,16 +500,17 @@ async fn get_user_by_id_returns_public_keys_and_404s_for_unknown() {
 }
 
 #[tokio::test]
-async fn get_env_details_returns_active_version_for_a_reader_and_403s_for_non_members() {
+async fn get_branch_details_returns_active_version_for_a_reader_and_403s_for_non_members() {
     let pool = test_pool().await;
     let reader_id = seed_user(&pool, "reader", &[1u8; 32], &[2u8; 32]).await;
     let outsider_id = seed_user(&pool, "outsider", &[3u8; 32], &[4u8; 32]).await;
-    let store_id = seed_store(&pool, "acme").await;
-    let env_id = seed_env(&pool, &store_id, "dev").await;
-    seed_member(&pool, &env_id, &reader_id, "reader").await;
+    let org_id = seed_org(&pool, "acme").await;
+    let store_id = seed_store(&pool, &org_id, "backend").await;
+    let branch_id = seed_branch(&pool, &store_id, "dev").await;
+    seed_branch_member(&pool, &branch_id, &reader_id, "reader").await;
     // Bump the active version so we can assert a non-default value round-trips.
-    sqlx::query("UPDATE environments SET active_dek_version = 5 WHERE id = ?")
-        .bind(&env_id)
+    sqlx::query("UPDATE branches SET active_dek_version = 5 WHERE id = ?")
+        .bind(&branch_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -435,17 +518,17 @@ async fn get_env_details_returns_active_version_for_a_reader_and_403s_for_non_me
     let outsider_token = seed_session(&pool, &outsider_id, now_unix() + 3600).await;
     let router = build_router(pool);
 
-    let (status, body) = send_json(&router, "GET", "/envs/acme/dev", Some(&reader_token), None).await;
+    let (status, body) = send_json(&router, "GET", "/orgs/acme/stores/backend/branches/dev", Some(&reader_token), None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["env_id"].as_str().unwrap(), env_id);
+    assert_eq!(body["branch_id"].as_str().unwrap(), branch_id);
     assert_eq!(body["active_dek_version"], json!(5));
 
-    // A non-member is forbidden (403), even though the env exists.
-    let (status, _) = send_json(&router, "GET", "/envs/acme/dev", Some(&outsider_token), None).await;
+    // A non-member is forbidden (403), even though the branch exists.
+    let (status, _) = send_json(&router, "GET", "/orgs/acme/stores/backend/branches/dev", Some(&outsider_token), None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    // A missing env is 404.
-    let (status, _) = send_json(&router, "GET", "/envs/acme/ghost", Some(&reader_token), None).await;
+    // A missing branch is 404.
+    let (status, _) = send_json(&router, "GET", "/orgs/acme/stores/backend/branches/ghost", Some(&reader_token), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -455,15 +538,16 @@ async fn list_members_joins_users_and_returns_x25519_keys_for_a_reader() {
     let admin_id = seed_user(&pool, "admin", &[1u8; 32], &[2u8; 32]).await;
     let reader_id = seed_user(&pool, "reader", &[3u8; 32], &[4u8; 32]).await;
     let outsider_id = seed_user(&pool, "outsider", &[9u8; 32], &[9u8; 32]).await;
-    let store_id = seed_store(&pool, "acme").await;
-    let env_id = seed_env(&pool, &store_id, "dev").await;
-    seed_member(&pool, &env_id, &admin_id, "admin").await;
-    seed_member(&pool, &env_id, &reader_id, "reader").await;
+    let org_id = seed_org(&pool, "acme").await;
+    let store_id = seed_store(&pool, &org_id, "backend").await;
+    let branch_id = seed_branch(&pool, &store_id, "dev").await;
+    seed_branch_member(&pool, &branch_id, &admin_id, "admin").await;
+    seed_branch_member(&pool, &branch_id, &reader_id, "reader").await;
     let admin_token = seed_session(&pool, &admin_id, now_unix() + 3600).await;
     let outsider_token = seed_session(&pool, &outsider_id, now_unix() + 3600).await;
     let router = build_router(pool);
 
-    let (status, body) = send_json(&router, "GET", "/envs/acme/dev/members", Some(&admin_token), None).await;
+    let (status, body) = send_json(&router, "GET", "/orgs/acme/stores/backend/branches/dev/members", Some(&admin_token), None).await;
     assert_eq!(status, StatusCode::OK);
     let members = body.as_array().unwrap();
     assert_eq!(members.len(), 2);
@@ -477,8 +561,73 @@ async fn list_members_joins_users_and_returns_x25519_keys_for_a_reader() {
     assert_eq!(reader_entry["x25519_pubkey"], json!(STANDARD.encode([4u8; 32])));
 
     // A non-member cannot list members (403).
-    let (status, _) = send_json(&router, "GET", "/envs/acme/dev/members", Some(&outsider_token), None).await;
+    let (status, _) = send_json(&router, "GET", "/orgs/acme/stores/backend/branches/dev/members", Some(&outsider_token), None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn add_member_auto_joins_the_target_to_the_org() {
+    // Sharing a branch with someone who isn't yet in the org adds them to it (scoped by the
+    // branch grant they actually got — see `handlers::add_member`'s doc comment). A second,
+    // already-a-member add must not duplicate/error on the org_members row.
+    let pool = test_pool().await;
+    let admin_id = seed_user(&pool, "admin", &[1u8; 32], &[2u8; 32]).await;
+    let target_id = seed_user(&pool, "target", &[3u8; 32], &[4u8; 32]).await;
+    let org_id = seed_org(&pool, "acme").await;
+    seed_org_member(&pool, &org_id, &admin_id, "owner").await;
+    let store_id = seed_store(&pool, &org_id, "backend").await;
+    let branch_id = seed_branch(&pool, &store_id, "dev").await;
+    seed_branch_member(&pool, &branch_id, &admin_id, "admin").await;
+    let admin_token = seed_session(&pool, &admin_id, now_unix() + 3600).await;
+    let router = build_router(pool.clone());
+
+    // Target is not yet an org member.
+    let before: i64 = sqlx::query("SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND user_id = ?")
+        .bind(&org_id)
+        .bind(&target_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("n");
+    assert_eq!(before, 0);
+
+    let (status, _) = send_json(
+        &router,
+        "POST",
+        "/orgs/acme/stores/backend/branches/dev/members",
+        Some(&admin_token),
+        Some(json!({ "user_id": target_id, "role": "reader" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let after: i64 = sqlx::query("SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND user_id = ?")
+        .bind(&org_id)
+        .bind(&target_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("n");
+    assert_eq!(after, 1, "sharing a branch must auto-join the target to the org");
+
+    // Re-sharing (e.g. role update) does not error or duplicate the org_members row.
+    let (status, _) = send_json(
+        &router,
+        "POST",
+        "/orgs/acme/stores/backend/branches/dev/members",
+        Some(&admin_token),
+        Some(json!({ "user_id": target_id, "role": "writer" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let still: i64 = sqlx::query("SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND user_id = ?")
+        .bind(&org_id)
+        .bind(&target_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("n");
+    assert_eq!(still, 1);
 }
 
 // ---- Objects ----------------------------------------------------------------------------
@@ -535,15 +684,16 @@ async fn object_fetch_nonexistent_hash_is_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-// ---- Refs / CAS ---------------------------------------------------------------------------
+// ---- Ref / CAS ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn ref_cas_move_succeeds_and_rejects_stale_old_hash() {
     let pool = test_pool().await;
     let user_id = seed_user(&pool, "alice", &[1u8; 32], &[2u8; 32]).await;
-    let store_id = seed_store(&pool, "acme").await;
-    let env_id = seed_env(&pool, &store_id, "dev").await;
-    seed_member(&pool, &env_id, &user_id, "writer").await;
+    let org_id = seed_org(&pool, "acme").await;
+    let store_id = seed_store(&pool, &org_id, "backend").await;
+    let branch_id = seed_branch(&pool, &store_id, "dev").await;
+    seed_branch_member(&pool, &branch_id, &user_id, "writer").await;
     let token = seed_session(&pool, &user_id, now_unix() + 3600).await;
     let router = build_router(pool);
 
@@ -561,11 +711,11 @@ async fn ref_cas_move_succeeds_and_rejects_stale_old_hash() {
         assert_eq!(status, StatusCode::OK);
     }
 
-    // Create the branch: old_hash None means "must not currently exist".
+    // Create the ref: old_hash None means "must not currently exist".
     let (status, _) = send_json(
         &router,
         "POST",
-        "/refs/acme/dev/main",
+        "/orgs/acme/stores/backend/branches/dev/ref",
         Some(&token),
         Some(json!({ "old_hash": Value::Null, "new_hash": commit_a })),
     )
@@ -576,7 +726,7 @@ async fn ref_cas_move_succeeds_and_rejects_stale_old_hash() {
     let (status, body) = send_json(
         &router,
         "POST",
-        "/refs/acme/dev/main",
+        "/orgs/acme/stores/backend/branches/dev/ref",
         Some(&token),
         Some(json!({ "old_hash": Value::Null, "new_hash": commit_a })),
     )
@@ -588,7 +738,7 @@ async fn ref_cas_move_succeeds_and_rejects_stale_old_hash() {
     let (status, body) = send_json(
         &router,
         "POST",
-        "/refs/acme/dev/main",
+        "/orgs/acme/stores/backend/branches/dev/ref",
         Some(&token),
         Some(json!({ "old_hash": Value::Null, "new_hash": commit_b })),
     )
@@ -600,25 +750,42 @@ async fn ref_cas_move_succeeds_and_rejects_stale_old_hash() {
     let (status, _) = send_json(
         &router,
         "POST",
-        "/refs/acme/dev/main",
+        "/orgs/acme/stores/backend/branches/dev/ref",
         Some(&token),
         Some(json!({ "old_hash": commit_a, "new_hash": commit_b })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, refs) = send_json(&router, "GET", "/refs/acme/dev", Some(&token), None).await;
+    let (status, ref_body) = send_json(&router, "GET", "/orgs/acme/stores/backend/branches/dev/ref", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(refs["main"], json!(commit_b));
+    assert_eq!(ref_body["commit_hash"], json!(commit_b));
+}
+
+#[tokio::test]
+async fn ref_get_on_a_never_pushed_branch_returns_none() {
+    let pool = test_pool().await;
+    let user_id = seed_user(&pool, "alice", &[1u8; 32], &[2u8; 32]).await;
+    let org_id = seed_org(&pool, "acme").await;
+    let store_id = seed_store(&pool, &org_id, "backend").await;
+    let branch_id = seed_branch(&pool, &store_id, "dev").await;
+    seed_branch_member(&pool, &branch_id, &user_id, "reader").await;
+    let token = seed_session(&pool, &user_id, now_unix() + 3600).await;
+    let router = build_router(pool);
+
+    let (status, ref_body) = send_json(&router, "GET", "/orgs/acme/stores/backend/branches/dev/ref", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ref_body["commit_hash"], Value::Null);
 }
 
 #[tokio::test]
 async fn ref_cas_concurrent_race_exactly_one_winner() {
     let pool = test_pool().await;
     let user_id = seed_user(&pool, "alice", &[1u8; 32], &[2u8; 32]).await;
-    let store_id = seed_store(&pool, "acme").await;
-    let env_id = seed_env(&pool, &store_id, "dev").await;
-    seed_member(&pool, &env_id, &user_id, "writer").await;
+    let org_id = seed_org(&pool, "acme").await;
+    let store_id = seed_store(&pool, &org_id, "backend").await;
+    let branch_id = seed_branch(&pool, &store_id, "dev").await;
+    seed_branch_member(&pool, &branch_id, &user_id, "writer").await;
     let token = seed_session(&pool, &user_id, now_unix() + 3600).await;
     let router = build_router(pool);
 
@@ -640,7 +807,7 @@ async fn ref_cas_concurrent_race_exactly_one_winner() {
     let (status, _) = send_json(
         &router,
         "POST",
-        "/refs/acme/dev/main",
+        "/orgs/acme/stores/backend/branches/dev/ref",
         Some(&token),
         Some(json!({ "old_hash": Value::Null, "new_hash": commit_base })),
     )
@@ -651,14 +818,14 @@ async fn ref_cas_concurrent_race_exactly_one_winner() {
     let req_x = send_json(
         &router,
         "POST",
-        "/refs/acme/dev/main",
+        "/orgs/acme/stores/backend/branches/dev/ref",
         Some(&token),
         Some(json!({ "old_hash": commit_base, "new_hash": commit_x })),
     );
     let req_y = send_json(
         &router,
         "POST",
-        "/refs/acme/dev/main",
+        "/orgs/acme/stores/backend/branches/dev/ref",
         Some(&token),
         Some(json!({ "old_hash": commit_base, "new_hash": commit_y })),
     );
@@ -671,9 +838,9 @@ async fn ref_cas_concurrent_race_exactly_one_winner() {
     assert_eq!(conflicts, 1, "exactly one racer must be rejected with 409");
 
     // The ref must now point at whichever one actually won.
-    let (_, refs) = send_json(&router, "GET", "/refs/acme/dev", Some(&token), None).await;
+    let (_, ref_body) = send_json(&router, "GET", "/orgs/acme/stores/backend/branches/dev/ref", Some(&token), None).await;
     let winner = if status_x == StatusCode::OK { &commit_x } else { &commit_y };
-    assert_eq!(refs["main"], json!(winner));
+    assert_eq!(ref_body["commit_hash"], json!(winner));
 }
 
 // ---- Auth: challenge-response login -------------------------------------------------------
@@ -685,9 +852,8 @@ async fn login_start_and_complete_round_trip_issues_a_working_token() {
     let signing_key = SigningKey::from_bytes(&seed);
     let verifying_key = signing_key.verifying_key();
     let user_id = seed_user(&pool, "alice", verifying_key.as_bytes(), &[9u8; 32]).await;
-    let store_id = seed_store(&pool, "acme").await;
-    let env_id = seed_env(&pool, &store_id, "dev").await;
-    seed_member(&pool, &env_id, &user_id, "reader").await;
+    let org_id = seed_org(&pool, "acme").await;
+    seed_org_member(&pool, &org_id, &user_id, "owner").await;
     let router = build_router(pool);
 
     let (status, start) = send_json(
@@ -723,7 +889,7 @@ async fn login_start_and_complete_round_trip_issues_a_working_token() {
     assert_eq!(complete["user_id"].as_str().unwrap(), user_id);
 
     // The freshly minted token actually authenticates a subsequent request.
-    let (status, _) = send_json(&router, "GET", "/stores/acme/envs", Some(&token), None).await;
+    let (status, _) = send_json(&router, "POST", "/orgs/acme/stores", Some(&token), Some(json!({ "name": "backend" }))).await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -853,13 +1019,13 @@ async fn missing_invalid_and_expired_tokens_are_all_401() {
     let expired_token = seed_session(&pool, &user_id, now_unix() - 10).await;
     let router = build_router(pool);
 
-    let (status, _) = send_json(&router, "GET", "/stores/acme/envs", None, None).await;
+    let (status, _) = send_json(&router, "POST", "/orgs", None, Some(json!({ "name": "acme" }))).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    let (status, _) = send_json(&router, "GET", "/stores/acme/envs", Some("not-a-real-token"), None).await;
+    let (status, _) = send_json(&router, "POST", "/orgs", Some("not-a-real-token"), Some(json!({ "name": "acme" }))).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    let (status, _) = send_json(&router, "GET", "/stores/acme/envs", Some(&expired_token), None).await;
+    let (status, _) = send_json(&router, "POST", "/orgs", Some(&expired_token), Some(json!({ "name": "acme" }))).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
@@ -871,8 +1037,8 @@ struct RbacFixture {
     writer_token: String,
     admin_token: String,
     /// A real (but unrelated) registered user, distinct from reader/writer/admin, for tests
-    /// that grant/revoke membership or wrapped-DEK entries — `env_members`/`wrapped_deks` both
-    /// have a `REFERENCES users(id)` foreign key, so the target must be a real user row.
+    /// that grant/revoke membership or wrapped-DEK entries — `branch_members`/`wrapped_deks`
+    /// both have a `REFERENCES users(id)` foreign key, so the target must be a real user row.
     target_user_id: String,
 }
 
@@ -882,11 +1048,12 @@ async fn rbac_fixture() -> RbacFixture {
     let writer_id = seed_user(&pool, "writer", &[3u8; 32], &[4u8; 32]).await;
     let admin_id = seed_user(&pool, "admin", &[5u8; 32], &[6u8; 32]).await;
     let target_user_id = seed_user(&pool, "target", &[8u8; 32], &[9u8; 32]).await;
-    let store_id = seed_store(&pool, "acme").await;
-    let env_id = seed_env(&pool, &store_id, "dev").await;
-    seed_member(&pool, &env_id, &reader_id, "reader").await;
-    seed_member(&pool, &env_id, &writer_id, "writer").await;
-    seed_member(&pool, &env_id, &admin_id, "admin").await;
+    let org_id = seed_org(&pool, "acme").await;
+    let store_id = seed_store(&pool, &org_id, "backend").await;
+    let branch_id = seed_branch(&pool, &store_id, "dev").await;
+    seed_branch_member(&pool, &branch_id, &reader_id, "reader").await;
+    seed_branch_member(&pool, &branch_id, &writer_id, "writer").await;
+    seed_branch_member(&pool, &branch_id, &admin_id, "admin").await;
     let reader_token = seed_session(&pool, &reader_id, now_unix() + 3600).await;
     let writer_token = seed_session(&pool, &writer_id, now_unix() + 3600).await;
     let admin_token = seed_session(&pool, &admin_id, now_unix() + 3600).await;
@@ -900,10 +1067,10 @@ async fn rbac_fixture() -> RbacFixture {
 }
 
 #[tokio::test]
-async fn reader_can_get_refs_but_not_move_them() {
+async fn reader_can_get_ref_but_not_move_it() {
     let fx = rbac_fixture().await;
 
-    let (status, _) = send_json(&fx.router, "GET", "/refs/acme/dev", Some(&fx.reader_token), None).await;
+    let (status, _) = send_json(&fx.router, "GET", "/orgs/acme/stores/backend/branches/dev/ref", Some(&fx.reader_token), None).await;
     assert_eq!(status, StatusCode::OK);
 
     // Needs an object to move the ref to, but role is checked before object existence, so this
@@ -912,7 +1079,7 @@ async fn reader_can_get_refs_but_not_move_them() {
     let (status, _) = send_json(
         &fx.router,
         "POST",
-        "/refs/acme/dev/main",
+        "/orgs/acme/stores/backend/branches/dev/ref",
         Some(&fx.reader_token),
         Some(json!({ "old_hash": Value::Null, "new_hash": bogus })),
     )
@@ -921,7 +1088,7 @@ async fn reader_can_get_refs_but_not_move_them() {
 }
 
 #[tokio::test]
-async fn writer_can_push_objects_and_refs_but_not_manage_members() {
+async fn writer_can_push_objects_and_ref_but_not_manage_members() {
     let fx = rbac_fixture().await;
 
     let (status, _) = send_json(
@@ -938,7 +1105,7 @@ async fn writer_can_push_objects_and_refs_but_not_manage_members() {
     let (status, _) = send_json(
         &fx.router,
         "POST",
-        "/refs/acme/dev/main",
+        "/orgs/acme/stores/backend/branches/dev/ref",
         Some(&fx.writer_token),
         Some(json!({ "old_hash": Value::Null, "new_hash": commit_hash })),
     )
@@ -948,7 +1115,7 @@ async fn writer_can_push_objects_and_refs_but_not_manage_members() {
     let (status, _) = send_json(
         &fx.router,
         "POST",
-        "/envs/acme/dev/members",
+        "/orgs/acme/stores/backend/branches/dev/members",
         Some(&fx.writer_token),
         Some(json!({ "user_id": fx.target_user_id, "role": "reader" })),
     )
@@ -974,7 +1141,7 @@ async fn admin_can_do_everything() {
     let (status, _) = send_json(
         &fx.router,
         "POST",
-        "/refs/acme/dev/main",
+        "/orgs/acme/stores/backend/branches/dev/ref",
         Some(&fx.admin_token),
         Some(json!({ "old_hash": Value::Null, "new_hash": commit_hash })),
     )
@@ -984,7 +1151,7 @@ async fn admin_can_do_everything() {
     let (status, _) = send_json(
         &fx.router,
         "POST",
-        "/envs/acme/dev/members",
+        "/orgs/acme/stores/backend/branches/dev/members",
         Some(&fx.admin_token),
         Some(json!({ "user_id": fx.target_user_id, "role": "reader" })),
     )
@@ -994,7 +1161,7 @@ async fn admin_can_do_everything() {
     let (status, _) = send_json(
         &fx.router,
         "DELETE",
-        &format!("/envs/acme/dev/members/{}", fx.target_user_id),
+        &format!("/orgs/acme/stores/backend/branches/dev/members/{}", fx.target_user_id),
         Some(&fx.admin_token),
         None,
     )
@@ -1004,7 +1171,7 @@ async fn admin_can_do_everything() {
     let (status, _) = send_json(
         &fx.router,
         "POST",
-        "/envs/acme/dev/keys",
+        "/orgs/acme/stores/backend/branches/dev/keys",
         Some(&fx.admin_token),
         Some(json!({ "user_id": fx.target_user_id, "dek_version": 1, "sealed_box": STANDARD.encode(b"sealed") })),
     )
@@ -1014,7 +1181,7 @@ async fn admin_can_do_everything() {
     let (status, _) = send_json(
         &fx.router,
         "POST",
-        "/envs/acme/dev/rotate",
+        "/orgs/acme/stores/backend/branches/dev/rotate",
         Some(&fx.admin_token),
         Some(json!({
             "new_dek_version": 2,
@@ -1037,9 +1204,10 @@ async fn admin_can_do_everything() {
 async fn rotation_that_fails_partway_rolls_back_the_whole_batch() {
     let pool = test_pool().await;
     let admin_id = seed_user(&pool, "admin", &[1u8; 32], &[2u8; 32]).await;
-    let store_id = seed_store(&pool, "acme").await;
-    let env_id = seed_env(&pool, &store_id, "dev").await;
-    seed_member(&pool, &env_id, &admin_id, "admin").await;
+    let org_id = seed_org(&pool, "acme").await;
+    let store_id = seed_store(&pool, &org_id, "backend").await;
+    let branch_id = seed_branch(&pool, &store_id, "dev").await;
+    seed_branch_member(&pool, &branch_id, &admin_id, "admin").await;
     let admin_token = seed_session(&pool, &admin_id, now_unix() + 3600).await;
     // Keep a handle to the pool so we can inspect the DB after the request; the router owns a
     // clone.
@@ -1053,7 +1221,7 @@ async fn rotation_that_fails_partway_rolls_back_the_whole_batch() {
     let (status, _) = send_json(
         &router,
         "POST",
-        "/envs/acme/dev/rotate",
+        "/orgs/acme/stores/backend/branches/dev/rotate",
         Some(&admin_token),
         Some(json!({
             "new_dek_version": 2,
@@ -1073,18 +1241,18 @@ async fn rotation_that_fails_partway_rolls_back_the_whole_batch() {
     assert_ne!(status, StatusCode::OK);
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 
-    // 1. The env's active DEK version never moved off its original value of 1.
-    let version: i64 = sqlx::query("SELECT active_dek_version FROM environments WHERE id = ?")
-        .bind(&env_id)
+    // 1. The branch's active DEK version never moved off its original value of 1.
+    let version: i64 = sqlx::query("SELECT active_dek_version FROM branches WHERE id = ?")
+        .bind(&branch_id)
         .fetch_one(&pool)
         .await
         .unwrap()
         .get("active_dek_version");
     assert_eq!(version, 1, "active_dek_version must not move on a failed rotation");
 
-    // 2. No wrapped-DEK row for the env survived — not even the first, valid one.
-    let dek_rows: i64 = sqlx::query("SELECT COUNT(*) AS n FROM wrapped_deks WHERE env_id = ?")
-        .bind(&env_id)
+    // 2. No wrapped-DEK row for the branch survived — not even the first, valid one.
+    let dek_rows: i64 = sqlx::query("SELECT COUNT(*) AS n FROM wrapped_deks WHERE branch_id = ?")
+        .bind(&branch_id)
         .fetch_one(&pool)
         .await
         .unwrap()
@@ -1100,4 +1268,130 @@ async fn rotation_that_fails_partway_rolls_back_the_whole_batch() {
         .unwrap()
         .get("n");
     assert_eq!(obj_rows, 0, "no batch object may survive a rolled-back rotation");
+}
+
+// ---- OAuth-gated registration (Part 1) ----------------------------------------------------
+
+fn router_with_mock_oauth(pool: SqlitePool, provider: crate::oauth::test_support::MockProvider) -> Router {
+    let providers = crate::OAuthProviders::none().register(provider);
+    crate::build_router_with_oauth(pool, providers)
+}
+
+/// Plain `POST /auth/register` (no `oauth_ticket`) must behave exactly as it always has — the
+/// OAuth gate is additive, not a breaking change to the existing open registration path.
+#[tokio::test]
+async fn register_without_a_ticket_is_unchanged() {
+    let pool = test_pool().await;
+    let router = build_router(pool);
+    let (status, body) = send_json(&router, "POST", "/auth/register", None, Some(register_body("plainuser"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body["user_id"].as_str().unwrap().is_empty());
+}
+
+/// `GET /auth/oauth/:provider/authorize` 404s for a provider name nothing registered under.
+#[tokio::test]
+async fn oauth_authorize_404s_for_an_unconfigured_provider() {
+    let pool = test_pool().await;
+    let router = build_router(pool); // no providers registered at all
+    let req = Request::builder()
+        .method("GET")
+        .uri("/auth/oauth/google/authorize")
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+/// The full happy path: `authorize` redirects, `callback` exchanges the code (via the mock
+/// provider) and mints a single-use ticket, and `register` with that ticket both succeeds and
+/// records the verified email/provider/subject — while the ticket cannot be presented twice.
+#[tokio::test]
+async fn oauth_callback_mints_a_ticket_that_register_consumes_exactly_once() {
+    let pool = test_pool().await;
+    let router = router_with_mock_oauth(
+        pool.clone(),
+        crate::oauth::test_support::MockProvider::always_succeeds("mock", "subj-123", "alice@example.com"),
+    );
+
+    // authorize redirects somewhere (a real consent screen for a real provider).
+    let req = Request::builder().method("GET").uri("/auth/oauth/mock/authorize").body(Body::empty()).unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert!(res.status().is_redirection());
+
+    // callback (mock exchange never inspects `code`) redirects with a ticket in the fragment.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/auth/oauth/mock/callback?code=whatever")
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert!(res.status().is_redirection());
+    let location = res.headers().get("location").unwrap().to_str().unwrap().to_string();
+    let ticket = location.split("oauth_ticket=").nth(1).unwrap().split('&').next().unwrap().to_string();
+    assert!(!ticket.is_empty());
+
+    // A single row was minted with the mock provider's identity.
+    let row_count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM oauth_verifications")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("n");
+    assert_eq!(row_count, 1);
+
+    // register() with the ticket succeeds and records the verified identity.
+    let mut body = register_body("alice");
+    body["oauth_ticket"] = json!(ticket);
+    let (status, resp) = send_json(&router, "POST", "/auth/register", None, Some(body)).await;
+    assert_eq!(status, StatusCode::OK);
+    let user_id = resp["user_id"].as_str().unwrap().to_string();
+
+    let row = sqlx::query("SELECT email, oauth_provider, oauth_subject FROM users WHERE id = ?")
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<String, _>("email"), "alice@example.com");
+    assert_eq!(row.get::<String, _>("oauth_provider"), "mock");
+    assert_eq!(row.get::<String, _>("oauth_subject"), "subj-123");
+
+    // The ticket was consumed (single-use) — a second registration attempt with the same ticket
+    // must be rejected, not silently accepted or re-verified.
+    let mut body2 = register_body("alice-again");
+    body2["oauth_ticket"] = json!(ticket);
+    let (status, _) = send_json(&router, "POST", "/auth/register", None, Some(body2)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// A garbage/unknown ticket is a clean 400, not a crash or a silently-unverified registration.
+#[tokio::test]
+async fn register_with_a_bogus_ticket_is_rejected() {
+    let pool = test_pool().await;
+    let router = build_router(pool);
+    let mut body = register_body("bob");
+    body["oauth_ticket"] = json!("this-ticket-was-never-minted");
+    let (status, _) = send_json(&router, "POST", "/auth/register", None, Some(body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// A provider that fails the code exchange (e.g. Google rejected the code) surfaces as a clean
+/// error from `callback`, not a ticket that gets minted anyway.
+#[tokio::test]
+async fn oauth_callback_with_a_failing_provider_mints_no_ticket() {
+    let pool = test_pool().await;
+    let router = router_with_mock_oauth(pool.clone(), crate::oauth::test_support::MockProvider::always_fails("mock"));
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/auth/oauth/mock/callback?code=whatever")
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert!(!res.status().is_redirection(), "a failed exchange must not redirect with a ticket");
+
+    let row_count: i64 = sqlx::query("SELECT COUNT(*) AS n FROM oauth_verifications")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("n");
+    assert_eq!(row_count, 0, "no ticket may be minted when the provider exchange fails");
 }

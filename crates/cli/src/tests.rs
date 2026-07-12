@@ -1,22 +1,20 @@
-//! End-to-end tests for the identity / context commands. Each test drives the
-//! command *logic* in `crate::commands` directly (not the compiled binary) against BOTH a real
-//! `wonton-server` (bound to an ephemeral port over a temp-file SQLite DB, mirroring
-//! `wonton-sync`'s integration tests) and a real in-process agent daemon (over a temp socket,
-//! mirroring `crate::agent::tests`), using a temp config path so nothing touches the real
+//! End-to-end tests for the identity/workspace commands. Each test drives the command *logic* in
+//! `crate::commands` directly (not the compiled binary) against BOTH a real `wonton-server`
+//! (bound to an ephemeral port over a temp-file SQLite DB, mirroring `wonton-sync`'s integration
+//! tests) and a real in-process agent daemon (over a temp socket, mirroring
+//! `crate::agent::tests`), using a temp config path so nothing touches the real
 //! `~/.config/wonton`.
 //!
-//! `.wonton` marker discovery and config save/load round-trips are covered by unit tests in
-//! `crate::config`; these tests focus on the networked flows (`login`, `use`) plus `link`.
+//! `wonton.toml`/`.wonton.local` discovery and config save/load round-trips are covered by unit
+//! tests in `crate::config`; these tests focus on the networked/agent-backed flows.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
-use wonton_crypto::{generate_dek, wrap_dek, EncryptedValue};
+use wonton_crypto::EncryptedValue;
 use wonton_objects::{Blob, Commit, Hash, Tree};
-use wonton_shared::{CreateEnvRequest, CreateStoreRequest, GrantKeyRequest, Role};
+use wonton_shared::Role;
 use wonton_sync::SyncClient;
 use wonton_vcs::ValueDecryptor;
 
@@ -70,47 +68,34 @@ fn temp_state_path() -> PathBuf {
     unique("state").join("state.toml")
 }
 
-/// Grant `user_id` a freshly-generated DEK (version 1) for `store`/`env`, returning nothing —
-/// the DEK stays server-side (sealed) and is unwrapped into the agent by `use`. Mirrors what a
-/// real `wonton share` will do in a later phase.
-async fn grant_dek(base: &str, token: &str, store: &str, env: &str, user_id: &str, x25519_b64: &str) {
-    let mut client = SyncClient::new(base);
-    client.set_token(token);
-    let dek = generate_dek();
-    let x: [u8; 32] = STANDARD.decode(x25519_b64).unwrap().as_slice().try_into().unwrap();
-    let sealed = wrap_dek(&dek, &x);
-    client
-        .grant_key(
-            store,
-            env,
-            &GrantKeyRequest {
-                user_id: user_id.to_string(),
-                dek_version: 1,
-                sealed_box: STANDARD.encode(&sealed.0),
-            },
-        )
-        .await
-        .unwrap();
+fn temp_dir() -> PathBuf {
+    let dir = unique("dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
-/// Everything a Phase-4c command needs: a real server, an in-process agent with the context's DEK
-/// unwrapped, and temp config/state paths (the object store is co-located with `state_path`).
+/// The `org/store/branch` key every fixture below uses by default.
+fn key(branch: &str) -> String {
+    format!("acme/backend/{branch}")
+}
+
+/// Everything a directory-bound command needs: a real server, an in-process agent, a project
+/// directory already `init`ed (fully local — no network calls happen in `ready_fixture` itself)
+/// at `acme/backend`, branch `main`.
 struct Fixture {
     base: String,
     config_path: PathBuf,
     state_path: PathBuf,
     socket: PathBuf,
+    dir: PathBuf,
     user_id: String,
 }
 
-/// Log `user` in against `base`, provision `acme`/`dev`, grant + `use` the DEK, and return a
-/// ready-to-drive [`Fixture`]. Reuses `base`/`socket` if provided (so two "machines" can share one
-/// server), otherwise starts fresh ones.
-async fn ready_fixture(
-    user: &str,
-    base: Option<String>,
-    provision: bool,
-) -> Fixture {
+/// Log `user` in (registering on first use) against `base` (starting a fresh server if `None`)
+/// and `init` a fresh project directory at `acme/backend` (branch `main`) — fully local, no
+/// network calls beyond `login` itself. Reuses `base` if given, so two "machines" (or two
+/// directories) can share one server/account.
+async fn ready_fixture(user: &str, base: Option<String>) -> Fixture {
     let base = match base {
         Some(b) => b,
         None => start_server().await,
@@ -118,143 +103,247 @@ async fn ready_fixture(
     let socket = spawn_agent().await;
     let config_path = temp_config_path();
     let state_path = temp_state_path();
+    let dir = temp_dir();
 
     commands::login(&config_path, &socket, Some(base.clone()), user, format!("pw-{user}"))
         .await
         .unwrap();
-    let id = Config::load_from(&config_path)
-        .unwrap()
-        .find_identity(user)
-        .unwrap()
-        .clone();
+    let id = Config::load_from(&config_path).unwrap().find_identity(user).unwrap().clone();
 
-    if provision {
-        let mut client = SyncClient::new(&base);
-        client.set_token(id.session_token.clone().unwrap());
-        client
-            .create_store(&CreateStoreRequest { name: "acme".into() })
-            .await
-            .unwrap();
-        client
-            .create_env("acme", &CreateEnvRequest { name: "dev".into() })
-            .await
-            .unwrap();
-        grant_dek(
-            &base,
-            id.session_token.as_ref().unwrap(),
-            "acme",
-            "dev",
-            &id.user_id,
-            &id.x25519_pubkey_b64,
-        )
-        .await;
-    }
-
-    commands::context_add(&config_path, "acme-dev", "acme", "dev", user).unwrap();
-    commands::use_context(&config_path, &state_path, &socket, "acme-dev")
-        .await
-        .unwrap();
+    commands::init(
+        &config_path,
+        &socket,
+        &dir,
+        Some("acme".into()),
+        Some("backend".into()),
+        Some("main".into()),
+        None,
+    )
+    .await
+    .expect("init must be fully local and always succeed");
 
     Fixture {
         base,
         config_path,
         state_path,
         socket,
+        dir,
         user_id: id.user_id,
     }
 }
 
-/// The full self-service bootstrap flow, using ONLY real CLI commands (no raw `SyncClient`
-/// bypass like `ready_fixture` uses): register/login, `store create`, `env create` (which
-/// self-grants DEK v1), `context add`, `use`, and finally `set`/`commit`/`run` to prove the
-/// freshly-created environment is genuinely usable end to end.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn store_and_env_create_bootstrap_a_freshly_usable_environment() {
-    let base = start_server().await;
-    let machine = login_only("bootstrapper", &base).await;
+/// A logged-in-but-otherwise-fresh "machine": its own agent/config/state, the user registered
+/// but no project directory bound yet. Used for a share/clone *target* who has no DEK until
+/// shared or cloned.
+struct Machine {
+    config_path: PathBuf,
+    state_path: PathBuf,
+    socket: PathBuf,
+}
 
-    commands::store_create(&machine.config_path, Some("bootstrapper"), "widgets")
+async fn login_only(user: &str, base: &str) -> Machine {
+    let socket = spawn_agent().await;
+    let config_path = temp_config_path();
+    let state_path = temp_state_path();
+    commands::login(&config_path, &socket, Some(base.to_string()), user, format!("pw-{user}"))
         .await
-        .expect("store create");
-    commands::env_create(
-        &machine.config_path,
-        &machine.socket,
-        Some("bootstrapper"),
-        "widgets",
-        "prod",
-    )
-    .await
-    .expect("env create should create the env and self-grant DEK v1");
-
-    commands::context_add(&machine.config_path, "widgets-prod", "widgets", "prod", "bootstrapper")
         .unwrap();
-    commands::use_context(&machine.config_path, &machine.state_path, &machine.socket, "widgets-prod")
-        .await
-        .expect("use should find the self-granted DEK via list_keys, no separate share needed");
+    Machine {
+        config_path,
+        state_path,
+        socket,
+    }
+}
 
-    commands::set(
-        &machine.config_path,
-        &machine.state_path,
-        &machine.socket,
-        "widgets-prod",
-        vec![("WIDGET_KEY".into(), "sk-widget-123".into())],
-    )
-    .await
-    .unwrap();
-    commands::commit(
-        &machine.config_path,
-        &machine.state_path,
-        &machine.socket,
-        "widgets-prod",
-        "first commit in a freshly bootstrapped env".into(),
-    )
-    .await
-    .unwrap();
+fn tip_of(state_path: &std::path::Path, branch_key: &str) -> Hash {
+    LocalState::load_from(state_path)
+        .unwrap()
+        .branch(branch_key)
+        .and_then(|b| b.tip)
+        .unwrap_or_else(|| panic!("no tip recorded for '{branch_key}'"))
+}
 
-    let out = unique("bootstrapout");
+/// Count the object files under `state_path`'s co-located object store (git-style fanout dirs).
+fn count_objects(state_path: &std::path::Path) -> usize {
+    fn walk(p: &std::path::Path) -> usize {
+        let mut n = 0;
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    n += walk(&path);
+                } else {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+    walk(&object_store_dir_for(state_path))
+}
+
+/// The blob hash a committed tree maps `key` to (for asserting a value's ciphertext changed after
+/// rotation without decrypting it).
+fn blob_hash_for_key(state_path: &std::path::Path, tip: Hash, entry_key: &str) -> Hash {
+    let store = open_object_store(&object_store_dir_for(state_path)).unwrap();
+    let commit = Commit::from_bytes(&store.get(&tip).unwrap().unwrap()).unwrap();
+    let tree = Tree::from_bytes(&store.get(&commit.fields.tree_hash).unwrap().unwrap()).unwrap();
+    *tree.entries.get(entry_key).unwrap()
+}
+
+/// Read one env var's value out of `fx`'s current working tree via `wonton run`, for asserting a
+/// result without touching the object store's internals.
+async fn read_via_run(fx: &Fixture, entry_key: &str) -> String {
+    let out = unique(&format!("read-{entry_key}"));
     let out_str = out.to_string_lossy().to_string();
     let code = commands::run(
-        &machine.config_path,
-        &machine.state_path,
-        &machine.socket,
-        "widgets-prod",
-        vec!["sh".into(), "-c".into(), format!("printf '%s' \"$WIDGET_KEY\" > {out_str}")],
+        &fx.config_path,
+        &fx.state_path,
+        &fx.socket,
+        &fx.dir,
+        vec!["sh".into(), "-c".into(), format!("printf '%s' \"${entry_key}\" > {out_str}")],
     )
     .await
     .unwrap();
     assert_eq!(code, 0);
-    assert_eq!(std::fs::read_to_string(&out).unwrap(), "sk-widget-123");
+    let value = std::fs::read_to_string(&out).unwrap();
     let _ = std::fs::remove_file(&out);
+    value
 }
 
-/// A second `store create` with the same name must be an idempotent no-op (`mkdir -p` style),
-/// not an error — a repeated onboarding flow needs to be safe to re-run. Also exercises
+// ---- init / push provisioning --------------------------------------------------------------
+
+/// `wonton init` must be entirely local: no store/branch exists server-side until the first
+/// `push`, at which point `push` provisions the org/store/branch and self-grants DEK v1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn init_is_fully_local_then_push_provisions_and_self_grants() {
+    let base = start_server().await;
+    let fx = ready_fixture("bootstrapper", Some(base.clone())).await;
+
+    let identity = Config::load_from(&fx.config_path).unwrap().find_identity("bootstrapper").unwrap().clone();
+    let mut client = SyncClient::new(&base);
+    client.set_token(identity.session_token.clone().unwrap());
+    let err = client.get_ref("acme", "backend", "main").await.unwrap_err();
+    assert!(
+        matches!(err, wonton_sync::SyncError::NotFound(_) | wonton_sync::SyncError::Forbidden),
+        "branch must not exist server-side right after init, got {err:?}"
+    );
+
+    commands::set(
+        &fx.config_path,
+        &fx.state_path,
+        &fx.socket,
+        &fx.dir,
+        vec![("WIDGET_KEY".into(), "sk-widget-123".into())],
+    )
+    .await
+    .unwrap();
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "first commit".into())
+        .await
+        .unwrap();
+
+    let out = unique("bootstrapout");
+    let out_str = out.to_string_lossy().to_string();
+    let code = commands::run(
+        &fx.config_path,
+        &fx.state_path,
+        &fx.socket,
+        &fx.dir,
+        vec!["sh".into(), "-c".into(), format!("printf '%s' \"$WIDGET_KEY\" > {out_str}")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "set/commit/run must all work offline before any push");
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "sk-widget-123");
+    let _ = std::fs::remove_file(&out);
+
+    commands::push(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir)
+        .await
+        .expect("push must provision org/store/branch and self-grant");
+
+    let state = LocalState::load_from(&fx.state_path).unwrap();
+    assert_eq!(state.branch(&key("main")).unwrap().dek_version, 1);
+
+    let ref_now = client.get_ref("acme", "backend", "main").await.unwrap();
+    assert!(ref_now.is_some(), "branch must exist server-side after push");
+}
+
+/// A second, independently-`init`ed local workspace for the SAME org/store/branch (its own
+/// unrelated DEK) must hard-fail on `push` once the branch already exists — there is no
+/// cryptographic way to reconcile two different DEKs, so this must not silently "win" or merge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_workspace_that_inits_same_name_before_pushing_is_rejected_on_push() {
+    let base = start_server().await;
+    let a = ready_fixture("racer", Some(base.clone())).await;
+    commands::set(&a.config_path, &a.state_path, &a.socket, &a.dir, vec![("K".into(), "a-value".into())])
+        .await
+        .unwrap();
+    commands::commit(&a.config_path, &a.state_path, &a.socket, &a.dir, "a's commit".into())
+        .await
+        .unwrap();
+    commands::push(&a.config_path, &a.state_path, &a.socket, &a.dir).await.unwrap();
+
+    // A second local workspace (same identity, but a fresh agent => a genuinely different
+    // randomly-generated DEK), `init`ed independently for the exact same org/store/branch.
+    let b = ready_fixture("racer", Some(base.clone())).await;
+    commands::set(&b.config_path, &b.state_path, &b.socket, &b.dir, vec![("K".into(), "b-value".into())])
+        .await
+        .unwrap();
+    commands::commit(&b.config_path, &b.state_path, &b.socket, &b.dir, "b's commit".into())
+        .await
+        .unwrap();
+
+    let err = commands::push(&b.config_path, &b.state_path, &b.socket, &b.dir).await.unwrap_err();
+    assert!(err.to_string().contains("already exists"), "got: {err}");
+}
+
+/// `init` refuses to clobber a `wonton.toml` that already names a different org/store, and is a
+/// no-op (not an error) when re-run with the exact same org/store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn init_refuses_to_clobber_a_different_projects_marker() {
+    let base = start_server().await;
+    let fx = ready_fixture("initclobber", Some(base)).await;
+
+    commands::init(
+        &fx.config_path,
+        &fx.socket,
+        &fx.dir,
+        Some("acme".into()),
+        Some("backend".into()),
+        Some("main".into()),
+        None,
+    )
+    .await
+    .expect("re-init with the same org/store is a no-op");
+
+    let err = commands::init(
+        &fx.config_path,
+        &fx.socket,
+        &fx.dir,
+        Some("acme".into()),
+        Some("other-store".into()),
+        Some("main".into()),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("refusing to overwrite"), "got: {err}");
+}
+
+// ---- store create (advanced/manual path) --------------------------------------------------
+
+/// A second `store create` with the same org/name must be an idempotent no-op (`mkdir -p`
+/// style), not an error — a repeated onboarding flow needs to be safe to re-run. Also exercises
 /// `--identity` being omitted entirely: with exactly one identity logged in, it must be inferred
 /// without error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn store_create_is_idempotent_on_a_duplicate_name() {
     let base = start_server().await;
     let machine = login_only("dupstore", &base).await;
-    commands::store_create(&machine.config_path, None, "acme").await.unwrap();
-    commands::store_create(&machine.config_path, None, "acme")
+    commands::store_create(&machine.config_path, None, "dupstore", "acme").await.unwrap();
+    commands::store_create(&machine.config_path, None, "dupstore", "acme")
         .await
-        .expect("re-creating an existing store must be a no-op, not an error");
-}
-
-/// `env create` on an environment that already exists must be a no-op too, and — critically —
-/// must NOT attempt the DEK self-grant bootstrap (that would be wrong: the caller didn't just
-/// create this environment, so self-granting into it isn't theirs to do).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn env_create_is_idempotent_and_skips_bootstrap_on_an_existing_env() {
-    let base = start_server().await;
-    let machine = login_only("dupenv", &base).await;
-    commands::store_create(&machine.config_path, None, "acme").await.unwrap();
-    commands::env_create(&machine.config_path, &machine.socket, None, "acme", "dev")
-        .await
-        .expect("first creation succeeds and self-grants");
-    commands::env_create(&machine.config_path, &machine.socket, None, "acme", "dev")
-        .await
-        .expect("re-creating an existing env must be a no-op, not an error");
+        .expect("re-creating an existing org/store must be a no-op, not an error");
 }
 
 /// With more than one identity cached in the same config, omitting `--identity` must be a clear
@@ -271,162 +360,266 @@ async fn store_create_without_identity_errors_clearly_when_ambiguous() {
         .await
         .unwrap();
 
-    let err = commands::store_create(&config_path, None, "acme").await.unwrap_err();
+    let err = commands::store_create(&config_path, None, "multi-a", "acme").await.unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("multi-a") && msg.contains("multi-b"), "got: {msg}");
 }
 
-/// `switch` is purely local: no server, no agent, and it persists the branch.
-#[tokio::test]
-async fn switch_is_local_and_persists() {
-    let state_path = temp_state_path();
-    commands::switch(&state_path, "acme-dev", "feature", true).unwrap();
-    let state = crate::state::LocalState::load_from(&state_path).unwrap();
-    assert_eq!(state.context("acme-dev").unwrap().branch, "feature");
+// ---- branch list / switch / create ---------------------------------------------------------
+
+/// `wonton branch` (list) shows the current branch; `branch -b <name>` creates one with its own
+/// DEK and switches to it (purely local, no network).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn branch_create_and_switch_are_local_and_update_the_marker() {
+    let base = start_server().await;
+    let fx = ready_fixture("brancher", Some(base)).await;
+
+    assert_eq!(crate::config::read_local_branch(&fx.dir), Some("main".to_string()));
+
+    commands::branch_create(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "feature", None, None)
+        .await
+        .expect("creating a branch with no --from is fully local");
+    assert_eq!(crate::config::read_local_branch(&fx.dir), Some("feature".to_string()));
+
+    // Creating the same name again must be rejected, not silently overwritten.
+    let err = commands::branch_create(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "feature", None, None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("already exists"), "got: {err}");
+
+    commands::branch_switch(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "main")
+        .await
+        .expect("switching back to main");
+    assert_eq!(crate::config::read_local_branch(&fx.dir), Some("main".to_string()));
 }
 
-/// A typo'd branch name must be a clear error, not a silently-created empty branch — `--create`
-/// is required to switch to one with no local history yet.
-#[tokio::test]
-async fn switch_without_create_rejects_an_unknown_branch() {
-    let state_path = temp_state_path();
-    let err = commands::switch(&state_path, "acme-dev", "mian", false).unwrap_err();
-    assert!(err.to_string().contains("--create"), "got: {err}");
-    let state = crate::state::LocalState::load_from(&state_path).unwrap();
-    assert!(
-        state.context("acme-dev").is_none(),
-        "a rejected switch must not create or mutate any context state"
-    );
+/// `branch -b <name> --from <source>` seeds the new branch's first commit from the source
+/// branch's current values, re-encrypted under the new branch's own (different) DEK.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn branch_create_from_source_seeds_a_root_commit_under_its_own_dek() {
+    let base = start_server().await;
+    let fx = ready_fixture("forker", Some(base)).await;
+    commands::set(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, vec![("K".into(), "v".into())])
+        .await
+        .unwrap();
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "root".into())
+        .await
+        .unwrap();
+
+    commands::branch_create(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "dev", Some("main"), None)
+        .await
+        .expect("forking from main");
+
+    let state = LocalState::load_from(&fx.state_path).unwrap();
+    let dev = state.branch(&key("dev")).unwrap();
+    let root = dev.tip.expect("branch -b --from must produce a root commit");
+    assert_eq!(dev.forked_from.as_ref().unwrap().branch, key("main"));
+    assert_eq!(dev.forked_from.as_ref().unwrap().root, root);
+
+    // The value is readable on "dev" (re-encrypted under dev's own DEK).
+    assert_eq!(read_via_run(&fx, "K").await, "v");
+
+    // And the object it's stored under is genuinely different ciphertext from main's own blob
+    // for the same key (different DEK+nonce), even though the plaintext is identical.
+    let main_tip = tip_of(&fx.state_path, &key("main"));
+    let main_hash = blob_hash_for_key(&fx.state_path, main_tip, "K");
+    let dev_hash = blob_hash_for_key(&fx.state_path, root, "K");
+    assert_ne!(main_hash, dev_hash, "forked branch must re-encrypt under its own DEK, not reuse the source's blob");
 }
 
-/// Switching back to a branch already recorded in `tips` (or the branch already selected) must
-/// not require `--create` — this is the common case (going back and forth between branches you
-/// already have local history on).
-#[tokio::test]
-async fn switch_without_create_allows_an_already_known_branch() {
-    let state_path = temp_state_path();
-    // A fresh context defaults to "main" -- switching to the branch you're already on needs no
-    // --create even before anything has ever been committed.
-    commands::switch(&state_path, "acme-dev", "main", false)
-        .expect("switching to the already-selected default branch needs no --create");
+/// `wonton branch` (list) must succeed and exercise the "sync with remote" path (it queries
+/// `list_branches` on the server, not just locally-known state) — here that reconfirms the one
+/// branch bob cloned, but the point is the network round-trip doesn't error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn branch_list_succeeds_and_syncs_with_remote() {
+    let owner = ready_fixture("blistowner", None).await;
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("K".into(), "v".into())])
+        .await
+        .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "c1".into())
+        .await
+        .unwrap();
+    commands::push(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir).await.unwrap();
 
-    // Seed "feature" directly into tips (as a `pull` or a merge-base fork would), simulating a
-    // branch we already have local history for -- switching to it needs no --create either.
-    fork_branch(&state_path, "acme-dev", "feature", Hash::of(b"root"));
-    commands::switch(&state_path, "acme-dev", "feature", false)
-        .expect("switching to a branch already present in tips needs no --create");
+    let bob = login_only("blistbob", &owner.base).await;
+    commands::share(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, None, "blistbob", Role::Reader)
+        .await
+        .unwrap();
+    let bob_dir = temp_dir();
+    commands::clone(&bob.config_path, &bob.state_path, &bob.socket, &bob_dir, "acme", "backend", Some("main"), None)
+        .await
+        .unwrap();
+
+    commands::branch_list(&bob.config_path, &bob.state_path, &bob_dir)
+        .await
+        .expect("branch list must succeed and sync with remote");
 }
+
+/// `status` must work cleanly across every remote-comparison state: before any push
+/// (`dek_version == 0`, nothing to compare), right after a push (up to date), and after a local
+/// commit that hasn't been pushed yet (ahead).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_reports_across_not_yet_pushed_up_to_date_and_ahead_states() {
+    let fx = ready_fixture("statuscheck", None).await;
+    commands::status(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir)
+        .await
+        .expect("status must work before any push");
+
+    commands::set(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, vec![("K".into(), "v".into())])
+        .await
+        .unwrap();
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "c1".into())
+        .await
+        .unwrap();
+    commands::push(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir).await.unwrap();
+    commands::status(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir)
+        .await
+        .expect("status must work right after push (up to date)");
+
+    commands::set(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, vec![("K2".into(), "v2".into())])
+        .await
+        .unwrap();
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "c2".into())
+        .await
+        .unwrap();
+    commands::status(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir)
+        .await
+        .expect("status must work while ahead of the remote (unpushed local commit)");
+}
+
+/// A project's `wonton.toml` `server` field must narrow identity resolution: with two
+/// identities logged into two DIFFERENT servers, a directory-bound command picks the one
+/// matching this project's server, with no ambiguity error and no `--identity` needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identity_resolution_is_scoped_by_the_projects_server() {
+    let base_a = start_server().await;
+    let base_b = start_server().await;
+    let socket = spawn_agent().await;
+    let config_path = temp_config_path();
+    let state_path = temp_state_path();
+
+    // Two identities, same local config, but logged into two DIFFERENT servers.
+    commands::login(&config_path, &socket, Some(base_a.clone()), "alice-a", "pw-a".into())
+        .await
+        .unwrap();
+    commands::login(&config_path, &socket, Some(base_b.clone()), "alice-b", "pw-b".into())
+        .await
+        .unwrap();
+
+    let dir = temp_dir();
+    // `init` has no project server yet to narrow by, so the whole-list ambiguity still applies
+    // there — pass --identity explicitly for the bootstrap step itself.
+    commands::init(
+        &config_path,
+        &socket,
+        &dir,
+        Some("acme".into()),
+        Some("backend".into()),
+        Some("main".into()),
+        Some("alice-a"),
+    )
+    .await
+    .unwrap();
+
+    // But now that wonton.toml names base_a's server, an ordinary directory-bound command needs
+    // NO --identity at all, despite two identities being cached locally — the project's server
+    // narrows it to exactly one.
+    commands::status(&config_path, &state_path, &socket, &dir)
+        .await
+        .expect("must resolve unambiguously via the project's declared server");
+}
+
+// ---- the VCS porcelain ----------------------------------------------------------------------
 
 /// `set` stages an encrypted blob; `status` runs; `unset` overwrites it with a tombstone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_status_and_unset_manage_the_staging_area() {
-    let fx = ready_fixture("erin", None, true).await;
+    let fx = ready_fixture("erin", None).await;
 
     commands::set(
         &fx.config_path,
         &fx.state_path,
         &fx.socket,
-        "acme-dev",
+        &fx.dir,
         vec![("API_KEY".into(), "sk-live-123".into())],
     )
     .await
     .unwrap();
 
-    let state = crate::state::LocalState::load_from(&fx.state_path).unwrap();
-    let staged = &state.context("acme-dev").unwrap().staged;
-    assert!(matches!(
-        staged.get("API_KEY"),
-        Some(crate::state::StagedEntry::Set(_))
-    ));
+    let state = LocalState::load_from(&fx.state_path).unwrap();
+    let staged = &state.branch(&key("main")).unwrap().staged;
+    assert!(matches!(staged.get("API_KEY"), Some(crate::state::StagedEntry::Set(_))));
 
     // status must run without error against the staged tree.
-    commands::status(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev")
-        .await
-        .unwrap();
+    commands::status(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir).await.unwrap();
 
     // `unset` replaces the staged Set with an Unset tombstone.
-    commands::unset(&fx.config_path, &fx.state_path, "acme-dev", vec!["API_KEY".into()]).unwrap();
-    let state = crate::state::LocalState::load_from(&fx.state_path).unwrap();
+    commands::unset(&fx.config_path, &fx.state_path, &fx.dir, vec!["API_KEY".into()]).unwrap();
+    let state = LocalState::load_from(&fx.state_path).unwrap();
     assert_eq!(
-        state.context("acme-dev").unwrap().staged.get("API_KEY"),
+        state.branch(&key("main")).unwrap().staged.get("API_KEY"),
         Some(&crate::state::StagedEntry::Unset)
     );
 }
 
 /// `commit` clears staging, advances the tip, and `log` shows the commit with the REAL
-/// server-assigned `author_id` (`Uuid::parse_str(user_id)`), not the old placeholder derivation.
+/// server-assigned `author_id`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_advances_tip_and_log_shows_real_author_id() {
-    let fx = ready_fixture("frank", None, true).await;
+    let fx = ready_fixture("frank", None).await;
 
     commands::set(
         &fx.config_path,
         &fx.state_path,
         &fx.socket,
-        "acme-dev",
+        &fx.dir,
         vec![("DATABASE_URL".into(), "postgres://x".into())],
     )
     .await
     .unwrap();
-    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", "initial".into())
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "initial".into())
         .await
         .unwrap();
 
-    let state = crate::state::LocalState::load_from(&fx.state_path).unwrap();
-    let cs = state.context("acme-dev").unwrap();
-    assert!(cs.staged.is_empty(), "staging must be cleared after commit");
-    let tip = *cs.tips.get("main").expect("tip advanced");
+    let state = LocalState::load_from(&fx.state_path).unwrap();
+    let bs = state.branch(&key("main")).unwrap();
+    assert!(bs.staged.is_empty(), "staging must be cleared after commit");
+    let tip = bs.tip.expect("tip advanced");
 
-    // Read the commit back and check its author_id is the parsed real user_id.
-    let store = crate::state::open_object_store(
-        &crate::state::object_store_dir_for(&fx.state_path),
-    )
-    .unwrap();
+    let store = open_object_store(&object_store_dir_for(&fx.state_path)).unwrap();
     let bytes = store.get(&tip).unwrap().unwrap();
-    let commit = wonton_objects::Commit::from_bytes(&bytes).unwrap();
-    assert_eq!(
-        commit.fields.author_id,
-        uuid::Uuid::parse_str(&fx.user_id).unwrap()
-    );
+    let commit = Commit::from_bytes(&bytes).unwrap();
+    assert_eq!(commit.fields.author_id, uuid::Uuid::parse_str(&fx.user_id).unwrap());
     assert_eq!(commit.fields.message, "initial");
 
-    // `log` runs and verifies the signature against the identity's own pubkey.
-    commands::log(&fx.config_path, &fx.state_path, "acme-dev").await.unwrap();
+    commands::log(&fx.config_path, &fx.state_path, &fx.dir).await.unwrap();
 }
 
 /// `diff` between two real commits reports the right Added/Changed keys, and re-committing an
-/// identical value must NOT report `Changed` (mirrors `wonton-vcs`'s critical test).
+/// identical value must NOT report `Changed`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn diff_reports_added_and_changed_but_not_unchanged() {
-    let fx = ready_fixture("grace", None, true).await;
+    let fx = ready_fixture("grace", None).await;
 
-    // c1: A=apple, B=banana
     commands::set(
         &fx.config_path,
         &fx.state_path,
         &fx.socket,
-        "acme-dev",
+        &fx.dir,
         vec![("A".into(), "apple".into()), ("B".into(), "banana".into())],
     )
     .await
     .unwrap();
-    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", "c1".into())
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "c1".into())
         .await
         .unwrap();
-    let c1 = *crate::state::LocalState::load_from(&fx.state_path)
-        .unwrap()
-        .context("acme-dev")
-        .unwrap()
-        .tips
-        .get("main")
-        .unwrap();
+    let c1 = tip_of(&fx.state_path, &key("main"));
 
-    // c2: A=apple (same value, re-encrypted), B=blueberry (changed), C=cherry (added)
     commands::set(
         &fx.config_path,
         &fx.state_path,
         &fx.socket,
-        "acme-dev",
+        &fx.dir,
         vec![
             ("A".into(), "apple".into()),
             ("B".into(), "blueberry".into()),
@@ -435,45 +628,27 @@ async fn diff_reports_added_and_changed_but_not_unchanged() {
     )
     .await
     .unwrap();
-    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", "c2".into())
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "c2".into())
         .await
         .unwrap();
-    let c2 = *crate::state::LocalState::load_from(&fx.state_path)
-        .unwrap()
-        .context("acme-dev")
-        .unwrap()
-        .tips
-        .get("main")
+    let c2 = tip_of(&fx.state_path, &key("main"));
+
+    let entries = commands::diff(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, Some(c1.to_hex()), Some(c2.to_hex()))
+        .await
         .unwrap();
 
-    let entries = commands::diff(
-        &fx.config_path,
-        &fx.state_path,
-        &fx.socket,
-        "acme-dev",
-        Some(c1.to_hex()),
-        Some(c2.to_hex()),
-    )
-    .await
-    .unwrap();
-
     use wonton_vcs::DiffEntry;
-    assert_eq!(
-        entries,
-        vec![DiffEntry::Changed("B".into()), DiffEntry::Added("C".into())]
-    );
+    assert_eq!(entries, vec![DiffEntry::Changed("B".into()), DiffEntry::Added("C".into())]);
     assert!(
         !entries.iter().any(|e| matches!(e, DiffEntry::Changed(k) if k == "A")),
         "re-committing the same value must not show Changed"
     );
 
-    // `diff` must accept an unambiguous hash *prefix* too, not just the full 64-char hex hash
-    // (git-style abbreviation) -- exercise a short one on both arguments.
     let entries_short = commands::diff(
         &fx.config_path,
         &fx.state_path,
         &fx.socket,
-        "acme-dev",
+        &fx.dir,
         Some(c1.to_hex()[..10].to_string()),
         Some(c2.to_hex()[..10].to_string()),
     )
@@ -486,20 +661,20 @@ async fn diff_reports_added_and_changed_but_not_unchanged() {
 /// errors — never a panic or a silent empty diff.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn diff_rejects_an_unknown_prefix_and_malformed_input() {
-    let fx = ready_fixture("prefixerr", None, true).await;
-    commands::set(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", vec![("K".into(), "v".into())])
+    let fx = ready_fixture("prefixerr", None).await;
+    commands::set(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, vec![("K".into(), "v".into())])
         .await
         .unwrap();
-    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", "root".into())
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "root".into())
         .await
         .unwrap();
 
-    let err = commands::diff(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", Some("deadbeef00".into()), None)
+    let err = commands::diff(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, Some("deadbeef00".into()), None)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("no commit matches"), "got: {err}");
 
-    let err = commands::diff(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", Some("not-hex!!".into()), None)
+    let err = commands::diff(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, Some("not-hex!!".into()), None)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("not a valid commit hash"), "got: {err}");
@@ -509,81 +684,38 @@ async fn diff_rejects_an_unknown_prefix_and_malformed_input() {
 /// propagates its exit code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_injects_secrets_as_env_vars() {
-    let fx = ready_fixture("heidi", None, true).await;
+    let fx = ready_fixture("heidi", None).await;
 
-    commands::set(
-        &fx.config_path,
-        &fx.state_path,
-        &fx.socket,
-        "acme-dev",
-        vec![("MY_SECRET".into(), "hunter2".into())],
-    )
-    .await
-    .unwrap();
-    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", "c1".into())
+    commands::set(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, vec![("MY_SECRET".into(), "hunter2".into())])
+        .await
+        .unwrap();
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "c1".into())
         .await
         .unwrap();
 
-    let out = unique("runout");
-    let out_str = out.to_string_lossy().to_string();
-    let code = commands::run(
-        &fx.config_path,
-        &fx.state_path,
-        &fx.socket,
-        "acme-dev",
-        vec![
-            "sh".into(),
-            "-c".into(),
-            format!("printf '%s' \"$MY_SECRET\" > {out_str}"),
-        ],
-    )
-    .await
-    .unwrap();
-    assert_eq!(code, 0);
-    assert_eq!(std::fs::read_to_string(&out).unwrap(), "hunter2");
-    let _ = std::fs::remove_file(&out);
+    assert_eq!(read_via_run(&fx, "MY_SECRET").await, "hunter2");
 }
 
 /// `export --format dotenv` writes a file whose parsed content matches the committed + staged
 /// values. (The plaintext warning is emitted to stderr; we assert the file's correctness.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn export_writes_dotenv_matching_the_working_tree() {
-    let fx = ready_fixture("ivan", None, true).await;
+    let fx = ready_fixture("ivan", None).await;
 
-    commands::set(
-        &fx.config_path,
-        &fx.state_path,
-        &fx.socket,
-        "acme-dev",
-        vec![("TOKEN".into(), "abc123".into())],
-    )
-    .await
-    .unwrap();
-    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", "c1".into())
+    commands::set(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, vec![("TOKEN".into(), "abc123".into())])
         .await
         .unwrap();
-    // Stage an additional value on top of the committed one; export uses tip + staged overlay.
-    commands::set(
-        &fx.config_path,
-        &fx.state_path,
-        &fx.socket,
-        "acme-dev",
-        vec![("EXTRA".into(), "with space".into())],
-    )
-    .await
-    .unwrap();
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "c1".into())
+        .await
+        .unwrap();
+    commands::set(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, vec![("EXTRA".into(), "with space".into())])
+        .await
+        .unwrap();
 
     let out = unique("dotenv");
-    commands::export(
-        &fx.config_path,
-        &fx.state_path,
-        &fx.socket,
-        "acme-dev",
-        commands::ExportFormat::Dotenv,
-        &out,
-    )
-    .await
-    .unwrap();
+    commands::export(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, commands::ExportFormat::Dotenv, &out)
+        .await
+        .unwrap();
 
     let contents = std::fs::read_to_string(&out).unwrap();
     assert!(contents.contains("TOKEN=abc123\n"), "got: {contents}");
@@ -591,56 +723,44 @@ async fn export_writes_dotenv_matching_the_working_tree() {
     let _ = std::fs::remove_file(&out);
 }
 
-/// End-to-end: machine A commits + pushes; a second machine (fresh config/state/store + fresh
-/// agent) logs in as the same user, `use`s the DEK, pulls, and sees the same tip and the same
-/// decrypted value.
+/// End-to-end: machine A commits + pushes; a second, fresh directory (`clone`, same account —
+/// mirrors "two machines sharing one account") auto-unwraps the self-granted DEK and
+/// auto-pulls the history immediately, seeing the same tip and the same decrypted value with
+/// zero extra commands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn push_then_fresh_machine_pull_sees_the_same_secrets() {
-    // Machine A: provision + grant + commit + push.
-    let a = ready_fixture("judy", None, true).await;
-    commands::set(
-        &a.config_path,
-        &a.state_path,
-        &a.socket,
-        "acme-dev",
-        vec![("SHARED".into(), "top-secret".into())],
-    )
-    .await
-    .unwrap();
-    commands::commit(&a.config_path, &a.state_path, &a.socket, "acme-dev", "seed".into())
+async fn push_then_fresh_clone_sees_the_same_secrets() {
+    let a = ready_fixture("judy", None).await;
+    commands::set(&a.config_path, &a.state_path, &a.socket, &a.dir, vec![("SHARED".into(), "top-secret".into())])
         .await
         .unwrap();
-    commands::push(&a.config_path, &a.state_path, "acme-dev").await.unwrap();
-    let a_tip = *crate::state::LocalState::load_from(&a.state_path)
-        .unwrap()
-        .context("acme-dev")
-        .unwrap()
-        .tips
-        .get("main")
+    commands::commit(&a.config_path, &a.state_path, &a.socket, &a.dir, "seed".into())
+        .await
+        .unwrap();
+    commands::push(&a.config_path, &a.state_path, &a.socket, &a.dir).await.unwrap();
+    let a_tip = tip_of(&a.state_path, &key("main"));
+
+    let socket = spawn_agent().await;
+    let config_path = temp_config_path();
+    let state_path = temp_state_path();
+    let dir = temp_dir();
+    commands::login(&config_path, &socket, Some(a.base.clone()), "judy", "pw-judy".into())
+        .await
+        .unwrap();
+    commands::clone(&config_path, &state_path, &socket, &dir, "acme", "backend", Some("main"), None)
+        .await
         .unwrap();
 
-    // Machine B: same user + server, but fresh socket/config/state (⇒ fresh object store).
-    let b = ready_fixture("judy", Some(a.base.clone()), false).await;
-    commands::pull(&b.config_path, &b.state_path, "acme-dev").await.unwrap();
+    let b_tip = tip_of(&state_path, &key("main"));
+    assert_eq!(a_tip, b_tip, "clone should fast-forward to A's tip immediately");
 
-    let b_tip = *crate::state::LocalState::load_from(&b.state_path)
-        .unwrap()
-        .context("acme-dev")
-        .unwrap()
-        .tips
-        .get("main")
-        .unwrap();
-    assert_eq!(a_tip, b_tip, "machine B should have fast-forwarded to A's tip");
-
-    // Machine B can `log` (verify) and decrypt the value via `run`.
-    commands::log(&b.config_path, &b.state_path, "acme-dev").await.unwrap();
+    commands::log(&config_path, &state_path, &dir).await.unwrap();
     let out = unique("bpull");
     let out_str = out.to_string_lossy().to_string();
     let code = commands::run(
-        &b.config_path,
-        &b.state_path,
-        &b.socket,
-        "acme-dev",
+        &config_path,
+        &state_path,
+        &socket,
+        &dir,
         vec!["sh".into(), "-c".into(), format!("printf '%s' \"$SHARED\" > {out_str}")],
     )
     .await
@@ -649,6 +769,53 @@ async fn push_then_fresh_machine_pull_sees_the_same_secrets() {
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "top-secret");
     let _ = std::fs::remove_file(&out);
 }
+
+/// The join flow: before being `share`d, the target's first command clearly reports "no
+/// access"; after `share`, the very next command (no separate `use`/`pull`) just works —
+/// auto-unwrapping the DEK and auto-pulling the history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clone_reports_no_access_then_works_after_share() {
+    let owner = ready_fixture("cloneowner", None).await;
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("SHARED".into(), "top-secret".into())])
+        .await
+        .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "seed".into())
+        .await
+        .unwrap();
+    commands::push(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir).await.unwrap();
+
+    let bob = login_only("cloneBob", &owner.base).await;
+    let bob_dir = temp_dir();
+    commands::clone(&bob.config_path, &bob.state_path, &bob.socket, &bob_dir, "acme", "backend", Some("main"), None)
+        .await
+        .expect("clone itself just writes markers; it doesn't require access");
+
+    let err = commands::run(&bob.config_path, &bob.state_path, &bob.socket, &bob_dir, vec!["true".into()])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("don't have access"), "got: {err}");
+
+    commands::share(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, None, "cloneBob", Role::Reader)
+        .await
+        .unwrap();
+
+    let out = unique("cloneout");
+    let out_str = out.to_string_lossy().to_string();
+    let code = commands::run(
+        &bob.config_path,
+        &bob.state_path,
+        &bob.socket,
+        &bob_dir,
+        vec!["sh".into(), "-c".into(), format!("printf '%s' \"$SHARED\" > {out_str}")],
+    )
+    .await
+    .expect("the next command after being shared must just work: auto-unwrap + auto-pull");
+    assert_eq!(code, 0);
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "top-secret");
+    let _ = std::fs::remove_file(&out);
+}
+
+// ---- login / whoami --------------------------------------------------------------------------
 
 /// A first-time `login` on a brand-new username registers, unlocks the agent, and ends with a
 /// valid cached session token + user_id in config.
@@ -739,8 +906,6 @@ async fn login_existing_user_does_not_reregister() {
         .await
         .expect("initial login registers bob");
 
-    // Lock, then log in again WITHOUT --server (reused from config). Must take the existing-user
-    // path (login_start succeeds), not attempt a second register (which would 409).
     agent::lock(&socket).await.unwrap();
     commands::login(&config_path, &socket, None, "bob", "pw-bob".into())
         .await
@@ -754,290 +919,94 @@ async fn login_existing_user_does_not_reregister() {
     assert!(status.unlocked);
 }
 
-/// Provision a store + env, grant the logged-in identity a real wrapped DEK, then `context add`
-/// + `use`: `use` succeeds and the agent's status afterward shows the context cached.
+/// `login` with no `--server` and no already-known identity falls back to the global config's
+/// `default_server` (set via `wonton config set-server`) instead of erroring.
 #[tokio::test]
-async fn context_add_and_use_unwraps_the_dek() {
+async fn login_falls_back_to_the_configured_default_server() {
     let base = start_server().await;
     let socket = spawn_agent().await;
     let config_path = temp_config_path();
 
-    let state_path = temp_state_path();
-    commands::login(&config_path, &socket, Some(base.clone()), "carol", "pw-carol".into())
+    commands::config_set_server(&config_path, &base).unwrap();
+    commands::login(&config_path, &socket, None, "dana", "pw-dana".into())
         .await
-        .unwrap();
-    let id = Config::load_from(&config_path)
-        .unwrap()
-        .find_identity("carol")
-        .unwrap()
-        .clone();
+        .expect("login should fall back to the configured default server");
 
-    // As carol (admin of the env she creates), provision and grant herself a DEK — mirroring what
-    // a real `wonton share` would do in a later phase.
-    let mut client = SyncClient::new(&base);
-    client.set_token(id.session_token.clone().unwrap());
-    client
-        .create_store(&CreateStoreRequest { name: "acme".into() })
-        .await
-        .unwrap();
-    client
-        .create_env("acme", &CreateEnvRequest { name: "dev".into() })
-        .await
-        .unwrap();
-
-    let dek = generate_dek();
-    let x_bytes = STANDARD.decode(&id.x25519_pubkey_b64).unwrap();
-    let x25519: [u8; 32] = x_bytes.as_slice().try_into().unwrap();
-    let sealed = wrap_dek(&dek, &x25519);
-    client
-        .grant_key(
-            "acme",
-            "dev",
-            &GrantKeyRequest {
-                user_id: id.user_id.clone(),
-                dek_version: 1,
-                sealed_box: STANDARD.encode(&sealed.0),
-            },
-        )
-        .await
-        .unwrap();
-
-    commands::context_add(&config_path, "acme-dev", "acme", "dev", "carol").unwrap();
-    commands::use_context(&config_path, &state_path, &socket, "acme-dev")
-        .await
-        .expect("use should unwrap the granted DEK");
-
-    let status = agent::status(&socket).await.unwrap();
-    assert!(
-        status.cached_contexts.contains(&"acme-dev".to_string()),
-        "agent should have cached the context's DEK, got {:?}",
-        status.cached_contexts
-    );
     let config = Config::load_from(&config_path).unwrap();
-    assert_eq!(config.current_context.as_deref(), Some("acme-dev"));
-    // `use` persisted the granted DEK version (1) into state.toml for `share`/`rotate` to read.
-    let state = crate::state::LocalState::load_from(&state_path).unwrap();
-    assert_eq!(state.context("acme-dev").unwrap().dek_version, 1);
-
-    // Re-using an already-cached context is cheap and still succeeds.
-    commands::use_context(&config_path, &state_path, &socket, "acme-dev")
-        .await
-        .expect("re-use of a cached context should succeed");
+    let id = config.find_identity("dana").unwrap();
+    assert_eq!(id.server_url, base);
 }
 
-/// `use` on a context where no wrapped-DEK entry exists for the identity fails with a clear
-/// "you don't have access" error (not a crash / generic 404). Here the user is a member (admin of
-/// the env she created) so `list_keys` succeeds, but no DEK was ever granted to her.
+/// With no `--server`, no already-known identity, and no configured default, `login` must still
+/// error clearly rather than panic — and the error should point at how to fix it either way.
 #[tokio::test]
-async fn use_without_a_granted_dek_reports_no_access() {
-    let base = start_server().await;
+async fn login_without_any_server_source_errors_clearly() {
     let socket = spawn_agent().await;
     let config_path = temp_config_path();
 
-    let state_path = temp_state_path();
-    commands::login(&config_path, &socket, Some(base.clone()), "dave", "pw-dave".into())
+    let err = commands::login(&config_path, &socket, None, "erin", "pw-erin".into())
         .await
-        .unwrap();
-    let id = Config::load_from(&config_path)
-        .unwrap()
-        .find_identity("dave")
-        .unwrap()
-        .clone();
+        .unwrap_err();
+    assert!(err.to_string().contains("wonton config set-server"), "got: {err}");
+}
 
-    let mut client = SyncClient::new(&base);
-    client.set_token(id.session_token.clone().unwrap());
-    client
-        .create_store(&CreateStoreRequest { name: "acme".into() })
-        .await
-        .unwrap();
-    client
-        .create_env("acme", &CreateEnvRequest { name: "prod".into() })
-        .await
-        .unwrap();
-    // NOTE: no grant_key — dave has no wrapped DEK for prod.
+/// `config set-server` persists across loads, and `config show` reports it; before it's ever
+/// set, `config show` says so explicitly instead of printing nothing.
+#[test]
+fn config_set_server_persists_and_show_reports_it() {
+    let config_path = temp_config_path();
 
-    commands::context_add(&config_path, "acme-prod", "acme", "prod", "dave").unwrap();
-    let err = commands::use_context(&config_path, &state_path, &socket, "acme-prod")
-        .await
-        .expect_err("use must fail with no granted DEK");
-    assert!(
-        err.to_string().contains("don't have access"),
-        "expected an access error, got: {err}"
-    );
+    commands::config_show(&config_path).unwrap(); // no default yet — must not error
 
-    // The context was NOT selected on failure.
+    commands::config_set_server(&config_path, "https://wonton.example.com").unwrap();
     let config = Config::load_from(&config_path).unwrap();
-    assert_eq!(config.current_context, None);
+    assert_eq!(config.default_server, Some("https://wonton.example.com".to_string()));
+
+    // Setting it again overwrites rather than erroring or duplicating.
+    commands::config_set_server(&config_path, "https://wonton2.example.com").unwrap();
+    let config = Config::load_from(&config_path).unwrap();
+    assert_eq!(config.default_server, Some("https://wonton2.example.com".to_string()));
 }
 
-/// `context add` refuses to reference an identity that isn't in the config.
+/// A directory with no `wonton.toml` anywhere in its ancestry is a clear error pointing at
+/// `init`/`clone`, not a panic or a silent no-op.
 #[tokio::test]
-async fn context_add_rejects_unknown_identity() {
-    let config_path = temp_config_path();
-    let err = commands::context_add(&config_path, "ctx", "acme", "dev", "ghost")
-        .expect_err("unknown identity should be rejected");
-    assert!(err.to_string().contains("no identity named 'ghost'"), "got: {err}");
-}
-
-/// `link` writes a `.wonton` marker, is idempotent for the same context, and refuses to clobber a
-/// marker naming a different context.
-#[tokio::test]
-async fn link_writes_marker_and_refuses_to_clobber_a_different_context() {
-    let config_path = temp_config_path();
-    // Seed two contexts (they need an identity to exist first).
-    let mut config = Config::default();
-    config.upsert_identity(crate::config::Identity {
-        name: "u".into(),
-        username: "u".into(),
-        server_url: "http://x".into(),
-        user_id: "uid".into(),
-        ed25519_pubkey_b64: "e".into(),
-        x25519_pubkey_b64: "x".into(),
-        wrapped_privkey_b64: "w".into(),
-        argon2_salt_b64: "s".into(),
-        argon2_m_cost_kib: 19456,
-        argon2_t_cost: 2,
-        argon2_p_cost: 1,
-        session_token: None,
-        session_expires_at: None,
-    });
-    config.upsert_context(crate::config::Context {
-        name: "one".into(),
-        store: "acme".into(),
-        environment: "dev".into(),
-        identity: "u".into(),
-    });
-    config.upsert_context(crate::config::Context {
-        name: "two".into(),
-        store: "acme".into(),
-        environment: "prod".into(),
-        identity: "u".into(),
-    });
-    config.save_to(&config_path).unwrap();
-
-    let dir = unique("linkdir");
-    std::fs::create_dir_all(&dir).unwrap();
-
-    commands::link(&config_path, &dir, "one").expect("first link writes the marker");
-    assert_eq!(
-        crate::config::find_wonton_context(&dir),
-        Some("one".to_string())
-    );
-
-    // Idempotent for the same context.
-    commands::link(&config_path, &dir, "one").expect("relinking the same context is fine");
-
-    // Refuses a different context.
-    let err = commands::link(&config_path, &dir, "two").expect_err("must not clobber");
-    assert!(err.to_string().contains("refusing to overwrite"), "got: {err}");
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-// ---- Phase 5a: share / revoke / key rotate -----------------------------------------------
-
-/// A logged-in-but-unprovisioned "machine": fresh agent/config/state, the user is registered but
-/// no store/env/context is set up yet. Used for a share *target* (who has no DEK until shared).
-struct Machine {
-    config_path: PathBuf,
-    state_path: PathBuf,
-    socket: PathBuf,
-}
-
-async fn login_only(user: &str, base: &str) -> Machine {
-    let socket = spawn_agent().await;
+async fn commands_without_a_wonton_toml_error_clearly() {
+    let dir = temp_dir();
     let config_path = temp_config_path();
     let state_path = temp_state_path();
-    commands::login(&config_path, &socket, Some(base.to_string()), user, format!("pw-{user}"))
-        .await
-        .unwrap();
-    Machine {
-        config_path,
-        state_path,
-        socket,
-    }
+    let err = commands::log(&config_path, &state_path, &dir).await.unwrap_err();
+    assert!(err.to_string().contains("wonton init"), "got: {err}");
 }
 
-/// Count the object files under `state_path`'s co-located object store (git-style fanout dirs).
-fn count_objects(state_path: &std::path::Path) -> usize {
-    fn walk(p: &std::path::Path) -> usize {
-        let mut n = 0;
-        if let Ok(rd) = std::fs::read_dir(p) {
-            for e in rd.flatten() {
-                let path = e.path();
-                if path.is_dir() {
-                    n += walk(&path);
-                } else {
-                    n += 1;
-                }
-            }
-        }
-        n
-    }
-    walk(&object_store_dir_for(state_path))
-}
-
-/// The blob hash a committed tree maps `key` to (for asserting a value's ciphertext changed after
-/// rotation without decrypting it).
-fn blob_hash_for_key(state_path: &std::path::Path, tip: Hash, key: &str) -> Hash {
-    let store = open_object_store(&object_store_dir_for(state_path)).unwrap();
-    let commit = Commit::from_bytes(&store.get(&tip).unwrap().unwrap()).unwrap();
-    let tree = Tree::from_bytes(&store.get(&commit.fields.tree_hash).unwrap().unwrap()).unwrap();
-    *tree.entries.get(key).unwrap()
-}
-
-fn tip_of(state_path: &std::path::Path) -> Hash {
-    *LocalState::load_from(state_path)
-        .unwrap()
-        .context("acme-dev")
-        .unwrap()
-        .tips
-        .get("main")
-        .unwrap()
-}
+// ---- sharing, revocation, key rotation --------------------------------------------------------
 
 /// `share` grants a second user access with NO re-encryption (O(1)): the object count is
-/// unchanged, and the target can then `use` + `pull` + read the same secret the sharer committed.
+/// unchanged, and the target can then `clone` + read the same secret the sharer committed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn share_grants_access_without_re_encryption() {
-    let owner = ready_fixture("p5owner", None, true).await;
-    commands::set(
-        &owner.config_path,
-        &owner.state_path,
-        &owner.socket,
-        "acme-dev",
-        vec![("SECRET".into(), "sk-shared".into())],
-    )
-    .await
-    .unwrap();
-    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "seed".into())
+    let owner = ready_fixture("p5owner", None).await;
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("SECRET".into(), "sk-shared".into())])
         .await
         .unwrap();
-    commands::push(&owner.config_path, &owner.state_path, "acme-dev").await.unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "seed".into())
+        .await
+        .unwrap();
+    commands::push(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir).await.unwrap();
 
     let bob = login_only("p5bob", &owner.base).await;
+    let bob_dir = temp_dir();
 
-    // O(1): share must not create any objects (no re-encryption).
     let before = count_objects(&owner.state_path);
-    commands::share(
-        &owner.config_path,
-        &owner.state_path,
-        &owner.socket,
-        "acme-dev",
-        "p5bob",
-        Role::Reader,
-    )
-    .await
-    .expect("share should grant access");
+    commands::share(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, None, "p5bob", Role::Reader)
+        .await
+        .expect("share should grant access");
     let after = count_objects(&owner.state_path);
     assert_eq!(before, after, "share must not re-encrypt / create objects");
 
-    // Bob can now use the context, pull, and read the same secret.
-    commands::context_add(&bob.config_path, "acme-dev", "acme", "dev", "p5bob").unwrap();
-    commands::use_context(&bob.config_path, &bob.state_path, &bob.socket, "acme-dev")
+    commands::clone(&bob.config_path, &bob.state_path, &bob.socket, &bob_dir, "acme", "backend", Some("main"), None)
         .await
-        .expect("bob can use the shared context");
-    commands::pull(&bob.config_path, &bob.state_path, "acme-dev").await.unwrap();
+        .unwrap();
 
     let out = unique("shareout");
     let out_str = out.to_string_lossy().to_string();
@@ -1045,7 +1014,7 @@ async fn share_grants_access_without_re_encryption() {
         &bob.config_path,
         &bob.state_path,
         &bob.socket,
-        "acme-dev",
+        &bob_dir,
         vec!["sh".into(), "-c".into(), format!("printf '%s' \"$SECRET\" > {out_str}")],
     )
     .await
@@ -1055,132 +1024,79 @@ async fn share_grants_access_without_re_encryption() {
     let _ = std::fs::remove_file(&out);
 }
 
-/// The bug found by manual end-to-end testing (2026-07-06): `log` used to verify every commit
-/// against the *local caller's own* pubkey, so a second identity reading a history it did not
-/// entirely author itself would fail signature verification on every commit it didn't write —
-/// not because anything was tampered, but because its own key obviously can't verify someone
-/// else's signature. After sharing, Bob's `log` over a history genuinely authored by BOTH Alice
-/// and Bob (each committing in turn) must succeed, resolving each commit against its own author.
+/// `log` used to verify every commit against the *local caller's own* pubkey; a second identity
+/// reading a history genuinely authored by BOTH users (each committing in turn) must succeed,
+/// resolving each commit against its own author.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn log_verifies_a_history_with_more_than_one_real_author() {
-    let alice = ready_fixture("p5xalice", None, true).await;
-    commands::set(
-        &alice.config_path,
-        &alice.state_path,
-        &alice.socket,
-        "acme-dev",
-        vec![("K".into(), "alice-value".into())],
-    )
-    .await
-    .unwrap();
-    commands::commit(&alice.config_path, &alice.state_path, &alice.socket, "acme-dev", "alice's commit".into())
+    let alice = ready_fixture("p5xalice", None).await;
+    commands::set(&alice.config_path, &alice.state_path, &alice.socket, &alice.dir, vec![("K".into(), "alice-value".into())])
         .await
         .unwrap();
-    commands::push(&alice.config_path, &alice.state_path, "acme-dev").await.unwrap();
+    commands::commit(&alice.config_path, &alice.state_path, &alice.socket, &alice.dir, "alice's commit".into())
+        .await
+        .unwrap();
+    commands::push(&alice.config_path, &alice.state_path, &alice.socket, &alice.dir).await.unwrap();
 
     let bob = login_only("p5xbob", &alice.base).await;
-    commands::share(
-        &alice.config_path,
-        &alice.state_path,
-        &alice.socket,
-        "acme-dev",
-        "p5xbob",
-        Role::Writer,
-    )
-    .await
-    .unwrap();
-    commands::context_add(&bob.config_path, "acme-dev", "acme", "dev", "p5xbob").unwrap();
-    commands::use_context(&bob.config_path, &bob.state_path, &bob.socket, "acme-dev")
+    commands::share(&alice.config_path, &alice.state_path, &alice.socket, &alice.dir, None, "p5xbob", Role::Writer)
         .await
         .unwrap();
-    commands::pull(&bob.config_path, &bob.state_path, "acme-dev").await.unwrap();
-
-    // Bob commits too, so the history now has two genuinely distinct real authors.
-    commands::set(
-        &bob.config_path,
-        &bob.state_path,
-        &bob.socket,
-        "acme-dev",
-        vec![("K2".into(), "bob-value".into())],
-    )
-    .await
-    .unwrap();
-    commands::commit(&bob.config_path, &bob.state_path, &bob.socket, "acme-dev", "bob's commit".into())
+    let bob_dir = temp_dir();
+    commands::clone(&bob.config_path, &bob.state_path, &bob.socket, &bob_dir, "acme", "backend", Some("main"), None)
         .await
         .unwrap();
 
-    // Both Alice and Bob must be able to verify the full two-author history via `log`.
-    commands::log(&bob.config_path, &bob.state_path, "acme-dev").await.unwrap();
-    commands::push(&bob.config_path, &bob.state_path, "acme-dev").await.unwrap();
-    commands::pull(&alice.config_path, &alice.state_path, "acme-dev").await.unwrap();
-    commands::log(&alice.config_path, &alice.state_path, "acme-dev").await.unwrap();
+    commands::set(&bob.config_path, &bob.state_path, &bob.socket, &bob_dir, vec![("K2".into(), "bob-value".into())])
+        .await
+        .unwrap();
+    commands::commit(&bob.config_path, &bob.state_path, &bob.socket, &bob_dir, "bob's commit".into())
+        .await
+        .unwrap();
+
+    commands::log(&bob.config_path, &bob.state_path, &bob_dir).await.unwrap();
+    commands::push(&bob.config_path, &bob.state_path, &bob.socket, &bob_dir).await.unwrap();
+    commands::pull(&alice.config_path, &alice.state_path, &alice.dir).await.unwrap();
+    commands::log(&alice.config_path, &alice.state_path, &alice.dir).await.unwrap();
 }
 
-/// The Phase-5 exit criterion: after `revoke` + the fresh commit that follows, the revoked user's
-/// STALE cached DEK can no longer decrypt a value committed after the revocation (AEAD auth
-/// failure, fail-closed — never garbage).
+/// After `revoke` + the fresh commit that follows, the revoked user's STALE cached DEK can no
+/// longer decrypt a value committed after the revocation (AEAD auth failure, fail-closed — never
+/// garbage).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoke_denies_the_revoked_users_stale_dek() {
-    let owner = ready_fixture("p5rowner", None, true).await;
-    commands::set(
-        &owner.config_path,
-        &owner.state_path,
-        &owner.socket,
-        "acme-dev",
-        vec![("OLD".into(), "old-value".into())],
-    )
-    .await
-    .unwrap();
-    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "v1".into())
+    let owner = ready_fixture("p5rowner", None).await;
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("OLD".into(), "old-value".into())])
         .await
         .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "v1".into())
+        .await
+        .unwrap();
+    commands::push(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir).await.unwrap();
 
-    // Mallory is shared in (gets DEK v1) and caches it via `use`.
     let mallory = login_only("p5mallory", &owner.base).await;
-    commands::share(
-        &owner.config_path,
-        &owner.state_path,
-        &owner.socket,
-        "acme-dev",
-        "p5mallory",
-        Role::Reader,
-    )
-    .await
-    .unwrap();
-    commands::context_add(&mallory.config_path, "acme-dev", "acme", "dev", "p5mallory").unwrap();
-    commands::use_context(&mallory.config_path, &mallory.state_path, &mallory.socket, "acme-dev")
+    commands::share(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, None, "p5mallory", Role::Reader)
         .await
-        .expect("mallory caches DEK v1");
+        .unwrap();
+    let mallory_dir = temp_dir();
+    commands::clone(&mallory.config_path, &mallory.state_path, &mallory.socket, &mallory_dir, "acme", "backend", Some("main"), None)
+        .await
+        .expect("mallory clones and caches DEK v1");
 
-    // Owner revokes Mallory (removes membership + rotates to v2; owner hot-swaps to v2).
-    commands::revoke(
-        &owner.config_path,
-        &owner.state_path,
-        &owner.socket,
-        "acme-dev",
-        "p5mallory",
-    )
-    .await
-    .expect("revoke + rotate");
+    commands::revoke(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, None, "p5mallory")
+        .await
+        .expect("revoke + rotate");
     let state = LocalState::load_from(&owner.state_path).unwrap();
-    assert_eq!(state.context("acme-dev").unwrap().dek_version, 2, "owner is on v2 after rotation");
+    assert_eq!(state.branch(&key("main")).unwrap().dek_version, 2, "owner is on v2 after rotation");
 
-    // Owner commits a NEW secret under the v2 DEK.
-    commands::set(
-        &owner.config_path,
-        &owner.state_path,
-        &owner.socket,
-        "acme-dev",
-        vec![("NEW".into(), "post-revocation-secret".into())],
-    )
-    .await
-    .unwrap();
-    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "v2-secret".into())
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("NEW".into(), "post-revocation-secret".into())])
+        .await
+        .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "v2-secret".into())
         .await
         .unwrap();
 
-    // Grab the NEW blob (encrypted under v2) from the owner's store.
-    let tip = tip_of(&owner.state_path);
+    let tip = tip_of(&owner.state_path, &key("main"));
     let blob_hash = blob_hash_for_key(&owner.state_path, tip, "NEW");
     let store = open_object_store(&object_store_dir_for(&owner.state_path)).unwrap();
     let blob = Blob::from_bytes(&store.get(&blob_hash).unwrap().unwrap()).unwrap();
@@ -1189,12 +1105,8 @@ async fn revoke_denies_the_revoked_users_stale_dek() {
         ciphertext: blob.ciphertext,
     };
 
-    // Mallory's agent still holds the STALE v1 DEK under "acme-dev"; it must fail to open the
-    // v2-encrypted value — fail closed, not a crash and not garbage.
-    let mallory_cipher = AgentCipher::new(mallory.socket.clone(), "acme-dev");
-    let result = tokio::task::spawn_blocking(move || mallory_cipher.decrypt(&value))
-        .await
-        .unwrap();
+    let mallory_cipher = AgentCipher::new(mallory.socket.clone(), key("main"));
+    let result = tokio::task::spawn_blocking(move || mallory_cipher.decrypt(&value)).await.unwrap();
     assert!(result.is_err(), "revoked user's stale DEK must not decrypt post-rotation ciphertext");
 }
 
@@ -1202,120 +1114,75 @@ async fn revoke_denies_the_revoked_users_stale_dek() {
 /// hash (re-encrypted under a fresh DEK), and a remaining member can still log + decrypt after.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn key_rotate_alone_advances_tip_and_reencrypts() {
-    let owner = ready_fixture("p5kowner", None, true).await;
-    commands::set(
-        &owner.config_path,
-        &owner.state_path,
-        &owner.socket,
-        "acme-dev",
-        vec![("KEY".into(), "the-value".into())],
-    )
-    .await
-    .unwrap();
-    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "v1".into())
+    let owner = ready_fixture("p5kowner", None).await;
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("KEY".into(), "the-value".into())])
         .await
         .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "v1".into())
+        .await
+        .unwrap();
+    commands::push(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir).await.unwrap();
 
-    let tip1 = tip_of(&owner.state_path);
+    let tip1 = tip_of(&owner.state_path, &key("main"));
     let h1 = blob_hash_for_key(&owner.state_path, tip1, "KEY");
 
-    commands::rotate(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev")
+    commands::rotate(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, None)
         .await
         .expect("key rotate");
 
     let state = LocalState::load_from(&owner.state_path).unwrap();
-    assert_eq!(state.context("acme-dev").unwrap().dek_version, 2, "version advanced to 2");
-    let tip2 = tip_of(&owner.state_path);
+    assert_eq!(state.branch(&key("main")).unwrap().dek_version, 2, "version advanced to 2");
+    let tip2 = tip_of(&owner.state_path, &key("main"));
     assert_ne!(tip1, tip2, "rotation must advance the tip");
     let h2 = blob_hash_for_key(&owner.state_path, tip2, "KEY");
     assert_ne!(h1, h2, "the same plaintext under a fresh DEK+nonce must yield a different blob");
 
-    // A remaining member (the owner) can still verify history and decrypt under the new DEK.
-    commands::log(&owner.config_path, &owner.state_path, "acme-dev").await.unwrap();
-    let out = unique("rotateout");
-    let out_str = out.to_string_lossy().to_string();
-    let code = commands::run(
-        &owner.config_path,
-        &owner.state_path,
-        &owner.socket,
-        "acme-dev",
-        vec!["sh".into(), "-c".into(), format!("printf '%s' \"$KEY\" > {out_str}")],
-    )
-    .await
-    .unwrap();
-    assert_eq!(code, 0);
-    assert_eq!(std::fs::read_to_string(&out).unwrap(), "the-value");
-    let _ = std::fs::remove_file(&out);
+    commands::log(&owner.config_path, &owner.state_path, &owner.dir).await.unwrap();
+    assert_eq!(read_via_run(&owner, "KEY").await, "the-value");
 }
 
-// ---- Phase 5b: three-way merge ------------------------------------------------------------
+// ---- three-way merge across two DEKs --------------------------------------------------------
 
-/// Fork a new local branch named `branch` off `at` (the commit both histories will share as
-/// their merge base) within `ctx_name`. There's no `checkout -b` porcelain command (v1 only has
-/// `switch` to an already-known branch), so this directly seeds `state.toml`'s `tips`
-/// map the same way `pull` would after fetching a peer's branch.
-fn fork_branch(state_path: &std::path::Path, ctx_name: &str, branch: &str, at: Hash) {
-    let mut state = LocalState::load_from(state_path).unwrap();
-    state.context_mut(ctx_name).tips.insert(branch.to_string(), at);
-    state.save_to(state_path).unwrap();
-}
-
-/// Read one env var's value out of the current working tree via `wonton run`, for asserting the
-/// merged result without touching the object store's internals.
-async fn read_via_run(f: &Fixture, key: &str) -> String {
-    let out = unique(&format!("mergeread-{key}"));
-    let out_str = out.to_string_lossy().to_string();
-    let code = commands::run(
-        &f.config_path,
-        &f.state_path,
-        &f.socket,
-        "acme-dev",
-        vec!["sh".into(), "-c".into(), format!("printf '%s' \"${key}\" > {out_str}")],
-    )
-    .await
-    .unwrap();
-    assert_eq!(code, 0);
-    let value = std::fs::read_to_string(&out).unwrap();
-    let _ = std::fs::remove_file(&out);
-    value
-}
-
-/// Two branches that each add a different, non-overlapping key auto-merge with zero conflicts,
-/// producing a real 2-parent commit that `wonton log` walks through without erroring.
+/// Two branches (each with their own DEK) that each add a different, non-overlapping key
+/// auto-merge with zero conflicts, producing a real 2-parent commit that `wonton log` walks
+/// through without erroring. Exercises the fork-root-as-merge-base path since `feature` was
+/// created via `--from main`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn merge_with_no_conflicts_produces_a_two_parent_commit() {
-    let owner = ready_fixture("p5bmerge1", None, true).await;
-    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("ROOT".into(), "root-value".into())])
+    let owner = ready_fixture("p5bmerge1", None).await;
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("ROOT".into(), "root-value".into())])
         .await
         .unwrap();
-    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "root".into())
-        .await
-        .unwrap();
-    let root_tip = tip_of(&owner.state_path);
-
-    fork_branch(&owner.state_path, "acme-dev", "feature", root_tip);
-    commands::switch(&owner.state_path, "acme-dev", "feature", false).unwrap();
-    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("FEATURE_KEY".into(), "feature-value".into())])
-        .await
-        .unwrap();
-    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "feature commit".into())
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "root".into())
         .await
         .unwrap();
 
-    commands::switch(&owner.state_path, "acme-dev", "main", false).unwrap();
-    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("MAIN_KEY".into(), "main-value".into())])
+    commands::branch_create(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "feature", Some("main"), None)
         .await
         .unwrap();
-    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "main commit".into())
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("FEATURE_KEY".into(), "feature-value".into())])
         .await
         .unwrap();
-    let main_tip_before = tip_of(&owner.state_path);
-
-    commands::merge(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "feature")
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "feature commit".into())
         .await
-        .expect("no conflicts, must merge cleanly");
+        .unwrap();
 
-    let merged_tip = tip_of(&owner.state_path);
+    commands::branch_switch(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "main")
+        .await
+        .unwrap();
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("MAIN_KEY".into(), "main-value".into())])
+        .await
+        .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "main commit".into())
+        .await
+        .unwrap();
+    let main_tip_before = tip_of(&owner.state_path, &key("main"));
+
+    commands::merge(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "feature")
+        .await
+        .expect("no conflicts, must merge cleanly across the two branches' different DEKs");
+
+    let merged_tip = tip_of(&owner.state_path, &key("main"));
     assert_ne!(merged_tip, main_tip_before);
 
     let store = open_object_store(&object_store_dir_for(&owner.state_path)).unwrap();
@@ -1323,96 +1190,96 @@ async fn merge_with_no_conflicts_produces_a_two_parent_commit() {
     assert_eq!(commit.fields.parent_hashes.len(), 2, "a merge commit must have exactly 2 parents");
     assert!(commit.fields.parent_hashes.contains(&main_tip_before));
 
-    // `wonton log`'s Phase 5b mainline-follow fix must walk past the merge commit without error.
-    commands::log(&owner.config_path, &owner.state_path, "acme-dev").await.unwrap();
+    commands::log(&owner.config_path, &owner.state_path, &owner.dir).await.unwrap();
 
     assert_eq!(read_via_run(&owner, "ROOT").await, "root-value");
     assert_eq!(read_via_run(&owner, "MAIN_KEY").await, "main-value");
     assert_eq!(read_via_run(&owner, "FEATURE_KEY").await, "feature-value");
 
     let state = LocalState::load_from(&owner.state_path).unwrap();
-    assert!(state.context("acme-dev").unwrap().merge.is_none(), "no merge state persisted for a clean merge");
+    assert!(state.branch(&key("main")).unwrap().merge.is_none(), "no merge state persisted for a clean merge");
 }
 
-/// A same-key divergent edit on both branches conflicts. Since the test process's stdin is
-/// non-interactive (immediate EOF), `merge` pauses on it exactly like a skipped prompt would,
-/// persisting only content hashes (never plaintext) into `state.toml`. Manually completing the
-/// resolution (as the interactive loop itself would) and calling `merge --continue` must then
-/// finalize the 2-parent commit and clear the paused state.
+/// A same-key divergent edit on both (differently-keyed) branches conflicts. Since the test
+/// process's stdin is non-interactive (immediate EOF), `merge` pauses on it exactly like a
+/// skipped prompt would, persisting only content hashes (never plaintext) into `state.toml`.
+/// Manually completing the resolution and calling `merge --continue` must then finalize the
+/// 2-parent commit and clear the paused state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn merge_conflict_pauses_with_hash_only_state_then_continue_resolves() {
-    let owner = ready_fixture("p5bmerge2", None, true).await;
-    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("KEY".into(), "base-value".into())])
+    let owner = ready_fixture("p5bmerge2", None).await;
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("KEY".into(), "base-value".into())])
         .await
         .unwrap();
-    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "root".into())
-        .await
-        .unwrap();
-    let root_tip = tip_of(&owner.state_path);
-
-    fork_branch(&owner.state_path, "acme-dev", "feature", root_tip);
-    commands::switch(&owner.state_path, "acme-dev", "feature", false).unwrap();
-    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("KEY".into(), "feature-value".into())])
-        .await
-        .unwrap();
-    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "feature edit".into())
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "root".into())
         .await
         .unwrap();
 
-    commands::switch(&owner.state_path, "acme-dev", "main", false).unwrap();
-    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("KEY".into(), "main-value".into())])
+    commands::branch_create(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "feature", Some("main"), None)
         .await
         .unwrap();
-    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "main edit".into())
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("KEY".into(), "feature-value".into())])
+        .await
+        .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "feature edit".into())
         .await
         .unwrap();
 
-    commands::merge(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "feature")
+    commands::branch_switch(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "main")
+        .await
+        .unwrap();
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("KEY".into(), "main-value".into())])
+        .await
+        .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "main edit".into())
+        .await
+        .unwrap();
+
+    commands::merge(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "feature")
         .await
         .expect("merge itself succeeds even though it pauses on an unresolved conflict");
 
     let state = LocalState::load_from(&owner.state_path).unwrap();
     let merge_state = state
-        .context("acme-dev")
+        .branch(&key("main"))
         .unwrap()
         .merge
         .clone()
         .expect("a paused merge must be persisted");
-    assert_eq!(merge_state.branch, "feature");
+    assert_eq!(merge_state.branch, key("feature"));
     assert_eq!(merge_state.conflicts.len(), 1);
     assert!(merge_state.conflicts.contains_key("KEY"));
     assert!(merge_state.resolved.is_empty());
 
-    // Only hex hashes / structural TOML keys may appear — never the plaintext values.
     let raw = std::fs::read_to_string(&owner.state_path).unwrap();
     assert!(!raw.contains("base-value"));
     assert!(!raw.contains("feature-value"));
     assert!(!raw.contains("main-value"));
 
-    // Resolve "KEY" to "ours" (main-value) exactly as a completed interactive prompt would,
-    // by editing the persisted hashes directly, then finish via `--continue`.
+    // Resolve "KEY" to "ours" (main-value) exactly as a completed interactive prompt would, by
+    // editing the persisted hashes directly, then finish via `--continue`.
     {
         let mut state = LocalState::load_from(&owner.state_path).unwrap();
-        let cs = state.context_mut("acme-dev");
-        let mut merge_state = cs.merge.clone().unwrap();
+        let bs = state.branch_mut(&key("main"));
+        let mut merge_state = bs.merge.clone().unwrap();
         let conflict = merge_state.conflicts.remove("KEY").unwrap();
         merge_state.resolved.insert("KEY".to_string(), ResolvedEntry::Set(conflict.ours.unwrap()));
-        cs.merge = Some(merge_state);
+        bs.merge = Some(merge_state);
         state.save_to(&owner.state_path).unwrap();
     }
 
-    commands::merge_continue(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev")
+    commands::merge_continue(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir)
         .await
         .expect("continue finalizes once every conflict is resolved");
 
     let state = LocalState::load_from(&owner.state_path).unwrap();
-    assert!(state.context("acme-dev").unwrap().merge.is_none(), "merge state must be cleared after finalizing");
+    assert!(state.branch(&key("main")).unwrap().merge.is_none(), "merge state must be cleared after finalizing");
 
-    let merged_tip = tip_of(&owner.state_path);
+    let merged_tip = tip_of(&owner.state_path, &key("main"));
     let store = open_object_store(&object_store_dir_for(&owner.state_path)).unwrap();
     let commit = Commit::from_bytes(&store.get(&merged_tip).unwrap().unwrap()).unwrap();
     assert_eq!(commit.fields.parent_hashes.len(), 2);
-    commands::log(&owner.config_path, &owner.state_path, "acme-dev").await.unwrap();
+    commands::log(&owner.config_path, &owner.state_path, &owner.dir).await.unwrap();
 
     assert_eq!(read_via_run(&owner, "KEY").await, "main-value", "resolved to ours (main-value)");
 }
@@ -1422,56 +1289,57 @@ async fn merge_conflict_pauses_with_hash_only_state_then_continue_resolves() {
 /// work normally afterward.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn merge_abort_discards_a_paused_merge_without_a_trace() {
-    let owner = ready_fixture("p5babort", None, true).await;
-    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("KEY".into(), "base-value".into())])
+    let owner = ready_fixture("p5babort", None).await;
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("KEY".into(), "base-value".into())])
         .await
         .unwrap();
-    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "root".into())
-        .await
-        .unwrap();
-    let root_tip = tip_of(&owner.state_path);
-
-    fork_branch(&owner.state_path, "acme-dev", "feature", root_tip);
-    commands::switch(&owner.state_path, "acme-dev", "feature", false).unwrap();
-    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("KEY".into(), "feature-value".into())])
-        .await
-        .unwrap();
-    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "feature edit".into())
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "root".into())
         .await
         .unwrap();
 
-    commands::switch(&owner.state_path, "acme-dev", "main", false).unwrap();
-    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("KEY".into(), "main-value".into())])
+    commands::branch_create(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "feature", Some("main"), None)
         .await
         .unwrap();
-    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "main edit".into())
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("KEY".into(), "feature-value".into())])
         .await
         .unwrap();
-    let main_tip_before_merge = tip_of(&owner.state_path);
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "feature edit".into())
+        .await
+        .unwrap();
 
-    commands::merge(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "feature")
+    commands::branch_switch(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "main")
+        .await
+        .unwrap();
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("KEY".into(), "main-value".into())])
+        .await
+        .unwrap();
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "main edit".into())
+        .await
+        .unwrap();
+    let main_tip_before_merge = tip_of(&owner.state_path, &key("main"));
+
+    commands::merge(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "feature")
         .await
         .expect("pauses on the KEY conflict");
     let state = LocalState::load_from(&owner.state_path).unwrap();
-    assert!(state.context("acme-dev").unwrap().merge.is_some(), "a merge must be paused");
+    assert!(state.branch(&key("main")).unwrap().merge.is_some(), "a merge must be paused");
 
-    commands::merge_abort(&owner.state_path, "acme-dev")
+    commands::merge_abort(&owner.config_path, &owner.state_path, &owner.dir)
         .await
         .expect("abort must succeed while a merge is paused");
 
     let state = LocalState::load_from(&owner.state_path).unwrap();
-    assert!(state.context("acme-dev").unwrap().merge.is_none(), "merge state must be cleared");
+    assert!(state.branch(&key("main")).unwrap().merge.is_none(), "merge state must be cleared");
     assert_eq!(
-        tip_of(&owner.state_path),
+        tip_of(&owner.state_path, &key("main")),
         main_tip_before_merge,
         "aborting must not create or move to any merge commit"
     );
 
-    // Ordinary work continues to function normally after an abort.
-    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("AFTER_ABORT".into(), "still-works".into())])
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("AFTER_ABORT".into(), "still-works".into())])
         .await
         .unwrap();
-    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "post-abort commit".into())
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "post-abort commit".into())
         .await
         .unwrap();
     assert_eq!(read_via_run(&owner, "AFTER_ABORT").await, "still-works");
@@ -1480,36 +1348,37 @@ async fn merge_abort_discards_a_paused_merge_without_a_trace() {
 /// `merge --abort` with nothing paused is a clear user error, not a silent no-op.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn merge_abort_without_a_paused_merge_errors() {
-    let owner = ready_fixture("p5babort2", None, true).await;
-    let err = commands::merge_abort(&owner.state_path, "acme-dev").await.unwrap_err();
+    let owner = ready_fixture("p5babort2", None).await;
+    let err = commands::merge_abort(&owner.config_path, &owner.state_path, &owner.dir).await.unwrap_err();
     assert!(err.to_string().contains("no merge in progress"), "got: {err}");
 }
 
 /// `merge --continue` with nothing paused is a clear user error, not a silent no-op.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn merge_continue_without_a_paused_merge_errors() {
-    let owner = ready_fixture("p5bmerge3", None, true).await;
-    let err = commands::merge_continue(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev")
+    let owner = ready_fixture("p5bmerge3", None).await;
+    let err = commands::merge_continue(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("no merge in progress"), "got: {err}");
 }
 
-/// Merging an unknown/never-fetched branch name is a clear user error, not a silent no-op.
+/// Merging a branch name that was never created (locally or server-side) is a clear user error,
+/// not a silent no-op.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn merge_unknown_branch_errors() {
-    let owner = ready_fixture("p5bmerge4", None, true).await;
-    commands::set(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", vec![("K".into(), "v".into())])
+    let owner = ready_fixture("p5bmerge4", None).await;
+    commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("K".into(), "v".into())])
         .await
         .unwrap();
-    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "root".into())
+    commands::commit(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "root".into())
         .await
         .unwrap();
 
-    let err = commands::merge(&owner.config_path, &owner.state_path, &owner.socket, "acme-dev", "nonexistent")
+    let err = commands::merge(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "nonexistent")
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("unknown branch"), "got: {err}");
+    assert!(err.to_string().contains("wrapped-DEK map"), "got: {err}");
 }
 
 // ---- no-plaintext-on-disk ------------------------------------------------------------------
@@ -1534,46 +1403,33 @@ fn all_files(root: &std::path::Path) -> Vec<PathBuf> {
 }
 
 /// The no-plaintext-on-disk rule: plaintext secrets must never touch disk except through the two
-/// named exits (`wonton run`'s child-process environment and `wonton export`'s named file). This drives
-/// a full `set` -> `commit` -> `run` cycle (the same cycle `share_grants_access_without_re_encryption`
-/// above uses to actually read a secret back) and then scans every file under both the state
-/// directory (object store + `state.toml`, including any paused-merge state) and the config
-/// directory (`config.toml`, cached wrapped keys) for the literal plaintext bytes, asserting they
-/// never appear — only ciphertext/hashes may.
+/// named exits (`wonton run`'s child-process environment and `wonton export`'s named file). This
+/// drives a full `set` -> `commit` -> `run` cycle and then scans every file under the state
+/// directory (object store + `state.toml`), the config directory (`config.toml`, cached wrapped
+/// keys), and the project directory (`wonton.toml` + `.wonton.local`) for the literal plaintext
+/// bytes, asserting they never appear — only ciphertext/hashes/non-secret metadata may.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_plaintext_secret_touches_disk_outside_the_named_export_exit() {
-    let fx = ready_fixture("nopt", None, true).await;
+    let fx = ready_fixture("nopt", None).await;
     let plaintext = "sk-super-secret-plaintext-marker-9f3a";
 
-    commands::set(
-        &fx.config_path,
-        &fx.state_path,
-        &fx.socket,
-        "acme-dev",
-        vec![("SECRET".into(), plaintext.into())],
-    )
-    .await
-    .unwrap();
-    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, "acme-dev", "seed".into())
+    commands::set(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, vec![("SECRET".into(), plaintext.into())])
+        .await
+        .unwrap();
+    commands::commit(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "seed".into())
         .await
         .unwrap();
 
-    // `run` must inject the plaintext only into the child process's environment, never to disk.
-    let code = commands::run(
-        &fx.config_path,
-        &fx.state_path,
-        &fx.socket,
-        "acme-dev",
-        vec!["true".into()],
-    )
-    .await
-    .unwrap();
+    let code = commands::run(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, vec!["true".into()])
+        .await
+        .unwrap();
     assert_eq!(code, 0);
 
     let needle = plaintext.as_bytes();
     for dir in [
         fx.state_path.parent().expect("state_path has a parent dir"),
         fx.config_path.parent().expect("config_path has a parent dir"),
+        fx.dir.as_path(),
     ] {
         for file in all_files(dir) {
             let bytes = std::fs::read(&file).unwrap();

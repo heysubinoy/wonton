@@ -91,6 +91,12 @@ pub struct RegisterRequest {
     /// base64 of the `WrappedPrivateKey` ciphertext blob (opaque to the server).
     pub wrapped_privkey: String,
     pub argon2_params: Argon2ParamsDto,
+    /// Optional single-use ticket minted by a completed `/auth/oauth/{provider}/callback`
+    /// exchange, proving this registration is by someone who verified a real email with that
+    /// provider. Omit for the plain (unverified) registration path, which still works exactly
+    /// as before — this is an additional gate, not a replacement. Never a passphrase or key.
+    #[serde(default)]
+    pub oauth_ticket: Option<String>,
 }
 
 /// `POST /auth/register` response: the server-assigned user id (UUID).
@@ -118,41 +124,58 @@ pub struct MachineTokenResponse {
 }
 
 // ---------------------------------------------------------------------------------------
-// Stores / environments
+// Orgs / stores (repos) / branches
 // ---------------------------------------------------------------------------------------
 
-/// One entry of `GET /stores/:store/envs`: an environment the caller can see and their role.
+/// `POST /orgs` request: create a new org. Any authenticated user may create one; the creator
+/// becomes its first `owner` member (the access-control bootstrap, same pattern as branch
+/// creation making its creator an admin).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnvSummary {
+pub struct CreateOrgRequest {
+    pub name: String,
+}
+
+/// `POST /orgs` response: the server-assigned org id (UUID).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateOrgResponse {
+    pub org_id: String,
+}
+
+/// One entry of `GET /orgs/:org/stores/:store/branches`: a branch the caller can see and their
+/// role on it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchSummary {
     pub name: String,
     pub role: Role,
 }
 
-/// `POST /stores` request: create a new store. Requires any valid token (there is no
-/// store-level ownership in this schema — only per-environment `env_members`).
+/// `POST /orgs/:org/stores` request: create a new store (repo) within an org. Requires the
+/// caller to already be a member of `org` (any role) — there is no store-level ownership beyond
+/// that; access control is per-branch via `branch_members`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateStoreRequest {
     pub name: String,
 }
 
-/// `POST /stores` response: the server-assigned store id (UUID).
+/// `POST /orgs/:org/stores` response: the server-assigned store id (UUID).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateStoreResponse {
     pub store_id: String,
 }
 
-/// `POST /stores/:store/envs` request: create a new environment inside a store. The creating
-/// actor is made an `admin` member of the new environment in the same transaction (the
-/// access-control bootstrap).
+/// `POST /orgs/:org/stores/:store/branches` request: create a new branch within a store. The
+/// creating actor is made an `admin` member of the new branch in the same transaction (the
+/// access-control bootstrap — a branch is its own DEK/ACL boundary, same role a fresh
+/// environment's first admin used to play).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateEnvRequest {
+pub struct CreateBranchRequest {
     pub name: String,
 }
 
-/// `POST /stores/:store/envs` response: the server-assigned environment id (UUID).
+/// `POST /orgs/:org/stores/:store/branches` response: the server-assigned branch id (UUID).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateEnvResponse {
-    pub env_id: String,
+pub struct CreateBranchResponse {
+    pub branch_id: String,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -172,14 +195,20 @@ pub struct ObjectUploadRequest {
 }
 
 // ---------------------------------------------------------------------------------------
-// Refs (branch pointers, CAS-moved)
+// Ref (one tip per branch, CAS-moved — a branch no longer contains named sub-branches, so
+// there's exactly one ref per branch instead of a `branch_name -> commit_hash` map)
 // ---------------------------------------------------------------------------------------
 
-/// `GET /refs/:store/:env` response: `branch_name -> commit_hash` (hex).
-pub type RefMap = HashMap<String, String>;
+/// `GET /orgs/:org/stores/:store/branches/:branch/ref` response: the branch's current tip
+/// commit hash (hex), or `None` if it has never been pushed to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefResponse {
+    pub commit_hash: Option<String>,
+}
 
-/// `POST /refs/:store/:env/:branch` request. `old_hash: None` means "create — must not
-/// currently exist"; `Some` means "move only if the ref currently equals this hash".
+/// `POST /orgs/:org/stores/:store/branches/:branch/ref` request. `old_hash: None` means
+/// "create — must not currently exist"; `Some` means "move only if the ref currently equals
+/// this hash".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefMoveRequest {
     pub old_hash: Option<String>,
@@ -255,8 +284,9 @@ pub struct UserPublicInfo {
     pub x25519_pubkey: String,
 }
 
-/// One entry of `GET /envs/:store/:env/members` response: a member's id, role, and the X25519
-/// public key needed to re-wrap a rotated DEK for them (`key rotate` re-wraps for every member).
+/// One entry of `GET /orgs/:org/stores/:store/branches/:branch/members` response: a member's id,
+/// role, and the X25519 public key needed to re-wrap a rotated DEK for them (`key rotate`
+/// re-wraps for every member).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemberInfo {
     pub user_id: String,
@@ -265,11 +295,12 @@ pub struct MemberInfo {
     pub x25519_pubkey: String,
 }
 
-/// `GET /envs/:store/:env` response: environment metadata a client needs to grant/rotate at the
-/// correct version. `active_dek_version` is tracked server-side (`environments.active_dek_version`)
-/// and never otherwise exposed; `share` grants at it, `rotate` advances it.
+/// `GET /orgs/:org/stores/:store/branches/:branch` response: branch metadata a client needs to
+/// grant/rotate at the correct version. `active_dek_version` is tracked server-side
+/// (`branches.active_dek_version`) and never otherwise exposed; `share` grants at it, `rotate`
+/// advances it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnvDetails {
-    pub env_id: String,
+pub struct BranchDetails {
+    pub branch_id: String,
     pub active_dek_version: u32,
 }

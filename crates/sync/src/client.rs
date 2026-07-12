@@ -13,11 +13,12 @@ use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use wonton_objects::Hash;
 use wonton_shared::{
-    CreateEnvRequest, CreateEnvResponse, CreateStoreRequest, CreateStoreResponse, EnvDetails,
-    EnvSummary, GrantKeyRequest, KeysMap, LoginCompleteRequest, LoginCompleteResponse,
-    LoginStartRequest, LoginStartResponse, MachineTokenRequest, MachineTokenResponse, MemberInfo,
-    MemberRequest, ObjectUploadRequest, RefConflict, RefMap, RefMoveRequest, RegisterRequest,
-    RegisterResponse, RotateRequest, UserPublicInfo,
+    BranchDetails, BranchSummary, CreateBranchRequest, CreateBranchResponse, CreateOrgRequest,
+    CreateOrgResponse, CreateStoreRequest, CreateStoreResponse, GrantKeyRequest, KeysMap,
+    LoginCompleteRequest, LoginCompleteResponse, LoginStartRequest, LoginStartResponse,
+    MachineTokenRequest, MachineTokenResponse, MemberInfo, MemberRequest, ObjectUploadRequest,
+    RefConflict, RefMoveRequest, RefResponse, RegisterRequest, RegisterResponse, RotateRequest,
+    UserPublicInfo,
 };
 
 use crate::error::SyncError;
@@ -143,42 +144,58 @@ impl SyncClient {
         json_response(resp).await
     }
 
-    // ---- Stores / environments --------------------------------------------------------
+    // ---- Orgs / stores (repos) / branches -----------------------------------------------
 
-    /// `GET /stores/{store}/envs`. Environments the caller is a member of, with their role.
-    pub async fn list_envs(&self, store: &str) -> Result<Vec<EnvSummary>, SyncError> {
+    /// `POST /orgs`. Create an org; the creating actor is made its first `owner` member
+    /// server-side. Requires any valid token. 409 on a duplicate name.
+    pub async fn create_org(&self, req: &CreateOrgRequest) -> Result<CreateOrgResponse, SyncError> {
         let resp = self
-            .authed(self.http.get(self.url(&format!("/stores/{store}/envs"))))
+            .authed(self.http.post(self.url("/orgs")).json(req))
             .send()
             .await?;
         json_response(resp).await
     }
 
-    /// `POST /stores`. Create a store. Requires any valid token (no store-level ownership in the
-    /// schema — access control is per-environment via `env_members`). 409 on a duplicate name.
-    pub async fn create_store(
-        &self,
-        req: &CreateStoreRequest,
-    ) -> Result<CreateStoreResponse, SyncError> {
-        let resp = self
-            .authed(self.http.post(self.url("/stores")).json(req))
-            .send()
-            .await?;
-        json_response(resp).await
-    }
-
-    /// `POST /stores/{store}/envs`. Create an environment inside a store; the creating actor is
-    /// made its first `admin` member server-side. Requires any valid token. 404 if the store is
-    /// unknown, 409 if the env name already exists in that store.
-    pub async fn create_env(
-        &self,
-        store: &str,
-        req: &CreateEnvRequest,
-    ) -> Result<CreateEnvResponse, SyncError> {
+    /// `GET /orgs/{org}/stores/{store}/branches`. Branches the caller is a member of, with their
+    /// role.
+    pub async fn list_branches(&self, org: &str, store: &str) -> Result<Vec<BranchSummary>, SyncError> {
         let resp = self
             .authed(
                 self.http
-                    .post(self.url(&format!("/stores/{store}/envs")))
+                    .get(self.url(&format!("/orgs/{org}/stores/{store}/branches"))),
+            )
+            .send()
+            .await?;
+        json_response(resp).await
+    }
+
+    /// `POST /orgs/{org}/stores`. Create a store (repo) within an org. Requires the caller to
+    /// already be a member of `org`. 404 if the org is unknown, 409 on a duplicate name.
+    pub async fn create_store(
+        &self,
+        org: &str,
+        req: &CreateStoreRequest,
+    ) -> Result<CreateStoreResponse, SyncError> {
+        let resp = self
+            .authed(self.http.post(self.url(&format!("/orgs/{org}/stores"))).json(req))
+            .send()
+            .await?;
+        json_response(resp).await
+    }
+
+    /// `POST /orgs/{org}/stores/{store}/branches`. Create a branch within a store; the creating
+    /// actor is made its first `admin` member server-side. Requires any valid token. 404 if the
+    /// org/store is unknown, 409 if the branch name already exists in that store.
+    pub async fn create_branch(
+        &self,
+        org: &str,
+        store: &str,
+        req: &CreateBranchRequest,
+    ) -> Result<CreateBranchResponse, SyncError> {
+        let resp = self
+            .authed(
+                self.http
+                    .post(self.url(&format!("/orgs/{org}/stores/{store}/branches")))
                     .json(req),
             )
             .send()
@@ -240,25 +257,30 @@ impl SyncClient {
         ok_response(resp).await
     }
 
-    // ---- Refs -------------------------------------------------------------------------
+    // ---- Ref (one per branch) -----------------------------------------------------------
 
-    /// `GET /refs/{store}/{env}`. `branch_name -> commit_hash` (hex). Requires >= reader.
-    pub async fn get_refs(&self, store: &str, env: &str) -> Result<RefMap, SyncError> {
+    /// `GET /orgs/{org}/stores/{store}/branches/{branch}/ref`. The branch's current tip commit
+    /// hash, or `None` if it has never been pushed to. Requires >= reader.
+    pub async fn get_ref(&self, org: &str, store: &str, branch: &str) -> Result<Option<String>, SyncError> {
         let resp = self
-            .authed(self.http.get(self.url(&format!("/refs/{store}/{env}"))))
+            .authed(
+                self.http
+                    .get(self.url(&format!("/orgs/{org}/stores/{store}/branches/{branch}/ref"))),
+            )
             .send()
             .await?;
-        json_response(resp).await
+        let ref_resp: RefResponse = json_response(resp).await?;
+        Ok(ref_resp.commit_hash)
     }
 
-    /// `POST /refs/{store}/{env}/{branch}`. Compare-and-swap ref move. Requires >= writer.
-    /// `old_hash: None` means "create — must not currently exist"; `Some` means "move only if
-    /// the ref currently equals this". A losing CAS is surfaced as [`SyncError::Conflict`]
-    /// carrying the ref's actual current value.
+    /// `POST /orgs/{org}/stores/{store}/branches/{branch}/ref`. Compare-and-swap ref move.
+    /// Requires >= writer. `old_hash: None` means "create — must not currently exist"; `Some`
+    /// means "move only if the ref currently equals this". A losing CAS is surfaced as
+    /// [`SyncError::Conflict`] carrying the ref's actual current value.
     pub async fn move_ref(
         &self,
+        org: &str,
         store: &str,
-        env: &str,
         branch: &str,
         old_hash: Option<&Hash>,
         new_hash: &Hash,
@@ -270,7 +292,7 @@ impl SyncClient {
         let resp = self
             .authed(
                 self.http
-                    .post(self.url(&format!("/refs/{store}/{env}/{branch}")))
+                    .post(self.url(&format!("/orgs/{org}/stores/{store}/branches/{branch}/ref")))
                     .json(&req),
             )
             .send()
@@ -309,27 +331,31 @@ impl SyncClient {
         json_response(resp).await
     }
 
-    /// `GET /envs/{store}/{env}`. Environment metadata (id + active DEK version). Requires
-    /// >= reader.
-    pub async fn get_env_details(&self, store: &str, env: &str) -> Result<EnvDetails, SyncError> {
+    /// `GET /orgs/{org}/stores/{store}/branches/{branch}`. Branch metadata (id + active DEK
+    /// version). Requires >= reader.
+    pub async fn get_branch_details(&self, org: &str, store: &str, branch: &str) -> Result<BranchDetails, SyncError> {
         let resp = self
-            .authed(self.http.get(self.url(&format!("/envs/{store}/{env}"))))
+            .authed(
+                self.http
+                    .get(self.url(&format!("/orgs/{org}/stores/{store}/branches/{branch}"))),
+            )
             .send()
             .await?;
         json_response(resp).await
     }
 
-    /// `GET /envs/{store}/{env}/members`. Every member's id, role, and X25519 pubkey (for
-    /// re-wrapping a rotated DEK). Requires >= reader.
+    /// `GET /orgs/{org}/stores/{store}/branches/{branch}/members`. Every member's id, role, and
+    /// X25519 pubkey (for re-wrapping a rotated DEK). Requires >= reader.
     pub async fn list_members(
         &self,
+        org: &str,
         store: &str,
-        env: &str,
+        branch: &str,
     ) -> Result<Vec<MemberInfo>, SyncError> {
         let resp = self
             .authed(
                 self.http
-                    .get(self.url(&format!("/envs/{store}/{env}/members"))),
+                    .get(self.url(&format!("/orgs/{org}/stores/{store}/branches/{branch}/members"))),
             )
             .send()
             .await?;
@@ -338,29 +364,32 @@ impl SyncClient {
 
     // ---- Wrapped-DEK maps / membership ------------------------------------------------
 
-    /// `GET /envs/{store}/{env}/keys`. `user_id -> [wrapped-DEK entries]`. Requires >= reader.
-    pub async fn list_keys(&self, store: &str, env: &str) -> Result<KeysMap, SyncError> {
+    /// `GET /orgs/{org}/stores/{store}/branches/{branch}/keys`. `user_id -> [wrapped-DEK
+    /// entries]`. Requires >= reader.
+    pub async fn list_keys(&self, org: &str, store: &str, branch: &str) -> Result<KeysMap, SyncError> {
         let resp = self
             .authed(
                 self.http
-                    .get(self.url(&format!("/envs/{store}/{env}/keys"))),
+                    .get(self.url(&format!("/orgs/{org}/stores/{store}/branches/{branch}/keys"))),
             )
             .send()
             .await?;
         json_response(resp).await
     }
 
-    /// `POST /envs/{store}/{env}/keys`. Grant/update one user's wrapped DEK. Requires >= writer.
+    /// `POST /orgs/{org}/stores/{store}/branches/{branch}/keys`. Grant/update one user's wrapped
+    /// DEK. Requires >= writer.
     pub async fn grant_key(
         &self,
+        org: &str,
         store: &str,
-        env: &str,
+        branch: &str,
         req: &GrantKeyRequest,
     ) -> Result<(), SyncError> {
         let resp = self
             .authed(
                 self.http
-                    .post(self.url(&format!("/envs/{store}/{env}/keys")))
+                    .post(self.url(&format!("/orgs/{org}/stores/{store}/branches/{branch}/keys")))
                     .json(req),
             )
             .send()
@@ -368,17 +397,19 @@ impl SyncClient {
         ok_response(resp).await
     }
 
-    /// `POST /envs/{store}/{env}/rotate`. Atomic rotation batch. Requires admin.
+    /// `POST /orgs/{org}/stores/{store}/branches/{branch}/rotate`. Atomic rotation batch.
+    /// Requires admin.
     pub async fn rotate(
         &self,
+        org: &str,
         store: &str,
-        env: &str,
+        branch: &str,
         req: &RotateRequest,
     ) -> Result<(), SyncError> {
         let resp = self
             .authed(
                 self.http
-                    .post(self.url(&format!("/envs/{store}/{env}/rotate")))
+                    .post(self.url(&format!("/orgs/{org}/stores/{store}/branches/{branch}/rotate")))
                     .json(req),
             )
             .send()
@@ -386,17 +417,19 @@ impl SyncClient {
         ok_response(resp).await
     }
 
-    /// `POST /envs/{store}/{env}/members`. Add/update a member's role. Requires admin.
+    /// `POST /orgs/{org}/stores/{store}/branches/{branch}/members`. Add/update a member's role
+    /// (also auto-joins them to the org server-side). Requires admin.
     pub async fn add_member(
         &self,
+        org: &str,
         store: &str,
-        env: &str,
+        branch: &str,
         req: &MemberRequest,
     ) -> Result<(), SyncError> {
         let resp = self
             .authed(
                 self.http
-                    .post(self.url(&format!("/envs/{store}/{env}/members")))
+                    .post(self.url(&format!("/orgs/{org}/stores/{store}/branches/{branch}/members")))
                     .json(req),
             )
             .send()
@@ -404,16 +437,18 @@ impl SyncClient {
         ok_response(resp).await
     }
 
-    /// `DELETE /envs/{store}/{env}/members/{user_id}`. Remove a member. Requires admin.
+    /// `DELETE /orgs/{org}/stores/{store}/branches/{branch}/members/{user_id}`. Remove a member.
+    /// Requires admin.
     pub async fn remove_member(
         &self,
+        org: &str,
         store: &str,
-        env: &str,
+        branch: &str,
         user_id: &str,
     ) -> Result<(), SyncError> {
         let resp = self
             .authed(self.http.delete(self.url(&format!(
-                "/envs/{store}/{env}/members/{user_id}"
+                "/orgs/{org}/stores/{store}/branches/{branch}/members/{user_id}"
             ))))
             .send()
             .await?;

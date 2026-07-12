@@ -1,10 +1,21 @@
-//! The identity / context-switching commands: `login`, `context add|list`,
-//! `context` (show), `use`, and `link`.
+//! `wonton login`, `whoami`, `store create` (advanced/manual), `init`, `branch`
+//! (list/create/switch), and the VCS porcelain (status/set/unset/commit/log/diff/pull/push/run/
+//! export/merge/share/revoke/rotate).
 //!
-//! Each command's *logic* is a free function taking explicit `config_path` / `socket_path` /
-//! `cwd` arguments (rather than resolving the real defaults itself), so integration tests can
-//! drive it against a temp config, an in-process agent daemon over a temp socket, and a real
-//! `wonton-server`. The thin `main.rs` handlers resolve the real defaults and call these.
+//! Each command's *logic* is a free function taking explicit `config_path` / `state_path` /
+//! `socket_path` / `cwd` arguments (rather than resolving the real defaults itself), so
+//! integration tests can drive it against a temp config, an in-process agent daemon over a temp
+//! socket, and a real `wonton-server`. The thin `main.rs` handlers resolve the real defaults and
+//! call these.
+//!
+//! ## `Workspace`: the single resolved unit every porcelain command operates on
+//! A directory is bound to a store by a committed `wonton.toml` (`server` + `store = "org/
+//! store"`); the current branch lives in an uncommitted sibling `.wonton.local` (`branch =
+//! "..."`), read fresh on every invocation — see `crate::config`'s module docs. [`resolve_workspace`]
+//! combines that with a resolved local [`Identity`] into a [`Workspace`], which every porcelain
+//! command below starts from. There is no more separate "context" concept: a branch **is** the
+//! crypto/ACL unit (it replaced "environment"), and the agent/`LocalState` key for it is simply
+//! `"{org}/{store}/{branch}"` (see [`Workspace::key`]).
 //!
 //! ## Wrapped-privkey wire framing (the convention this task owns — keep it consistent)
 //! The server treats the wrapped private key as one opaque blob. Both register and login here
@@ -15,7 +26,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context as _};
 use base64::engine::general_purpose::STANDARD;
@@ -24,8 +35,9 @@ use uuid::Uuid;
 use wonton_crypto::{generate_identity, EncryptedValue};
 use wonton_objects::{Blob, Commit, Hash, LocalObjectStore, Tree, HASH_LEN};
 use wonton_shared::{
-    Argon2ParamsDto, CreateEnvRequest, CreateStoreRequest, GrantKeyRequest, LoginCompleteRequest,
-    LoginStartRequest, MemberRequest, ObjectUploadRequest, RegisterRequest, Role, RotateRequest,
+    Argon2ParamsDto, CreateBranchRequest, CreateOrgRequest, CreateStoreRequest, GrantKeyRequest,
+    LoginCompleteRequest, LoginStartRequest, MemberRequest, ObjectUploadRequest, RegisterRequest,
+    Role, RotateRequest,
 };
 use wonton_sync::{PullOutcome, SyncClient, SyncError};
 use wonton_vcs::{DiffEntry, MergeEntry, ValueDecryptor, ValueEncryptor, WorkingSet};
@@ -33,10 +45,10 @@ use wonton_vcs::{DiffEntry, MergeEntry, ValueDecryptor, ValueEncryptor, WorkingS
 use crate::agent::cipher::AgentCipher;
 use crate::agent::client as agent;
 use crate::agent::protocol::Argon2ParamsWire;
-use crate::config::{self, Config, Context, Identity};
+use crate::config::{self, Config, Identity};
 use crate::state::{
-    object_store_dir_for, open_object_store, ConflictHashes, LocalState, MergeState,
-    ResolvedEntry, StagedEntry,
+    object_store_dir_for, open_object_store, BranchState, ConflictHashes, ForkedFrom, LocalState,
+    MergeState, ResolvedEntry, StagedEntry,
 };
 
 /// `wonton login <username>`. Registers on first use of a username, unlocks the agent, completes
@@ -59,9 +71,11 @@ pub async fn login(
     let existing = config.find_identity(name).cloned();
     let server_url = server_url
         .or_else(|| existing.as_ref().map(|i| i.server_url.clone()))
+        .or_else(|| config.default_server.clone())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "--server <url> is required the first time you log in as '{username}'"
+                "--server <url> is required the first time you log in as '{username}' (or set a \
+                 default with `wonton config set-server <url>`)"
             )
         })?;
 
@@ -99,6 +113,7 @@ pub async fn login(
                     x25519_pubkey: STANDARD.encode(public.x25519_pubkey),
                     wrapped_privkey: wrapped_b64.clone(),
                     argon2_params: params_dto.clone(),
+                    oauth_ticket: None,
                 })
                 .await
                 .context("registration failed")?;
@@ -174,75 +189,10 @@ pub async fn login(
     Ok(())
 }
 
-/// `wonton context add <name> --store --env --identity`. Validates the identity exists, then
-/// appends/updates the context. No network or agent interaction.
-pub fn context_add(
-    config_path: &Path,
-    name: &str,
-    store: &str,
-    environment: &str,
-    identity: &str,
-) -> anyhow::Result<()> {
-    let mut config = Config::load_from(config_path)?;
-    if config.find_identity(identity).is_none() {
-        bail!("no identity named '{identity}'; run `wonton login <username>` first");
-    }
-    config.upsert_context(Context {
-        name: name.to_string(),
-        store: store.to_string(),
-        environment: environment.to_string(),
-        identity: identity.to_string(),
-    });
-    config.save_to(config_path)?;
-    println!("Context '{name}' added ({store}@{environment}, identity '{identity}').");
-    Ok(())
-}
-
-/// `wonton context list`. Prints every configured context, marking the current one.
-pub fn context_list(config_path: &Path) -> anyhow::Result<()> {
-    let config = Config::load_from(config_path)?;
-    if config.contexts.is_empty() {
-        println!("No contexts configured. Add one with `wonton context add`.");
-        return Ok(());
-    }
-    for c in &config.contexts {
-        let current = config.current_context.as_deref() == Some(c.name.as_str());
-        let marker = if current { "*" } else { " " };
-        println!(
-            "{marker} {} -> {}@{} (identity: {})",
-            c.name, c.store, c.environment, c.identity
-        );
-    }
-    Ok(())
-}
-
-/// `wonton context` (no subcommand). Resolves and prints the current context and whether the
-/// agent currently holds a cached DEK for it. Does not auto-start the agent.
-pub async fn context_show(config_path: &Path, socket_path: &Path, cwd: &Path) -> anyhow::Result<()> {
-    let config = Config::load_from(config_path)?;
-    let name = config::resolve_context_name(&config, cwd)?;
-    let ctx = config
-        .find_context(&name)
-        .ok_or_else(|| anyhow::anyhow!("current context '{name}' is not in the config"))?;
-
-    // Best-effort: if the agent isn't running, report "no" rather than erroring.
-    let cached = match agent::status(socket_path).await {
-        Ok(status) => status.cached_contexts.contains(&ctx.name),
-        Err(_) => false,
-    };
-
-    println!("Context: {}", ctx.name);
-    println!("  store:       {}", ctx.store);
-    println!("  environment: {}", ctx.environment);
-    println!("  identity:    {}", ctx.identity);
-    println!("  DEK cached:  {}", if cached { "yes" } else { "no" });
-    Ok(())
-}
-
 /// `wonton whoami` — show which locally-logged-in identity/identities are cached, without
-/// needing a resolvable context (unlike `wonton context`, which requires one). Useful right
-/// after `login`, before any `context add` has happened, and for quickly checking which server
-/// an identity points at without digging into `config.toml`.
+/// needing a resolvable workspace. Useful right after `login`, before any `init`/`clone` has
+/// happened, and for quickly checking which server an identity points at without digging into
+/// `config.toml`.
 pub fn whoami(config_path: &Path) -> anyhow::Result<()> {
     let config = Config::load_from(config_path)?;
     let mut out = std::io::stdout();
@@ -281,149 +231,38 @@ pub(crate) fn whoami_report(config: &Config, out: &mut impl Write) -> anyhow::Re
     Ok(())
 }
 
-/// `wonton use <name>`. Switches the current context, unwrapping the environment's DEK into the
-/// agent the first time (cheap on subsequent uses once cached). This is the Phase 4 exit
-/// criterion: "switching context unwraps the right DEK".
-pub async fn use_context(
-    config_path: &Path,
-    state_path: &Path,
-    socket_path: &Path,
-    name: &str,
-) -> anyhow::Result<()> {
+/// `wonton config set-server <url>`. Stores a fallback server URL in the global config, used by
+/// `login` when neither `--server` nor an already-known identity supplies one — purely a
+/// bootstrapping convenience so a fresh machine doesn't need `--server` on every first login.
+pub fn config_set_server(config_path: &Path, url: &str) -> anyhow::Result<()> {
     let mut config = Config::load_from(config_path)?;
-    let ctx = config
-        .find_context(name)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("no context named '{name}'; add one with `wonton context add`"))?;
-    let identity = config
-        .find_identity(&ctx.identity)
-        .cloned()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "context '{name}' references unknown identity '{}'",
-                ctx.identity
-            )
-        })?;
-
-    // Step 2: the agent must be unlocked for this identity.
-    let status = agent::status(socket_path).await.map_err(|_| {
-        anyhow::anyhow!(
-            "agent is not running; run `wonton login {}` first",
-            identity.username
-        )
-    })?;
-    if !status.unlocked {
-        bail!("agent is locked; run `wonton login {}` first", identity.username);
-    }
-    // Guard against a different identity being resident (its unwrap would just fail closed, but a
-    // clear message is friendlier).
-    if let Ok(keys) = agent::public_identity(socket_path).await {
-        if keys.x25519_pubkey_b64 != identity.x25519_pubkey_b64 {
-            bail!(
-                "the agent is unlocked for a different identity; run `wonton login {}` first",
-                identity.username
-            );
-        }
-    }
-
-    // Step 3: already cached -> cheap switch, no network.
-    if status.cached_contexts.contains(&ctx.name) {
-        config.current_context = Some(ctx.name.clone());
-        config.save_to(config_path)?;
-        println!(
-            "Switched to context '{}' ({}@{}) [already cached].",
-            ctx.name, ctx.store, ctx.environment
-        );
-        return Ok(());
-    }
-
-    // Step 4: fetch the wrapped-DEK map and find this identity's entry.
-    let mut client = SyncClient::new(&identity.server_url);
-    if let Some(token) = &identity.session_token {
-        client.set_token(token);
-    }
-    let keys = match client.list_keys(&ctx.store, &ctx.environment).await {
-        Ok(k) => k,
-        // A non-member gets 403 before ever seeing the map — same user-facing meaning.
-        Err(SyncError::Forbidden) => {
-            bail!("you don't have access to {}@{}", ctx.store, ctx.environment)
-        }
-        Err(SyncError::Unauthorized) => bail!(
-            "your session for '{}' has expired; run `wonton login {}` again",
-            identity.name,
-            identity.username
-        ),
-        Err(e) => return Err(e).context("could not fetch the environment's wrapped-DEK map"),
-    };
-
-    let entry = keys
-        .get(&identity.user_id)
-        .and_then(|entries| entries.iter().max_by_key(|e| e.dek_version))
-        .ok_or_else(|| anyhow::anyhow!("you don't have access to {}@{}", ctx.store, ctx.environment))?;
-
-    // `sealed_box` is already base64 on the wire; forward it straight to the agent, which
-    // unwraps it with the resident X25519 secret and caches the DEK under the context name.
-    let dek_version = entry.dek_version;
-    agent::unwrap_dek(socket_path, ctx.name.clone(), entry.sealed_box.clone())
-        .await
-        .context("agent could not unwrap the DEK for this environment")?;
-
-    // Persist the version we just unwrapped so `share`/`rotate` know what version this context's
-    // cached DEK is (they can't ask the agent — the raw DEK never leaves it).
-    let mut state = LocalState::load_from(state_path)?;
-    state.context_mut(&ctx.name).dek_version = dek_version;
-    state.save_to(state_path)?;
-
-    // Step 5: record the selection.
-    config.current_context = Some(ctx.name.clone());
+    config.default_server = Some(url.to_string());
     config.save_to(config_path)?;
-    println!(
-        "Switched to context '{}' ({}@{}); DEK unwrapped into the agent.",
-        ctx.name, ctx.store, ctx.environment
-    );
+    println!("Default server set to {url}.");
     Ok(())
 }
 
-/// `wonton link <name>`. Binds the current directory to a context by writing a `.wonton` marker.
-/// Idempotent for the same context; refuses to overwrite a marker naming a *different* one.
-pub fn link(config_path: &Path, cwd: &Path, name: &str) -> anyhow::Result<()> {
+/// `wonton config show`. Prints the current default server, if any.
+pub fn config_show(config_path: &Path) -> anyhow::Result<()> {
     let config = Config::load_from(config_path)?;
-    if config.find_context(name).is_none() {
-        bail!("no context named '{name}'; add one with `wonton context add` first");
+    match &config.default_server {
+        Some(url) => println!("Default server: {url}"),
+        None => println!("No default server set. Run `wonton config set-server <url>` to set one."),
     }
-    let marker = cwd.join(".wonton");
-    if marker.exists() {
-        match config::read_marker_file(&marker) {
-            Some(existing) if existing == name => {
-                println!(".wonton already links this directory to '{name}'.");
-                return Ok(());
-            }
-            Some(existing) => bail!(
-                ".wonton already exists here linking to '{existing}'; refusing to overwrite it \
-                 (remove it first to relink)"
-            ),
-            None => bail!(
-                "a .wonton file already exists here but is unreadable/malformed; refusing to \
-                 overwrite it"
-            ),
-        }
-    }
-    std::fs::write(&marker, format!("context = \"{name}\"\n"))
-        .with_context(|| format!("writing {}", marker.display()))?;
-    println!("Linked this directory to context '{name}' (wrote .wonton).");
     Ok(())
 }
 
 // =====================================================================================
-// Provisioning: create a store/environment. Any authenticated identity can create a store
-// (stores have no membership of their own); creating an environment additionally bootstraps and
-// self-grants its first DEK, since only a client holding key material can do that — the server
-// can never generate or wrap a DEK on anyone's behalf.
+// Provisioning: `store create` (advanced/manual — the golden path is `init`/`branch -b`, which
+// defer all server contact to the first `push`). Any org member may create a store within it;
+// creating a branch additionally bootstraps and self-grants its first DEK, since only a client
+// holding key material can do that — the server can never generate or wrap a DEK on anyone's
+// behalf.
 // =====================================================================================
 
-/// Resolve which identity a provisioning command should act as: the caller-supplied `--identity`
-/// if given, else the sole cached identity if there's exactly one, else a clear error naming the
-/// choices (0 identities: log in first; 2+: ambiguous, must disambiguate).
+/// Resolve which identity a command should act as: the caller-supplied `--identity` if given,
+/// else the sole cached identity if there's exactly one, else a clear error naming the choices
+/// (0 identities: log in first; 2+: ambiguous, must disambiguate).
 fn resolve_identity_name<'a>(config: &'a Config, given: Option<&'a str>) -> anyhow::Result<&'a str> {
     if let Some(name) = given {
         return Ok(name);
@@ -438,105 +277,457 @@ fn resolve_identity_name<'a>(config: &'a Config, given: Option<&'a str>) -> anyh
     }
 }
 
-/// `wonton store create <name> [--identity <identity>]` — create a new store on the server.
-/// `--identity` is only required if more than one identity is logged in locally. Idempotent:
-/// a store that already exists is treated as success, not an error (`mkdir -p` style), so a
-/// repeated onboarding flow can safely re-run this.
+fn resolve_identity(config: &Config, identity_name: Option<&str>) -> anyhow::Result<Identity> {
+    let name = resolve_identity_name(config, identity_name)?;
+    config
+        .find_identity(name)
+        .cloned()
+        .ok_or_else(|| anyhow!("no identity named '{name}'; run `wonton login {name}` first"))
+}
+
+/// Resolve which identity a *directory-bound* command should act as, narrowed by the project's
+/// own `wonton.toml`-declared `server` — the local repo config always wins over guessing across
+/// every logged-in identity, mirroring how a git remote URL pins which credentials apply. An
+/// explicit `--identity` still wins outright. Narrowing by server also resolves what would
+/// otherwise be an ambiguity error: two identities logged into two different servers no longer
+/// collide just because both are cached locally.
+fn resolve_identity_for_project(config: &Config, server: &str, identity_name: Option<&str>) -> anyhow::Result<Identity> {
+    if let Some(name) = identity_name {
+        return config
+            .find_identity(name)
+            .cloned()
+            .ok_or_else(|| anyhow!("no identity named '{name}'; run `wonton login {name}` first"));
+    }
+    let matching: Vec<&Identity> = config.identities.iter().filter(|i| i.server_url == server).collect();
+    match matching.as_slice() {
+        [] => bail!(
+            "no identity logged in for server '{server}' (this project's wonton.toml); run \
+             `wonton login <username> --server {server}` first"
+        ),
+        [only] => Ok((*only).clone()),
+        many => {
+            let names: Vec<&str> = many.iter().map(|i| i.name.as_str()).collect();
+            bail!(
+                "multiple identities are logged in for server '{server}' ({}); pass --identity to \
+                 disambiguate",
+                names.join(", ")
+            )
+        }
+    }
+}
+
+/// `wonton store create <org> <name> [--identity <identity>]` — create a store (repo) within an
+/// org, creating the org first if it doesn't exist yet (the creator becomes its owner).
+/// `--identity` is only required if more than one identity is logged in locally. Idempotent: an
+/// org/store that already exists is treated as success, not an error (`mkdir -p` style).
 pub async fn store_create(
     config_path: &Path,
     identity_name: Option<&str>,
+    org: &str,
     name: &str,
 ) -> anyhow::Result<()> {
     let config = Config::load_from(config_path)?;
-    let identity_name = resolve_identity_name(&config, identity_name)?;
-    let identity = config.find_identity(identity_name).ok_or_else(|| {
-        anyhow!("no identity named '{identity_name}'; run `wonton login {identity_name}` first")
-    })?;
-    let client = authed_client(identity);
-    match client.create_store(&CreateStoreRequest { name: name.to_string() }).await {
-        Ok(_) => println!("Created store '{name}'."),
-        Err(e) if e.is_already_exists() => println!("Store '{name}' already exists; nothing to do."),
-        Err(e) => return Err(e).with_context(|| format!("could not create store '{name}'")),
+    let identity = resolve_identity(&config, identity_name)?;
+    let client = authed_client(&identity);
+
+    match client.create_org(&CreateOrgRequest { name: org.to_string() }).await {
+        Ok(_) => println!("Created org '{org}'."),
+        Err(e) if e.is_already_exists() => {}
+        Err(e) => return Err(e).with_context(|| format!("could not create org '{org}'")),
     }
-    Ok(())
-}
-
-/// `wonton env create <store> <env> [--identity <identity>]` — create a new environment within
-/// `store` (the caller becomes its first admin member, same as the server already does for
-/// `POST /stores/{{store}}/envs`), then immediately bootstrap the environment's first DEK:
-/// generate it in the agent, wrap it for the caller's own X25519 public key, and self-grant it
-/// at version 1. No context needs to exist yet for this — a scratch label stages the DEK in the
-/// agent just long enough to wrap it. `--identity` is only required if more than one identity is
-/// logged in locally.
-///
-/// Idempotent, but only in the sense that re-running it is safe: if the environment already
-/// exists, this is a no-op that does **not** attempt the DEK bootstrap (self-granting into an
-/// environment you didn't just create would be wrong — you either already have access, or you
-/// need an admin to `wonton share` you in).
-pub async fn env_create(
-    config_path: &Path,
-    socket_path: &Path,
-    identity_name: Option<&str>,
-    store: &str,
-    env: &str,
-) -> anyhow::Result<()> {
-    let config = Config::load_from(config_path)?;
-    let identity_name = resolve_identity_name(&config, identity_name)?;
-    let identity = config.find_identity(identity_name).ok_or_else(|| {
-        anyhow!("no identity named '{identity_name}'; run `wonton login {identity_name}` first")
-    })?;
-    let client = authed_client(identity);
-
-    match client.create_env(store, &CreateEnvRequest { name: env.to_string() }).await {
-        Ok(_) => {}
-        Err(e) if e.is_already_exists() => {
-            println!(
-                "Environment '{store}@{env}' already exists; skipping creation and DEK bootstrap."
-            );
-            println!(
-                "If you don't already have access, ask an admin to run `wonton share <you> \
-                 --context <context>`."
-            );
-            return Ok(());
-        }
-        Err(e) => return Err(e).with_context(|| format!("could not create environment '{store}@{env}'")),
+    match client.create_store(org, &CreateStoreRequest { name: name.to_string() }).await {
+        Ok(_) => println!("Created store '{org}/{name}'."),
+        Err(e) if e.is_already_exists() => println!("Store '{org}/{name}' already exists; nothing to do."),
+        Err(e) => return Err(e).with_context(|| format!("could not create store '{org}/{name}'")),
     }
-
-    let temp_ctx = format!("{store}-{env}::init");
-    agent::generate_dek(socket_path, temp_ctx.clone())
-        .await
-        .context("agent could not generate the environment's first DEK (are you logged in?)")?;
-    let sealed = agent::wrap_dek_for_recipient(socket_path, temp_ctx, identity.x25519_pubkey_b64.clone())
-        .await
-        .context("agent could not wrap the DEK for self-grant")?;
-    client
-        .grant_key(
-            store,
-            env,
-            &GrantKeyRequest {
-                user_id: identity.user_id.clone(),
-                dek_version: 1,
-                sealed_box: sealed,
-            },
-        )
-        .await
-        .context("could not self-grant the environment's first DEK")?;
-
-    println!("Created environment '{store}@{env}' and granted yourself DEK v1.");
-    println!(
-        "Next: wonton context add <name> --store {store} --env {env} --identity {identity_name}"
-    );
     Ok(())
 }
 
 // =====================================================================================
-// Phase 4c: the VCS porcelain (switch/status/set/unset/commit/log/diff/pull/push/run/export)
-//
-// Every command below operates on a caller-resolved *current context* (`main.rs` resolves the
-// name via `config::resolve_context_name` and passes it as `ctx_name`; there is no `--context`
-// flag in v1). None of them ever holds a raw `Dek` or `UnlockedIdentity`: all encrypt/decrypt/
-// sign goes through the agent socket via [`AgentCipher`]. `state.toml` holds only key names and
-// content hashes — never plaintext or ciphertext bytes.
+// The resolved workspace every directory-bound command starts from.
+// =====================================================================================
+
+/// A resolved `wonton.toml`/`.wonton.local` project + the local identity to act as.
+#[derive(Debug, Clone)]
+pub struct Workspace {
+    /// The directory `wonton.toml` was found in (where `.wonton.local` lives too).
+    pub dir: PathBuf,
+    pub org: String,
+    pub store: String,
+    pub branch: String,
+    pub identity: Identity,
+}
+
+impl Workspace {
+    /// The agent/`LocalState` key for this workspace's branch: `"{org}/{store}/{branch}"`.
+    pub fn key(&self) -> String {
+        format!("{}/{}/{}", self.org, self.store, self.branch)
+    }
+}
+
+/// Resolve the current directory's workspace: walk up for `wonton.toml`, read `.wonton.local`
+/// for the current branch (defaulting to `"main"` if absent — e.g. a fresh `git clone` that
+/// never had one written locally yet), and resolve the identity to act as.
+pub fn resolve_workspace(config_path: &Path, cwd: &Path, identity_name: Option<&str>) -> anyhow::Result<Workspace> {
+    let project = config::find_project(cwd).ok_or_else(|| {
+        anyhow!(
+            "no wonton.toml found in this directory or its ancestors; run `wonton init` to \
+             start a new project, or `wonton clone <org> <store>` to join an existing one"
+        )
+    })?;
+    let branch = config::read_local_branch(&project.dir).unwrap_or_else(|| "main".to_string());
+    let config = Config::load_from(config_path)?;
+    let identity = resolve_identity_for_project(&config, &project.server, identity_name)?;
+    Ok(Workspace {
+        dir: project.dir,
+        org: project.org,
+        store: project.store,
+        branch,
+        identity,
+    })
+}
+
+/// Require the agent to be running, unlocked, and unlocked for `identity` specifically. Shared
+/// by every command that needs the agent at all.
+async fn require_agent_unlocked_for(socket_path: &Path, identity: &Identity) -> anyhow::Result<agent::AgentStatus> {
+    let status = agent::status(socket_path).await.map_err(|_| {
+        anyhow!("agent is not running; run `wonton login {}` first", identity.username)
+    })?;
+    if !status.unlocked {
+        bail!("agent is locked; run `wonton login {}` first", identity.username);
+    }
+    if let Ok(keys) = agent::public_identity(socket_path).await {
+        if keys.x25519_pubkey_b64 != identity.x25519_pubkey_b64 {
+            bail!(
+                "the agent is unlocked for a different identity; run `wonton login {}` first",
+                identity.username
+            );
+        }
+    }
+    Ok(status)
+}
+
+/// Fetch + unwrap the wrapped DEK for `(org, store, branch)` into the agent under its key,
+/// persisting the granted version to `LocalState`. Extracted so both the explicit `wonton
+/// branch <name>` switch and the automatic "make sure I'm ready" guard on every porcelain
+/// command share one implementation.
+async fn ensure_dek_unwrapped(
+    state_path: &Path,
+    socket_path: &Path,
+    org: &str,
+    store: &str,
+    branch: &str,
+    identity: &Identity,
+) -> anyhow::Result<()> {
+    let key = format!("{org}/{store}/{branch}");
+    let mut client = SyncClient::new(&identity.server_url);
+    if let Some(token) = &identity.session_token {
+        client.set_token(token);
+    }
+    let keys = match client.list_keys(org, store, branch).await {
+        Ok(k) => k,
+        Err(SyncError::Forbidden) => bail!("you don't have access to {org}/{store}/{branch}"),
+        Err(SyncError::Unauthorized) => bail!(
+            "your session for '{}' has expired; run `wonton login {}` again",
+            identity.name,
+            identity.username
+        ),
+        Err(e) => return Err(e).context("could not fetch the branch's wrapped-DEK map"),
+    };
+    let entry = keys
+        .get(&identity.user_id)
+        .and_then(|entries| entries.iter().max_by_key(|e| e.dek_version))
+        .ok_or_else(|| anyhow!("you don't have access to {org}/{store}/{branch}"))?;
+    let dek_version = entry.dek_version;
+    agent::unwrap_dek(socket_path, key.clone(), entry.sealed_box.clone())
+        .await
+        .context("agent could not unwrap the DEK for this branch")?;
+    let mut state = LocalState::load_from(state_path)?;
+    state.branch_mut(&key).dek_version = dek_version;
+    state.save_to(state_path)?;
+    Ok(())
+}
+
+/// Pull `(org, store, branch)` if a fast-forward is available, silently doing nothing on
+/// `UpToDate`/`Diverged` (this is the automatic "seed local history" path, not an explicit
+/// `wonton pull` — a divergence here is surfaced the normal way the next time the user runs
+/// `wonton pull` themselves).
+async fn auto_pull(state_path: &Path, org: &str, store: &str, branch: &str, identity: &Identity) -> anyhow::Result<()> {
+    let key = format!("{org}/{store}/{branch}");
+    let mut state = LocalState::load_from(state_path)?;
+    let local_tip = state.branch(&key).and_then(|b| b.tip);
+    let obj_store = open_object_store(&object_store_dir_for(state_path))?;
+    let client = authed_client(identity);
+    let outcome = wonton_sync::pull(&client, &obj_store, org, store, branch, local_tip).await?;
+    if let PullOutcome::FastForward { new_tip } = outcome {
+        state.branch_mut(&key).tip = Some(new_tip);
+        state.save_to(state_path)?;
+    }
+    Ok(())
+}
+
+/// Make sure `(org, store, branch)` is ready to be read/written under `identity`: the agent is
+/// unlocked for them, the DEK is cached (unwrapping it if not — the "just works after `login` +
+/// `share`" path), and — only for a branch that's known to exist server-side
+/// (`dek_version > 0`) but has no local history yet — automatically pulled once. A branch that
+/// only exists locally so far (`dek_version == 0`, e.g. straight after `init`/`branch -b`, never
+/// pushed) is deliberately NOT auto-pulled: there is nothing to pull, and trying would require
+/// network access that `init`'s "zero network calls" promise depends on not needing.
+async fn ready_branch(
+    state_path: &Path,
+    socket_path: &Path,
+    org: &str,
+    store: &str,
+    branch: &str,
+    identity: &Identity,
+) -> anyhow::Result<()> {
+    let status = require_agent_unlocked_for(socket_path, identity).await?;
+    let key = format!("{org}/{store}/{branch}");
+    if !status.cached_contexts.contains(&key) {
+        ensure_dek_unwrapped(state_path, socket_path, org, store, branch, identity).await?;
+    }
+    let state = LocalState::load_from(state_path)?;
+    let bs = state.branch(&key).cloned().unwrap_or_default();
+    if bs.tip.is_none() && bs.dek_version > 0 {
+        auto_pull(state_path, org, store, branch, identity).await?;
+    }
+    Ok(())
+}
+
+/// [`ready_branch`] for a whole [`Workspace`] (its own org/store/branch/identity).
+async fn ready_workspace(state_path: &Path, socket_path: &Path, ws: &Workspace) -> anyhow::Result<()> {
+    ready_branch(state_path, socket_path, &ws.org, &ws.store, &ws.branch, &ws.identity).await
+}
+
+/// The last path component of `cwd`, used as `init`'s default store name when none is given.
+fn default_store_name(cwd: &Path) -> String {
+    cwd.file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "store".to_string())
+}
+
+// =====================================================================================
+// `wonton init` — fully local workspace bootstrap (zero network calls). Server contact is
+// deferred to the first `wonton push` (see `provision_on_first_push`).
+// =====================================================================================
+
+/// `wonton init [ORG] [STORE] [BRANCH] [--identity <identity>]`. Defaults: `ORG` = your username,
+/// `STORE` = the current directory's name, `BRANCH` = `"main"`. Generates a fresh DEK locally
+/// under the resolved key and writes `wonton.toml` (committed) + `.wonton.local` (not
+/// committed). Idempotent if `wonton.toml` already names the same org/store.
+pub async fn init(
+    config_path: &Path,
+    socket_path: &Path,
+    cwd: &Path,
+    org: Option<String>,
+    store: Option<String>,
+    branch: Option<String>,
+    identity_name: Option<&str>,
+) -> anyhow::Result<()> {
+    let config = Config::load_from(config_path)?;
+    let identity = resolve_identity(&config, identity_name)?;
+
+    let org = org.unwrap_or_else(|| identity.username.clone());
+    let store = store.unwrap_or_else(|| default_store_name(cwd));
+    let branch = branch.unwrap_or_else(|| "main".to_string());
+
+    let marker_path = cwd.join("wonton.toml");
+    if marker_path.exists() {
+        match config::read_wonton_toml(&marker_path) {
+            Some(w) if w.store == format!("{org}/{store}") => {
+                println!("wonton.toml already tracks '{org}/{store}'.");
+            }
+            Some(w) => bail!(
+                "wonton.toml already exists here and tracks '{}'; refusing to overwrite it \
+                 (remove it first to re-init)",
+                w.store
+            ),
+            None => bail!(
+                "a wonton.toml file already exists here but is unreadable/malformed; refusing to \
+                 overwrite it"
+            ),
+        }
+    } else {
+        let key = format!("{org}/{store}/{branch}");
+        agent::generate_dek(socket_path, key)
+            .await
+            .context("agent could not generate a DEK (are you logged in?)")?;
+        config::write_wonton_toml(&marker_path, &identity.server_url, &org, &store)
+            .context("writing wonton.toml")?;
+        println!("Initialized '{org}/{store}' in {} (wrote wonton.toml).", cwd.display());
+    }
+    config::write_local_branch(cwd, &branch).context("writing .wonton.local")?;
+    println!("wonton: add `.wonton.local` to .gitignore — it's per-clone local state, not shared.");
+    println!("Next: wonton set KEY=value, wonton commit -m \"...\", wonton push");
+    Ok(())
+}
+
+/// `wonton clone <org> <store> [branch] [--identity <identity>]`. For a directory that isn't a
+/// git checkout carrying a `wonton.toml` already (access was communicated out-of-band): writes
+/// the marker + `.wonton.local`, then makes a best-effort attempt to confirm access and pull
+/// history right away, so the failure mode ("not shared in yet") is reported immediately instead
+/// of on the first porcelain command. No network beyond that attempt.
+#[allow(clippy::too_many_arguments)]
+pub async fn clone(
+    config_path: &Path,
+    state_path: &Path,
+    socket_path: &Path,
+    cwd: &Path,
+    org: &str,
+    store: &str,
+    branch: Option<&str>,
+    identity_name: Option<&str>,
+) -> anyhow::Result<()> {
+    let config = Config::load_from(config_path)?;
+    let identity = resolve_identity(&config, identity_name)?;
+    let branch = branch.unwrap_or("main");
+
+    let marker_path = cwd.join("wonton.toml");
+    if marker_path.exists() {
+        bail!("wonton.toml already exists in this directory; refusing to overwrite it");
+    }
+    config::write_wonton_toml(&marker_path, &identity.server_url, org, store).context("writing wonton.toml")?;
+    config::write_local_branch(cwd, branch).context("writing .wonton.local")?;
+    println!(
+        "Cloned '{org}/{store}' (branch '{branch}') into {} (wrote wonton.toml + .wonton.local).",
+        cwd.display()
+    );
+
+    match ready_branch(state_path, socket_path, org, store, branch, &identity).await {
+        Ok(()) => println!("Ready — access confirmed and history pulled."),
+        Err(e) => println!(
+            "wonton: wrote the marker, but couldn't confirm access yet ({e}). Run any command \
+             here once you've been shared in."
+        ),
+    }
+    Ok(())
+}
+
+// =====================================================================================
+// `wonton branch` — list / create (`-b`) / switch. Replaces the old `switch` + `env create` +
+// `context add` + `use` + `link` family entirely: a branch is now the crypto/ACL unit, so
+// switching to one just needs its DEK (cached or freshly unwrapped) and there's no separate
+// "context" indirection left to manage.
+// =====================================================================================
+
+/// `wonton branch` (no args) — list branches known locally for the current store, marking the
+/// current one (read from `.wonton.local`).
+pub async fn branch_list(config_path: &Path, state_path: &Path, cwd: &Path) -> anyhow::Result<()> {
+    let ws = resolve_workspace(config_path, cwd, None)?;
+    let prefix = format!("{}/{}/", ws.org, ws.store);
+    let state = LocalState::load_from(state_path)?;
+    let mut names: std::collections::BTreeSet<String> = state
+        .branches
+        .keys()
+        .filter_map(|k| k.strip_prefix(prefix.as_str()).map(|s| s.to_string()))
+        .collect();
+    names.insert(ws.branch.clone());
+
+    // Best-effort: also show every branch the server knows this identity has access to (like
+    // `git branch -a` syncing with the remote) — a fresh clone with no local history yet still
+    // sees the full accessible branch list, not just the one branch it happens to be on.
+    let client = authed_client(&ws.identity);
+    match client.list_branches(&ws.org, &ws.store).await {
+        Ok(remote) => {
+            for b in remote {
+                names.insert(b.name);
+            }
+        }
+        Err(_) => {
+            println!("(could not reach the server — showing locally-known branches only)");
+        }
+    }
+
+    for name in &names {
+        let marker = if name == &ws.branch { "*" } else { " " };
+        println!("{marker} {name}");
+    }
+    Ok(())
+}
+
+/// `wonton branch <name>` — switch: rewrite `.wonton.local`, making sure the branch's DEK is
+/// ready (unwrapping/auto-pulling as needed via [`ready_branch`]) first.
+pub async fn branch_switch(config_path: &Path, state_path: &Path, socket_path: &Path, cwd: &Path, name: &str) -> anyhow::Result<()> {
+    let ws = resolve_workspace(config_path, cwd, None)?;
+    ready_branch(state_path, socket_path, &ws.org, &ws.store, name, &ws.identity)
+        .await
+        .with_context(|| format!("could not switch to branch '{name}'"))?;
+    config::write_local_branch(&ws.dir, name).context("writing .wonton.local")?;
+    println!("Switched to branch '{name}'.");
+    Ok(())
+}
+
+/// `wonton branch -b <name> [--from <source>] [--identity <identity>]` — create a new branch: a
+/// fresh DEK, generated and cached locally (zero network calls, same principle as `init`), and
+/// switch to it. If `--from` is given, the source branch's current effective values (needs its
+/// own DEK — `ready_branch`'d here) become this branch's first commit, re-encrypted under its
+/// own new DEK, and that commit is recorded as the branch's root/fork point (`ForkedFrom`) —
+/// `wonton merge` uses it as a cross-DEK merge base later. Refuses to clobber an already-known
+/// branch of the same name.
+pub async fn branch_create(
+    config_path: &Path,
+    state_path: &Path,
+    socket_path: &Path,
+    cwd: &Path,
+    name: &str,
+    from: Option<&str>,
+    identity_name: Option<&str>,
+) -> anyhow::Result<()> {
+    let ws = resolve_workspace(config_path, cwd, identity_name)?;
+    let new_key = format!("{}/{}/{}", ws.org, ws.store, name);
+
+    let mut state = LocalState::load_from(state_path)?;
+    if state.branch(&new_key).is_some() {
+        bail!("branch '{name}' already exists locally in this store; use `wonton branch {name}` to switch to it");
+    }
+
+    agent::generate_dek(socket_path, new_key.clone())
+        .await
+        .context("agent could not generate a DEK (are you logged in?)")?;
+
+    // Mark the branch as locally known even with no `--from` (no tip yet) — otherwise a second
+    // `branch -b <name>` with the same name would not see it as already existing.
+    state.branch_mut(&new_key);
+
+    if let Some(source) = from {
+        ready_branch(state_path, socket_path, &ws.org, &ws.store, source, &ws.identity).await?;
+        let source_key = format!("{}/{}/{}", ws.org, ws.store, source);
+        state = LocalState::load_from(state_path)?; // ready_branch may have persisted a pulled tip
+        let source_tip = state.branch(&source_key).and_then(|b| b.tip);
+
+        let obj_store = open_object_store(&object_store_dir_for(state_path))?;
+        let source_cipher = AgentCipher::new(socket_path, source_key.clone());
+        let new_cipher = AgentCipher::new(socket_path, new_key.clone());
+        let working_set = effective_working_set(&obj_store, &source_cipher, source_tip, &BTreeMap::new())?;
+        let author_id = Uuid::parse_str(&ws.identity.user_id)
+            .with_context(|| format!("identity user_id '{}' is not a valid UUID", ws.identity.user_id))?;
+        let root = wonton_vcs::commit(
+            &obj_store,
+            &new_cipher,
+            &source_cipher,
+            author_id,
+            None,
+            &working_set,
+            format!("fork from '{source}'"),
+        )?;
+
+        let bs = state.branch_mut(&new_key);
+        bs.tip = Some(root);
+        bs.forked_from = Some(ForkedFrom { branch: source_key, root });
+    }
+    state.save_to(state_path)?;
+
+    config::write_local_branch(&ws.dir, name).context("writing .wonton.local")?;
+    println!("Created branch '{name}' (switched to it).");
+    Ok(())
+}
+
+// =====================================================================================
+// The VCS porcelain: status/set/unset/commit/log/diff/pull/push/run/export/merge. None of these
+// ever hold a raw `Dek` or `UnlockedIdentity`: all encrypt/decrypt/sign goes through the agent
+// socket via [`AgentCipher`]. `state.toml` holds only key names and content hashes — never
+// plaintext or ciphertext bytes.
 // =====================================================================================
 
 /// The output format for `wonton export`. Only dotenv is supported in v1.
@@ -555,87 +746,32 @@ impl ExportFormat {
     }
 }
 
-/// Resolve a context + its identity from config, requiring the agent to be unlocked for that
-/// identity and holding a cached DEK for the context. Mirrors `use_context`'s guard style so the
-/// failure message always points the user at `wonton use`.
-async fn ready_context(
-    config: &Config,
-    socket_path: &Path,
-    ctx_name: &str,
-) -> anyhow::Result<(Context, Identity)> {
-    let ctx = config
-        .find_context(ctx_name)
-        .cloned()
-        .ok_or_else(|| anyhow!("no context named '{ctx_name}'; add one with `wonton context add`"))?;
-    let identity = config
-        .find_identity(&ctx.identity)
-        .cloned()
-        .ok_or_else(|| anyhow!("context '{ctx_name}' references unknown identity '{}'", ctx.identity))?;
-
-    let status = agent::status(socket_path)
-        .await
-        .map_err(|_| anyhow!("agent is not running; run `wonton use {ctx_name}` first"))?;
-    if !status.unlocked || !status.cached_contexts.contains(&ctx.name) {
-        bail!("no DEK cached for context '{ctx_name}'; run `wonton use {ctx_name}` first");
-    }
-    Ok((ctx, identity))
-}
-
-/// `wonton switch <branch>` — purely local: set the current context's branch. No DEK unwrap, no
-/// network. This is the Phase-4 exit criterion "switching branch needs no unwrap".
-pub fn switch(state_path: &Path, ctx_name: &str, branch: &str, create: bool) -> anyhow::Result<()> {
-    let mut state = LocalState::load_from(state_path)?;
-    let cs = state.context(ctx_name).cloned().unwrap_or_default();
-    let known = cs.branch == branch || cs.tips.contains_key(branch);
-    if !known && !create {
-        bail!(
-            "no local record of branch '{branch}' in context '{ctx_name}'; pass --create if \
-             you're starting a brand new branch, or if you're about to `wonton pull` a branch \
-             that exists on the remote but you haven't fetched yet"
-        );
-    }
-    state.context_mut(ctx_name).branch = branch.to_string();
-    state.save_to(state_path)?;
-    println!("Switched context '{ctx_name}' to branch '{branch}'.");
-    Ok(())
-}
-
-/// `wonton status` — print context, branch, DEK-cached status, and the staged working-tree diff.
-pub async fn status(
-    config_path: &Path,
-    state_path: &Path,
-    socket_path: &Path,
-    ctx_name: &str,
-) -> anyhow::Result<()> {
-    let config = Config::load_from(config_path)?;
-    let ctx = config
-        .find_context(ctx_name)
-        .ok_or_else(|| anyhow!("no context named '{ctx_name}'"))?;
+/// `wonton status` — print the workspace, branch, DEK-cached status, and the staged working-tree
+/// diff.
+pub async fn status(config_path: &Path, state_path: &Path, socket_path: &Path, cwd: &Path) -> anyhow::Result<()> {
+    let ws = resolve_workspace(config_path, cwd, None)?;
+    let key = ws.key();
     let state = LocalState::load_from(state_path)?;
-    let cs = state.context(ctx_name).cloned().unwrap_or_default();
-    let branch = cs.branch.clone();
+    let bs = state.branch(&key).cloned().unwrap_or_default();
 
-    // Best-effort DEK-cached check (report "no" if the agent isn't running).
     let cached = match agent::status(socket_path).await {
-        Ok(s) => s.cached_contexts.contains(&ctx.name),
+        Ok(s) => s.cached_contexts.contains(&key),
         Err(_) => false,
     };
 
-    println!("Context: {ctx_name}");
-    println!("  store:       {}", ctx.store);
-    println!("  environment: {}", ctx.environment);
-    println!("  branch:      {branch}");
+    println!("Workspace: {}/{}", ws.org, ws.store);
+    println!("  branch:      {}", ws.branch);
     println!("  DEK cached:  {}", if cached { "yes" } else { "no" });
 
-    // Staged diff markers, computed WITHOUT decrypting (just key-name presence in the tip tree).
-    let store = open_object_store(&object_store_dir_for(state_path))?;
-    let tip = cs.tips.get(&branch).copied();
-    let tip_tree = tip.map(|h| tree_of_commit(&store, h)).transpose().unwrap_or(None).unwrap_or_default();
-    if cs.staged.is_empty() {
+    let obj_store = open_object_store(&object_store_dir_for(state_path))?;
+    println!("  remote:      {}", remote_status_line(&ws, bs.dek_version, bs.tip, &obj_store).await);
+
+    let tip_tree = bs.tip.map(|h| tree_of_commit(&obj_store, h)).transpose().unwrap_or(None).unwrap_or_default();
+    if bs.staged.is_empty() {
         println!("  staged:      (nothing staged)");
     } else {
         println!("  staged:");
-        for (key, entry) in &cs.staged {
+        for (key, entry) in &bs.staged {
             let marker = match entry {
                 StagedEntry::Set(_) if tip_tree.entries.contains_key(key) => '~',
                 StagedEntry::Set(_) => '+',
@@ -647,97 +783,128 @@ pub async fn status(
     Ok(())
 }
 
+/// Best-effort, git-style "is my branch ahead/behind the remote" line for `status`. Only ever a
+/// single cheap `get_ref` call (no object fetch) — never blocks on or requires a full `pull`.
+/// `local_dek_version == 0` means this branch has never been pushed, so there's nothing to
+/// compare against yet. A network failure (offline) is reported inline rather than propagated,
+/// since `status` must still work offline for everything else it shows.
+async fn remote_status_line(ws: &Workspace, local_dek_version: u32, local_tip: Option<Hash>, obj_store: &LocalObjectStore) -> String {
+    if local_dek_version == 0 {
+        return "(not yet pushed)".to_string();
+    }
+    let client = authed_client(&ws.identity);
+    let remote_hex = match client.get_ref(&ws.org, &ws.store, &ws.branch).await {
+        Ok(r) => r,
+        Err(_) => return "(could not reach the server — offline?)".to_string(),
+    };
+    let remote_tip = match remote_hex.as_deref().map(Hash::from_hex).transpose() {
+        Ok(h) => h,
+        Err(_) => return "(server returned a malformed ref)".to_string(),
+    };
+    match (local_tip, remote_tip) {
+        (None, None) => "up to date (nothing committed yet)".to_string(),
+        (Some(_), None) => "ahead — nothing pushed yet; run `wonton push`".to_string(),
+        (None, Some(_)) => "behind — run `wonton pull`".to_string(),
+        (Some(l), Some(r)) if l == r => "up to date".to_string(),
+        (Some(l), Some(r)) => {
+            if local_history_reaches(obj_store, l, r).unwrap_or(false) {
+                "ahead — run `wonton push`".to_string()
+            } else {
+                "behind or diverged — run `wonton pull`".to_string()
+            }
+        }
+    }
+}
+
+/// First-parent-only walk in the LOCAL store from `from` looking for `target` (no network). Used
+/// only for `status`'s best-effort ahead/behind line — stops silently (`Ok(false)`) on a missing
+/// local object or a root, rather than erroring, since an inconclusive answer here is fine (the
+/// caller falls back to "behind or diverged — run `wonton pull`", which is always a safe thing
+/// to suggest).
+fn local_history_reaches(store: &LocalObjectStore, mut from: Hash, target: Hash) -> anyhow::Result<bool> {
+    loop {
+        if from == target {
+            return Ok(true);
+        }
+        let bytes = match store.get(&from)? {
+            Some(b) => b,
+            None => return Ok(false),
+        };
+        let commit = Commit::from_bytes(&bytes)?;
+        match commit.fields.parent_hashes.first() {
+            Some(p) => from = *p,
+            None => return Ok(false),
+        }
+    }
+}
+
 /// `wonton set KEY=VALUE ...` — agent-encrypt each value, store the blob locally, stage it.
-pub async fn set(
-    config_path: &Path,
-    state_path: &Path,
-    socket_path: &Path,
-    ctx_name: &str,
-    pairs: Vec<(String, String)>,
-) -> anyhow::Result<()> {
-    let config = Config::load_from(config_path)?;
-    let (ctx, _identity) = ready_context(&config, socket_path, ctx_name).await?;
-    let store = open_object_store(&object_store_dir_for(state_path))?;
-    let cipher = AgentCipher::new(socket_path, ctx.name.clone());
+pub async fn set(config_path: &Path, state_path: &Path, socket_path: &Path, cwd: &Path, pairs: Vec<(String, String)>) -> anyhow::Result<()> {
+    let ws = resolve_workspace(config_path, cwd, None)?;
+    ready_workspace(state_path, socket_path, &ws).await?;
+    let key = ws.key();
+    let obj_store = open_object_store(&object_store_dir_for(state_path))?;
+    let cipher = AgentCipher::new(socket_path, key.clone());
 
     let mut state = LocalState::load_from(state_path)?;
-    let cs = state.context_mut(&ctx.name);
+    let bs = state.branch_mut(&key);
     let count = pairs.len();
-    for (key, value) in pairs {
+    for (k, value) in pairs {
         let encrypted = cipher.encrypt(value.as_bytes())?;
         let blob = Blob::new(encrypted.nonce, encrypted.ciphertext);
         let blob_bytes = blob.to_bytes()?;
         let blob_hash = Hash::of(&blob_bytes);
-        store.put(&blob_hash, &blob_bytes)?;
-        cs.staged.insert(key, StagedEntry::Set(blob_hash));
+        obj_store.put(&blob_hash, &blob_bytes)?;
+        bs.staged.insert(k, StagedEntry::Set(blob_hash));
     }
     state.save_to(state_path)?;
-    println!("Staged {count} value(s) in context '{ctx_name}'.");
+    println!("Staged {count} value(s) on branch '{}'.", ws.branch);
     Ok(())
 }
 
 /// `wonton unset KEY ...` — stage a tombstone for each key. Purely local (no agent/crypto).
-pub fn unset(
-    config_path: &Path,
-    state_path: &Path,
-    ctx_name: &str,
-    keys: Vec<String>,
-) -> anyhow::Result<()> {
-    // Validate the context exists for a friendly error; no crypto/network needed.
-    let config = Config::load_from(config_path)?;
-    if config.find_context(ctx_name).is_none() {
-        bail!("no context named '{ctx_name}'; add one with `wonton context add`");
-    }
+pub fn unset(config_path: &Path, state_path: &Path, cwd: &Path, keys: Vec<String>) -> anyhow::Result<()> {
+    let ws = resolve_workspace(config_path, cwd, None)?;
+    let key = ws.key();
     let mut state = LocalState::load_from(state_path)?;
-    let cs = state.context_mut(ctx_name);
+    let bs = state.branch_mut(&key);
     let count = keys.len();
-    for key in keys {
-        cs.staged.insert(key, StagedEntry::Unset);
+    for k in keys {
+        bs.staged.insert(k, StagedEntry::Unset);
     }
     state.save_to(state_path)?;
-    println!("Staged deletion of {count} key(s) in context '{ctx_name}'.");
+    println!("Staged deletion of {count} key(s) on branch '{}'.", ws.branch);
     Ok(())
 }
 
 /// `wonton commit -m <message>` — build the effective working set from the current tip plus the
 /// staged overlay, sign a new commit via the agent, advance the tip, and clear staging.
-pub async fn commit(
-    config_path: &Path,
-    state_path: &Path,
-    socket_path: &Path,
-    ctx_name: &str,
-    message: String,
-) -> anyhow::Result<()> {
-    let config = Config::load_from(config_path)?;
-    let (ctx, identity) = ready_context(&config, socket_path, ctx_name).await?;
-    let store = open_object_store(&object_store_dir_for(state_path))?;
-    let cipher = AgentCipher::new(socket_path, ctx.name.clone());
+pub async fn commit(config_path: &Path, state_path: &Path, socket_path: &Path, cwd: &Path, message: String) -> anyhow::Result<()> {
+    let ws = resolve_workspace(config_path, cwd, None)?;
+    ready_workspace(state_path, socket_path, &ws).await?;
+    let key = ws.key();
+    let obj_store = open_object_store(&object_store_dir_for(state_path))?;
+    let cipher = AgentCipher::new(socket_path, key.clone());
 
     let mut state = LocalState::load_from(state_path)?;
-    let cs = state.context_mut(&ctx.name);
-    let branch = cs.branch.clone();
-    let parent = cs.tips.get(&branch).copied();
-    let staged = cs.staged.clone();
+    let bs = state.branch_mut(&key);
+    let parent = bs.tip;
+    let staged = bs.staged.clone();
     if staged.is_empty() {
         bail!("nothing staged; use `wonton set KEY=value` (or `wonton unset KEY`) first");
     }
 
-    let working_set = effective_working_set(&store, &cipher, parent, &staged)?;
-    let author_id = Uuid::parse_str(&identity.user_id)
-        .with_context(|| format!("identity user_id '{}' is not a valid UUID", identity.user_id))?;
+    let working_set = effective_working_set(&obj_store, &cipher, parent, &staged)?;
+    let author_id = Uuid::parse_str(&ws.identity.user_id)
+        .with_context(|| format!("identity user_id '{}' is not a valid UUID", ws.identity.user_id))?;
 
-    let new_hash = wonton_vcs::commit(&store, &cipher, &cipher, author_id, parent, &working_set, message)?;
+    let new_hash = wonton_vcs::commit(&obj_store, &cipher, &cipher, author_id, parent, &working_set, message)?;
 
-    let cs = state.context_mut(&ctx.name);
-    cs.staged.clear();
-    cs.tips.insert(branch.clone(), new_hash);
+    let bs = state.branch_mut(&key);
+    bs.staged.clear();
+    bs.tip = Some(new_hash);
     state.save_to(state_path)?;
-    println!(
-        "Committed {} to branch '{branch}' ({}@{}).",
-        new_hash.to_hex(),
-        ctx.store,
-        ctx.environment
-    );
+    println!("Committed {} to branch '{}' ({}/{}).", new_hash.to_hex(), ws.branch, ws.org, ws.store);
     Ok(())
 }
 
@@ -745,32 +912,24 @@ pub async fn commit(
 /// expected signer by its own `author_id` rather than assuming the local caller's own identity
 /// authored the whole history: a history shared with (or received from) another user contains
 /// commits authored by *their* identity too, and those must verify against *their* pubkey, not
-/// ours (found by manual end-to-end testing). Author pubkeys are resolved via
-/// the server's global user directory (`get_user_by_id`), not just current env membership, so a
-/// since-revoked member's past commits remain verifiable.
-pub async fn log(config_path: &Path, state_path: &Path, ctx_name: &str) -> anyhow::Result<()> {
-    let config = Config::load_from(config_path)?;
-    let ctx = config
-        .find_context(ctx_name)
-        .ok_or_else(|| anyhow!("no context named '{ctx_name}'"))?;
-    let identity = config
-        .find_identity(&ctx.identity)
-        .ok_or_else(|| anyhow!("context '{ctx_name}' references unknown identity '{}'", ctx.identity))?;
-
+/// ours. Author pubkeys are resolved via the server's global user directory (`get_user_by_id`),
+/// not just current branch membership, so a since-revoked member's past commits remain
+/// verifiable.
+pub async fn log(config_path: &Path, state_path: &Path, cwd: &Path) -> anyhow::Result<()> {
+    let ws = resolve_workspace(config_path, cwd, None)?;
+    let key = ws.key();
     let state = LocalState::load_from(state_path)?;
-    let cs = state.context(ctx_name).cloned().unwrap_or_default();
-    let branch = cs.branch.clone();
-    let tip = match cs.tips.get(&branch).copied() {
+    let tip = match state.branch(&key).and_then(|b| b.tip) {
         Some(t) => t,
         None => {
-            println!("No commits on branch '{branch}' yet.");
+            println!("No commits on branch '{}' yet.", ws.branch);
             return Ok(());
         }
     };
 
-    let store = open_object_store(&object_store_dir_for(state_path))?;
-    let author_ids = wonton_vcs::mainline_author_ids(&store, tip)?;
-    let client = authed_client(identity);
+    let obj_store = open_object_store(&object_store_dir_for(state_path))?;
+    let author_ids = wonton_vcs::mainline_author_ids(&obj_store, tip)?;
+    let client = authed_client(&ws.identity);
     let mut signers: HashMap<Uuid, [u8; 32]> = HashMap::new();
     for author_id in author_ids {
         let info = client
@@ -780,7 +939,7 @@ pub async fn log(config_path: &Path, state_path: &Path, ctx_name: &str) -> anyho
         signers.insert(author_id, decode_ed25519_pubkey(&info.ed25519_pubkey)?);
     }
 
-    let history = wonton_vcs::log(&store, tip, |author_id| signers.get(&author_id).copied())?;
+    let history = wonton_vcs::log(&obj_store, tip, |author_id| signers.get(&author_id).copied())?;
     for vc in &history {
         println!("commit {} ({})", short_hash(&vc.hash), vc.hash.to_hex());
         println!("  author:  {}", vc.commit.fields.author_id);
@@ -803,62 +962,50 @@ fn short_hash(hash: &Hash) -> String {
 /// - both given: diff commit `a` against commit `b`;
 /// - one given: diff the empty tree against that commit;
 /// - none given: diff the current tip's parent against the current tip.
-pub async fn diff(
-    config_path: &Path,
-    state_path: &Path,
-    socket_path: &Path,
-    ctx_name: &str,
-    a: Option<String>,
-    b: Option<String>,
-) -> anyhow::Result<Vec<DiffEntry>> {
-    let config = Config::load_from(config_path)?;
-    let (ctx, _identity) = ready_context(&config, socket_path, ctx_name).await?;
+pub async fn diff(config_path: &Path, state_path: &Path, socket_path: &Path, cwd: &Path, a: Option<String>, b: Option<String>) -> anyhow::Result<Vec<DiffEntry>> {
+    let ws = resolve_workspace(config_path, cwd, None)?;
+    ready_workspace(state_path, socket_path, &ws).await?;
+    let key = ws.key();
     let state = LocalState::load_from(state_path)?;
-    let cs = state.context(ctx_name).cloned().unwrap_or_default();
-    let branch = cs.branch.clone();
-    let store = open_object_store(&object_store_dir_for(state_path))?;
-    let cipher = AgentCipher::new(socket_path, ctx.name.clone());
+    let obj_store = open_object_store(&object_store_dir_for(state_path))?;
+    let cipher = AgentCipher::new(socket_path, key.clone());
 
     let (from_hash, to_hash) = match (a, b) {
-        (Some(a), Some(b)) => (Some(parse_commit_hash(&store, &a)?), parse_commit_hash(&store, &b)?),
-        // A single positional argument is the `to` commit; diff it against the empty tree.
-        (Some(a), None) => (None, parse_commit_hash(&store, &a)?),
+        (Some(a), Some(b)) => (Some(parse_commit_hash(&obj_store, &a)?), parse_commit_hash(&obj_store, &b)?),
+        (Some(a), None) => (None, parse_commit_hash(&obj_store, &a)?),
         (None, _) => {
-            let tip = cs
-                .tips
-                .get(&branch)
-                .copied()
-                .ok_or_else(|| anyhow!("no commits on branch '{branch}' to diff"))?;
-            (commit_first_parent(&store, tip)?, tip)
+            let tip = state
+                .branch(&key)
+                .and_then(|b| b.tip)
+                .ok_or_else(|| anyhow!("no commits on branch '{}' to diff", ws.branch))?;
+            (commit_first_parent(&obj_store, tip)?, tip)
         }
     };
 
-    Ok(wonton_vcs::diff(&store, &cipher, from_hash, to_hash)?)
+    Ok(wonton_vcs::diff(&obj_store, &cipher, from_hash, to_hash)?)
 }
 
 /// `wonton pull` — fast-forward the current branch from the server, refreshing the local tip.
-pub async fn pull(config_path: &Path, state_path: &Path, ctx_name: &str) -> anyhow::Result<()> {
-    let config = Config::load_from(config_path)?;
-    let (ctx, identity) = context_and_identity(&config, ctx_name)?;
+pub async fn pull(config_path: &Path, state_path: &Path, cwd: &Path) -> anyhow::Result<()> {
+    let ws = resolve_workspace(config_path, cwd, None)?;
+    let key = ws.key();
     let mut state = LocalState::load_from(state_path)?;
-    let cs = state.context(ctx_name).cloned().unwrap_or_default();
-    let branch = cs.branch.clone();
-    let local_tip = cs.tips.get(&branch).copied();
+    let local_tip = state.branch(&key).and_then(|b| b.tip);
 
-    let store = open_object_store(&object_store_dir_for(state_path))?;
-    let client = authed_client(&identity);
+    let obj_store = open_object_store(&object_store_dir_for(state_path))?;
+    let client = authed_client(&ws.identity);
 
-    let outcome = wonton_sync::pull(&client, &store, &ctx.store, &ctx.environment, &branch, local_tip).await?;
+    let outcome = wonton_sync::pull(&client, &obj_store, &ws.org, &ws.store, &ws.branch, local_tip).await?;
     match outcome {
-        PullOutcome::UpToDate => println!("Already up to date on branch '{branch}'."),
+        PullOutcome::UpToDate => println!("Already up to date on branch '{}'.", ws.branch),
         PullOutcome::FastForward { new_tip } => {
-            state.context_mut(ctx_name).tips.insert(branch.clone(), new_tip);
+            state.branch_mut(&key).tip = Some(new_tip);
             state.save_to(state_path)?;
-            println!("Fast-forwarded '{branch}' to {}.", new_tip.to_hex());
+            println!("Fast-forwarded '{}' to {}.", ws.branch, new_tip.to_hex());
         }
         PullOutcome::Diverged { local_tip, remote_tip } => {
             println!(
-                "Diverged: local {} vs remote {}. A merge (Phase 5) is required; local state left unchanged.",
+                "Diverged: local {} vs remote {}. A merge is required; local state left unchanged.",
                 local_tip.to_hex(),
                 remote_tip.to_hex()
             );
@@ -867,70 +1014,126 @@ pub async fn pull(config_path: &Path, state_path: &Path, ctx_name: &str) -> anyh
     Ok(())
 }
 
-/// `wonton push` — upload local objects then CAS-move the branch ref.
+/// `wonton push` — first push on a branch provisions it server-side (org/store/branch + DEK
+/// self-grant, see [`provision_on_first_push`]), then every push uploads local objects and
+/// CAS-moves the branch ref.
 ///
 /// **Known v1 limitation** (pragmatic object-set walk): we read the remote's current hash for the
 /// branch as `old_hash`, then walk the local commit chain back from the tip collecting every
 /// commit/tree/blob until we reach `old_hash` (or a root, or an object the local store lacks). We
 /// do not diff against the full remote object set, so on a diverged history this may re-upload
-/// objects the server already has — harmless (uploads are idempotent), but not minimal.
-pub async fn push(config_path: &Path, state_path: &Path, ctx_name: &str) -> anyhow::Result<()> {
-    let config = Config::load_from(config_path)?;
-    let (ctx, identity) = context_and_identity(&config, ctx_name)?;
+/// objects the server already has (harmless; uploads are idempotent) but is not minimal.
+pub async fn push(config_path: &Path, state_path: &Path, socket_path: &Path, cwd: &Path) -> anyhow::Result<()> {
+    let ws = resolve_workspace(config_path, cwd, None)?;
+    let key = ws.key();
+
+    let dek_version = LocalState::load_from(state_path)?.branch(&key).map(|b| b.dek_version).unwrap_or(0);
+    if dek_version == 0 {
+        provision_on_first_push(state_path, socket_path, &ws).await?;
+    }
+
     let state = LocalState::load_from(state_path)?;
-    let cs = state.context(ctx_name).cloned().unwrap_or_default();
-    let branch = cs.branch.clone();
-    let local_tip = cs
-        .tips
-        .get(&branch)
-        .copied()
-        .ok_or_else(|| anyhow!("nothing to push; no local commits on branch '{branch}'"))?;
+    let local_tip = state
+        .branch(&key)
+        .and_then(|b| b.tip)
+        .ok_or_else(|| anyhow!("nothing to push; no local commits on branch '{}'", ws.branch))?;
 
-    let store = open_object_store(&object_store_dir_for(state_path))?;
-    let client = authed_client(&identity);
+    let obj_store = open_object_store(&object_store_dir_for(state_path))?;
+    let client = authed_client(&ws.identity);
 
-    let refs = client.get_refs(&ctx.store, &ctx.environment).await?;
-    let old_hash = match refs.get(&branch) {
-        Some(hex) => Some(Hash::from_hex(hex)?),
-        None => None,
-    };
+    let old_hash = client
+        .get_ref(&ws.org, &ws.store, &ws.branch)
+        .await?
+        .map(|hex| Hash::from_hex(&hex))
+        .transpose()?;
     if old_hash == Some(local_tip) {
         println!("Already up to date; nothing to push.");
         return Ok(());
     }
 
-    let object_hashes = collect_objects_to_push(&store, local_tip, old_hash)?;
-    match wonton_sync::push(
-        &client,
-        &store,
-        &ctx.store,
-        &ctx.environment,
-        &branch,
-        &object_hashes,
-        old_hash,
-        local_tip,
-    )
-    .await
-    {
+    let object_hashes = collect_objects_to_push(&obj_store, local_tip, old_hash)?;
+    match wonton_sync::push(&client, &obj_store, &ws.org, &ws.store, &ws.branch, &object_hashes, old_hash, local_tip).await {
         Ok(()) => {
-            println!("Pushed branch '{branch}' -> {}.", local_tip.to_hex());
+            println!("Pushed branch '{}' -> {}.", ws.branch, local_tip.to_hex());
             Ok(())
         }
         Err(SyncError::Conflict(c)) => bail!(
-            "someone else pushed first (remote '{branch}' is now {}); run `wonton pull` then retry",
+            "someone else pushed first (remote '{}' is now {}); run `wonton pull` then retry",
+            ws.branch,
             c.current.as_deref().unwrap_or("<absent>")
         ),
         Err(e) => Err(e).context("push failed"),
     }
 }
 
+/// First-time server provisioning for a branch, run once by [`push`] when `dek_version == 0`
+/// (never granted server-side yet): create the org (idempotent) -> create the store (idempotent)
+/// -> create the branch. If the branch turns out to already exist (someone else created one with
+/// this name first), this workspace's locally-generated DEK is cryptographically unrelated to
+/// whatever's already there — hard-error rather than self-granting it, since there is no way to
+/// reconcile two different DEKs (unlike an ordinary git non-fast-forward push). On genuine
+/// creation, wrap the already-agent-cached DEK for self and grant it at v1.
+async fn provision_on_first_push(state_path: &Path, socket_path: &Path, ws: &Workspace) -> anyhow::Result<()> {
+    let client = authed_client(&ws.identity);
+
+    match client.create_org(&CreateOrgRequest { name: ws.org.clone() }).await {
+        Ok(_) | Err(_) => {} // idempotent path handled below via create_store's own 404-on-unknown-org
+    }
+    // (create_org's error is deliberately not inspected further: a 409 means it already exists,
+    // which is fine, and any other failure will simply resurface at create_store below with a
+    // clearer, store-scoped error.)
+    match client.create_store(&ws.org, &CreateStoreRequest { name: ws.store.clone() }).await {
+        Ok(_) => {}
+        Err(e) if e.is_already_exists() => {}
+        Err(e) => return Err(e).with_context(|| format!("could not create store '{}/{}'", ws.org, ws.store)),
+    }
+    match client.create_branch(&ws.org, &ws.store, &CreateBranchRequest { name: ws.branch.clone() }).await {
+        Ok(_) => {
+            require_agent_unlocked_for(socket_path, &ws.identity).await?;
+            let key = ws.key();
+            let sealed = agent::wrap_dek_for_recipient(socket_path, key.clone(), ws.identity.x25519_pubkey_b64.clone())
+                .await
+                .context("agent could not wrap the DEK for self-grant")?;
+            client
+                .grant_key(
+                    &ws.org,
+                    &ws.store,
+                    &ws.branch,
+                    &GrantKeyRequest {
+                        user_id: ws.identity.user_id.clone(),
+                        dek_version: 1,
+                        sealed_box: sealed,
+                    },
+                )
+                .await
+                .context("could not self-grant the branch's first DEK")?;
+            let mut state = LocalState::load_from(state_path)?;
+            state.branch_mut(&key).dek_version = 1;
+            state.save_to(state_path)?;
+            println!("Provisioned '{}/{}/{}' and granted yourself DEK v1.", ws.org, ws.store, ws.branch);
+        }
+        Err(e) if e.is_already_exists() => {
+            bail!(
+                "'{}/{}/{}' already exists on the server (created by someone else) — this local \
+                 history was encrypted under a different key and can't be reconciled with it. Ask \
+                 an admin to `wonton share` you, then start a fresh directory with `wonton clone {} \
+                 {} {}` instead of pushing this one.",
+                ws.org,
+                ws.store,
+                ws.branch,
+                ws.org,
+                ws.store,
+                ws.branch
+            );
+        }
+        Err(e) => return Err(e).with_context(|| format!("could not create branch '{}/{}/{}'", ws.org, ws.store, ws.branch)),
+    }
+    Ok(())
+}
+
 /// Decrypt an entire commit's tree into a plaintext `key -> value` map. `tip = None` yields an
 /// empty map (used for a merge base of `None`, i.e. disjoint histories).
-fn tree_to_plaintext_map(
-    store: &LocalObjectStore,
-    cipher: &AgentCipher,
-    tip: Option<Hash>,
-) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
+fn tree_to_plaintext_map(store: &LocalObjectStore, cipher: &AgentCipher, tip: Option<Hash>) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
     let mut map = BTreeMap::new();
     if let Some(tip) = tip {
         let tree = tree_of_commit(store, tip)?;
@@ -1018,11 +1221,19 @@ fn prompt_conflict_resolution(
 
 /// Run the interactive one-key-at-a-time conflict prompt over `conflicts`, moving each resolved
 /// key into `resolved`. Calls `persist` after **every single resolution** so an interrupted
-/// `--continue` loses at most the one answer in flight. Stops — leaving that
-/// key and every key after it in `conflicts` — on `Skip`.
+/// `--continue` loses at most the one answer in flight. Stops — leaving that key and every key
+/// after it in `conflicts` — on `Skip`.
+///
+/// Cross-DEK-aware: `ours_cipher` decrypts/encrypts under the CURRENT branch's DEK (the merge
+/// commit's own DEK), `theirs_cipher` only ever *decrypts* the other side's already-encrypted
+/// blobs for display/comparison. When "theirs" wins a conflict, its value is decrypted under
+/// `theirs_cipher` and **re-encrypted under `ours_cipher`** — reusing theirs' blob hash directly
+/// would be wrong (it's ciphertext under a DEK the merge result's own branch doesn't use).
+#[allow(clippy::too_many_arguments)]
 fn resolve_conflicts_interactively(
     store: &LocalObjectStore,
-    cipher: &AgentCipher,
+    ours_cipher: &AgentCipher,
+    theirs_cipher: &AgentCipher,
     reader: &mut impl BufRead,
     writer: &mut impl Write,
     conflicts: &mut BTreeMap<String, ConflictHashes>,
@@ -1032,8 +1243,8 @@ fn resolve_conflicts_interactively(
     let keys: Vec<String> = conflicts.keys().cloned().collect();
     for key in keys {
         let hashes = conflicts.get(&key).expect("key came from conflicts.keys()").clone();
-        let ours_plain = hashes.ours.as_ref().map(|h| decrypt_blob(store, cipher, h)).transpose()?;
-        let theirs_plain = hashes.theirs.as_ref().map(|h| decrypt_blob(store, cipher, h)).transpose()?;
+        let ours_plain = hashes.ours.as_ref().map(|h| decrypt_blob(store, ours_cipher, h)).transpose()?;
+        let theirs_plain = hashes.theirs.as_ref().map(|h| decrypt_blob(store, theirs_cipher, h)).transpose()?;
 
         let outcome = prompt_conflict_resolution(reader, writer, &key, ours_plain.as_deref(), theirs_plain.as_deref())?;
         let resolved_entry = match outcome {
@@ -1042,11 +1253,11 @@ fn resolve_conflicts_interactively(
                 Some(h) => ResolvedEntry::Set(h),
                 None => ResolvedEntry::Delete,
             },
-            PromptOutcome::Theirs => match hashes.theirs {
-                Some(h) => ResolvedEntry::Set(h),
+            PromptOutcome::Theirs => match theirs_plain {
+                Some(plain) => ResolvedEntry::Set(encrypt_and_store(store, ours_cipher, &plain)?),
                 None => ResolvedEntry::Delete,
             },
-            PromptOutcome::Manual(value) => ResolvedEntry::Set(encrypt_and_store(store, cipher, value.as_bytes())?),
+            PromptOutcome::Manual(value) => ResolvedEntry::Set(encrypt_and_store(store, ours_cipher, value.as_bytes())?),
         };
         conflicts.remove(&key);
         resolved.insert(key, resolved_entry);
@@ -1055,10 +1266,11 @@ fn resolve_conflicts_interactively(
     Ok(())
 }
 
-/// Finalize a merge: fold every already-settled conflict (`resolved`, decrypting each blob hash
-/// back to plaintext — `commit_merge` takes a plaintext `WorkingSet`, not hashes) into the
-/// non-conflicting `resolved_plaintext` map, build the final `WorkingSet`, and produce the
-/// 2-parent merge commit. Prints an added/changed/removed summary relative to `ours_map`.
+/// Finalize a merge: fold every already-settled conflict (`resolved` — already correctly
+/// encrypted under `cipher`, the current/"ours" branch's own DEK, per
+/// [`resolve_conflicts_interactively`]'s cross-DEK handling) into the non-conflicting
+/// `resolved_plaintext` map, build the final `WorkingSet`, and produce the 2-parent merge
+/// commit. Prints an added/changed/removed summary relative to `ours_map`.
 #[allow(clippy::too_many_arguments)]
 fn finalize_merge_commit(
     store: &LocalObjectStore,
@@ -1107,49 +1319,77 @@ fn finalize_merge_commit(
     Ok(hash)
 }
 
-/// `wonton merge <branch>` — three-way merge `branch` into the current branch.
-/// Entirely offline/client-side: the server never sees plaintext, a merge base, or a conflict.
-pub async fn merge(
-    config_path: &Path,
-    state_path: &Path,
-    socket_path: &Path,
-    ctx_name: &str,
-    branch: &str,
-) -> anyhow::Result<()> {
-    let config = Config::load_from(config_path)?;
-    let (ctx, identity) = ready_context(&config, socket_path, ctx_name).await?;
-    let store = open_object_store(&object_store_dir_for(state_path))?;
-    let cipher = AgentCipher::new(socket_path, ctx.name.clone());
-    let author_id = Uuid::parse_str(&identity.user_id)
-        .with_context(|| format!("identity user_id '{}' is not a valid UUID", identity.user_id))?;
+/// Given the current workspace's branch key and the source branch's key + its recorded
+/// [`ForkedFrom`] (if any, on either side), decide the cross-DEK merge base and which cipher
+/// decrypts it. See `commands` module docs and the plan this implements: a real cryptographic
+/// `merge_base` walk can't cross a DEK boundary, but a branch created via `wonton branch -b
+/// --from` already recorded its own root commit as the fork snapshot, decryptable under its own
+/// (one) DEK — reuse that. Two branches with no recorded fork relationship fall back to an empty
+/// base (disjoint histories), same as today's existing behavior for unrelated histories.
+fn merge_base_and_cipher<'a>(
+    ours_key: &str,
+    theirs_key: &str,
+    ours_state: &BranchState,
+    theirs_state: &BranchState,
+    ours_cipher: &'a AgentCipher,
+    theirs_cipher: &'a AgentCipher,
+) -> (Option<Hash>, &'a AgentCipher) {
+    if let Some(f) = &theirs_state.forked_from {
+        if f.branch == ours_key {
+            return (Some(f.root), theirs_cipher);
+        }
+    }
+    if let Some(f) = &ours_state.forked_from {
+        if f.branch == theirs_key {
+            return (Some(f.root), ours_cipher);
+        }
+    }
+    (None, ours_cipher)
+}
+
+/// `wonton merge <branch>` — three-way merge `branch` (another branch in the same store, under
+/// its own DEK) into the current branch. Entirely offline/client-side once both branches' DEKs
+/// are ready: the server never sees plaintext, a merge base, or a conflict. See
+/// `resolve_conflicts_interactively`/`merge_base_and_cipher` for how this reconciles two branches
+/// encrypted under two different keys.
+pub async fn merge(config_path: &Path, state_path: &Path, socket_path: &Path, cwd: &Path, branch: &str) -> anyhow::Result<()> {
+    let ws = resolve_workspace(config_path, cwd, None)?;
+    ready_workspace(state_path, socket_path, &ws).await?;
+    ready_branch(state_path, socket_path, &ws.org, &ws.store, branch, &ws.identity).await?;
+
+    let ours_key = ws.key();
+    let theirs_key = format!("{}/{}/{}", ws.org, ws.store, branch);
+    let obj_store = open_object_store(&object_store_dir_for(state_path))?;
+    let ours_cipher = AgentCipher::new(socket_path, ours_key.clone());
+    let theirs_cipher = AgentCipher::new(socket_path, theirs_key.clone());
+    let author_id = Uuid::parse_str(&ws.identity.user_id)
+        .with_context(|| format!("identity user_id '{}' is not a valid UUID", ws.identity.user_id))?;
 
     let mut state = LocalState::load_from(state_path)?;
-    let cs = state.context_mut(&ctx.name);
-    if cs.merge.is_some() {
+    if state.branch(&ours_key).and_then(|b| b.merge.as_ref()).is_some() {
         bail!("a merge is already in progress; resolve it and run `wonton merge --continue`");
     }
-    let current_branch = cs.branch.clone();
-    let ours_tip = cs
-        .tips
-        .get(&current_branch)
-        .copied()
-        .ok_or_else(|| anyhow!("branch '{current_branch}' has no commits yet; nothing to merge into"))?;
-    let theirs_tip = cs.tips.get(branch).copied().ok_or_else(|| {
-        anyhow!("unknown branch '{branch}'; `pull`/`switch` to make it known locally first")
-    })?;
+    let ours_state = state.branch(&ours_key).cloned().unwrap_or_default();
+    let theirs_state = state.branch(&theirs_key).cloned().unwrap_or_default();
+    let ours_tip = ours_state
+        .tip
+        .ok_or_else(|| anyhow!("branch '{}' has no commits yet; nothing to merge into", ws.branch))?;
+    let theirs_tip = theirs_state
+        .tip
+        .ok_or_else(|| anyhow!("branch '{branch}' has no commits yet; nothing to merge"))?;
 
     if ours_tip == theirs_tip {
-        println!("Branch '{branch}' is already merged into '{current_branch}'.");
+        println!("Branch '{branch}' is already merged into '{}'.", ws.branch);
         return Ok(());
     }
 
-    let base = wonton_vcs::merge_base(&store, ours_tip, theirs_tip)?;
-    let ours_tree = tree_of_commit(&store, ours_tip)?;
-    let theirs_tree = tree_of_commit(&store, theirs_tip)?;
+    let (base, base_cipher) = merge_base_and_cipher(&ours_key, &theirs_key, &ours_state, &theirs_state, &ours_cipher, &theirs_cipher);
+    let ours_tree = tree_of_commit(&obj_store, ours_tip)?;
+    let theirs_tree = tree_of_commit(&obj_store, theirs_tip)?;
 
-    let base_map = tree_to_plaintext_map(&store, &cipher, base)?;
-    let ours_map = tree_to_plaintext_map(&store, &cipher, Some(ours_tip))?;
-    let theirs_map = tree_to_plaintext_map(&store, &cipher, Some(theirs_tip))?;
+    let base_map = tree_to_plaintext_map(&obj_store, base_cipher, base)?;
+    let ours_map = tree_to_plaintext_map(&obj_store, &ours_cipher, Some(ours_tip))?;
+    let theirs_map = tree_to_plaintext_map(&obj_store, &theirs_cipher, Some(theirs_tip))?;
 
     let merged = wonton_vcs::three_way_merge(&base_map, &ours_map, &theirs_map);
 
@@ -1173,19 +1413,8 @@ pub async fn merge(
     }
 
     if conflicts.is_empty() {
-        let hash = finalize_merge_commit(
-            &store,
-            &cipher,
-            author_id,
-            ours_tip,
-            theirs_tip,
-            &ours_map,
-            resolved_plaintext,
-            &BTreeMap::new(),
-            branch,
-        )?;
-        let cs = state.context_mut(&ctx.name);
-        cs.tips.insert(current_branch, hash);
+        let hash = finalize_merge_commit(&obj_store, &ours_cipher, author_id, ours_tip, theirs_tip, &ours_map, resolved_plaintext, &BTreeMap::new(), branch)?;
+        state.branch_mut(&ours_key).tip = Some(hash);
         state.save_to(state_path)?;
         return Ok(());
     }
@@ -1193,9 +1422,8 @@ pub async fn merge(
     // Conflicts exist: persist the initial (fully unresolved) state up front, so even an
     // immediate `s`kip on the very first key leaves a resumable `--continue` state on disk.
     let mut resolved: BTreeMap<String, ResolvedEntry> = BTreeMap::new();
-    let cs = state.context_mut(&ctx.name);
-    cs.merge = Some(MergeState {
-        branch: branch.to_string(),
+    state.branch_mut(&ours_key).merge = Some(MergeState {
+        branch: theirs_key.clone(),
         ours_tip,
         theirs_tip,
         base,
@@ -1207,11 +1435,11 @@ pub async fn merge(
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let mut stdout = std::io::stdout();
-    resolve_conflicts_interactively(&store, &cipher, &mut reader, &mut stdout, &mut conflicts, &mut resolved, |c, r| {
+    let theirs_key_for_persist = theirs_key.clone();
+    resolve_conflicts_interactively(&obj_store, &ours_cipher, &theirs_cipher, &mut reader, &mut stdout, &mut conflicts, &mut resolved, |c, r| {
         let mut state = LocalState::load_from(state_path)?;
-        let cs = state.context_mut(&ctx.name);
-        cs.merge = Some(MergeState {
-            branch: branch.to_string(),
+        state.branch_mut(&ours_key).merge = Some(MergeState {
+            branch: theirs_key_for_persist.clone(),
             ours_tip,
             theirs_tip,
             base,
@@ -1222,21 +1450,11 @@ pub async fn merge(
     })?;
 
     if conflicts.is_empty() {
-        let hash = finalize_merge_commit(
-            &store,
-            &cipher,
-            author_id,
-            ours_tip,
-            theirs_tip,
-            &ours_map,
-            resolved_plaintext,
-            &resolved,
-            branch,
-        )?;
+        let hash = finalize_merge_commit(&obj_store, &ours_cipher, author_id, ours_tip, theirs_tip, &ours_map, resolved_plaintext, &resolved, branch)?;
         let mut state = LocalState::load_from(state_path)?;
-        let cs = state.context_mut(&ctx.name);
-        cs.tips.insert(current_branch, hash);
-        cs.merge = None;
+        let bs = state.branch_mut(&ours_key);
+        bs.tip = Some(hash);
+        bs.merge = None;
         state.save_to(state_path)?;
     } else {
         println!(
@@ -1248,46 +1466,49 @@ pub async fn merge(
 }
 
 /// `wonton merge --continue` — resume a merge paused by `merge` on unresolved conflicts.
-pub async fn merge_continue(
-    config_path: &Path,
-    state_path: &Path,
-    socket_path: &Path,
-    ctx_name: &str,
-) -> anyhow::Result<()> {
-    let config = Config::load_from(config_path)?;
-    let (ctx, identity) = ready_context(&config, socket_path, ctx_name).await?;
-    let store = open_object_store(&object_store_dir_for(state_path))?;
-    let cipher = AgentCipher::new(socket_path, ctx.name.clone());
-    let author_id = Uuid::parse_str(&identity.user_id)
-        .with_context(|| format!("identity user_id '{}' is not a valid UUID", identity.user_id))?;
+pub async fn merge_continue(config_path: &Path, state_path: &Path, socket_path: &Path, cwd: &Path) -> anyhow::Result<()> {
+    let ws = resolve_workspace(config_path, cwd, None)?;
+    ready_workspace(state_path, socket_path, &ws).await?;
+    let ours_key = ws.key();
+    let author_id = Uuid::parse_str(&ws.identity.user_id)
+        .with_context(|| format!("identity user_id '{}' is not a valid UUID", ws.identity.user_id))?;
 
     let state = LocalState::load_from(state_path)?;
-    let cs = state.context(&ctx.name).cloned().unwrap_or_default();
-    let mut merge_state = cs
-        .merge
-        .clone()
+    let mut merge_state = state
+        .branch(&ours_key)
+        .and_then(|b| b.merge.clone())
         .ok_or_else(|| anyhow!("no merge in progress; run `wonton merge <branch>` first"))?;
 
-    let branch_name = merge_state.branch.clone();
+    let theirs_key = merge_state.branch.clone();
+    let theirs_branch_name = theirs_key.rsplit('/').next().unwrap_or(&theirs_key).to_string();
+    ready_branch(state_path, socket_path, &ws.org, &ws.store, &theirs_branch_name, &ws.identity).await?;
+
     let ours_tip = merge_state.ours_tip;
     let theirs_tip = merge_state.theirs_tip;
     let base = merge_state.base;
+
+    let obj_store = open_object_store(&object_store_dir_for(state_path))?;
+    let ours_cipher = AgentCipher::new(socket_path, ours_key.clone());
+    let theirs_cipher = AgentCipher::new(socket_path, theirs_key.clone());
+    let ours_state = state.branch(&ours_key).cloned().unwrap_or_default();
+    let theirs_state = state.branch(&theirs_key).cloned().unwrap_or_default();
+    let (_, base_cipher) = merge_base_and_cipher(&ours_key, &theirs_key, &ours_state, &theirs_state, &ours_cipher, &theirs_cipher);
 
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let mut stdout = std::io::stdout();
     resolve_conflicts_interactively(
-        &store,
-        &cipher,
+        &obj_store,
+        &ours_cipher,
+        &theirs_cipher,
         &mut reader,
         &mut stdout,
         &mut merge_state.conflicts,
         &mut merge_state.resolved,
         |c, r| {
             let mut state = LocalState::load_from(state_path)?;
-            let cs = state.context_mut(&ctx.name);
-            cs.merge = Some(MergeState {
-                branch: branch_name.clone(),
+            state.branch_mut(&ours_key).merge = Some(MergeState {
+                branch: theirs_key.clone(),
                 ours_tip,
                 theirs_tip,
                 base,
@@ -1299,9 +1520,9 @@ pub async fn merge_continue(
     )?;
 
     if merge_state.conflicts.is_empty() {
-        let base_map = tree_to_plaintext_map(&store, &cipher, base)?;
-        let ours_map = tree_to_plaintext_map(&store, &cipher, Some(ours_tip))?;
-        let theirs_map = tree_to_plaintext_map(&store, &cipher, Some(theirs_tip))?;
+        let base_map = tree_to_plaintext_map(&obj_store, base_cipher, base)?;
+        let ours_map = tree_to_plaintext_map(&obj_store, &ours_cipher, Some(ours_tip))?;
+        let theirs_map = tree_to_plaintext_map(&obj_store, &theirs_cipher, Some(theirs_tip))?;
         let merged = wonton_vcs::three_way_merge(&base_map, &ours_map, &theirs_map);
         let mut resolved_plaintext: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
         for (key, entry) in merged {
@@ -1311,22 +1532,21 @@ pub async fn merge_continue(
         }
 
         let hash = finalize_merge_commit(
-            &store,
-            &cipher,
+            &obj_store,
+            &ours_cipher,
             author_id,
             ours_tip,
             theirs_tip,
             &ours_map,
             resolved_plaintext,
             &merge_state.resolved,
-            &branch_name,
+            &theirs_branch_name,
         )?;
 
         let mut state = LocalState::load_from(state_path)?;
-        let cs = state.context_mut(&ctx.name);
-        let current_branch = cs.branch.clone();
-        cs.tips.insert(current_branch, hash);
-        cs.merge = None;
+        let bs = state.branch_mut(&ours_key);
+        bs.tip = Some(hash);
+        bs.merge = None;
         state.save_to(state_path)?;
     } else {
         // Already persisted incrementally by `resolve_conflicts_interactively`'s `persist` closure.
@@ -1342,13 +1562,13 @@ pub async fn merge_continue(
 /// merge has never produced a commit (that only happens once every conflict is resolved and
 /// `merge`/`merge --continue` finalizes it), so there is nothing to unwind except the persisted
 /// `MergeState` itself. The branch tip and all prior history are untouched.
-pub async fn merge_abort(state_path: &Path, ctx_name: &str) -> anyhow::Result<()> {
+pub async fn merge_abort(config_path: &Path, state_path: &Path, cwd: &Path) -> anyhow::Result<()> {
+    let ws = resolve_workspace(config_path, cwd, None)?;
+    let key = ws.key();
     let mut state = LocalState::load_from(state_path)?;
-    let cs = state.context(ctx_name).cloned().unwrap_or_default();
-    let merge_state = cs
-        .merge
-        .ok_or_else(|| anyhow!("no merge in progress; nothing to abort"))?;
-    state.context_mut(ctx_name).merge = None;
+    let bs_snapshot = state.branch(&key).cloned().unwrap_or_default();
+    let merge_state = bs_snapshot.merge.ok_or_else(|| anyhow!("no merge in progress; nothing to abort"))?;
+    state.branch_mut(&key).merge = None;
     state.save_to(state_path)?;
     println!(
         "Aborted the merge of '{}' ({} unresolved conflict(s) discarded).",
@@ -1361,33 +1581,27 @@ pub async fn merge_abort(state_path: &Path, ctx_name: &str) -> anyhow::Result<()
 /// `wonton run -- <cmd> [args...]` — decrypt the effective working tree into env vars, spawn the
 /// child with them injected (stdio inherited), and return the child's exit code for `main.rs` to
 /// propagate. **Never writes any decrypted value to disk.**
-pub async fn run(
-    config_path: &Path,
-    state_path: &Path,
-    socket_path: &Path,
-    ctx_name: &str,
-    cmd: Vec<String>,
-) -> anyhow::Result<i32> {
+pub async fn run(config_path: &Path, state_path: &Path, socket_path: &Path, cwd: &Path, cmd: Vec<String>) -> anyhow::Result<i32> {
     if cmd.is_empty() {
         bail!("no command given; usage: `wonton run -- <cmd> [args...]`");
     }
-    let config = Config::load_from(config_path)?;
-    let (ctx, _identity) = ready_context(&config, socket_path, ctx_name).await?;
-    let store = open_object_store(&object_store_dir_for(state_path))?;
-    let cipher = AgentCipher::new(socket_path, ctx.name.clone());
+    let ws = resolve_workspace(config_path, cwd, None)?;
+    ready_workspace(state_path, socket_path, &ws).await?;
+    let key = ws.key();
+    let obj_store = open_object_store(&object_store_dir_for(state_path))?;
+    let cipher = AgentCipher::new(socket_path, key.clone());
 
     let state = LocalState::load_from(state_path)?;
-    let cs = state.context(ctx_name).cloned().unwrap_or_default();
-    let tip = cs.tips.get(&cs.branch).copied();
-    let working_set = effective_working_set(&store, &cipher, tip, &cs.staged)?;
+    let bs = state.branch(&key).cloned().unwrap_or_default();
+    let working_set = effective_working_set(&obj_store, &cipher, bs.tip, &bs.staged)?;
 
     let mut command = std::process::Command::new(&cmd[0]);
     command.args(&cmd[1..]);
-    for (key, value) in working_set.iter() {
+    for (k, value) in working_set.iter() {
         let value = std::str::from_utf8(value).map_err(|_| {
-            anyhow!("value for '{key}' is not valid UTF-8; `wonton run` can only inject UTF-8 env vars")
+            anyhow!("value for '{k}' is not valid UTF-8; `wonton run` can only inject UTF-8 env vars")
         })?;
-        command.env(key, value);
+        command.env(k, value);
     }
     let status = command
         .status()
@@ -1398,23 +1612,16 @@ pub async fn run(
 /// `wonton export --format dotenv <path>` — decrypt the effective working tree and write it to a
 /// file the user names. **Prints an explicit plaintext warning to stderr before writing.** Only
 /// ever runs on direct request, never as a side effect of another command.
-pub async fn export(
-    config_path: &Path,
-    state_path: &Path,
-    socket_path: &Path,
-    ctx_name: &str,
-    format: ExportFormat,
-    path: &Path,
-) -> anyhow::Result<()> {
-    let config = Config::load_from(config_path)?;
-    let (ctx, _identity) = ready_context(&config, socket_path, ctx_name).await?;
-    let store = open_object_store(&object_store_dir_for(state_path))?;
-    let cipher = AgentCipher::new(socket_path, ctx.name.clone());
+pub async fn export(config_path: &Path, state_path: &Path, socket_path: &Path, cwd: &Path, format: ExportFormat, path: &Path) -> anyhow::Result<()> {
+    let ws = resolve_workspace(config_path, cwd, None)?;
+    ready_workspace(state_path, socket_path, &ws).await?;
+    let key = ws.key();
+    let obj_store = open_object_store(&object_store_dir_for(state_path))?;
+    let cipher = AgentCipher::new(socket_path, key.clone());
 
     let state = LocalState::load_from(state_path)?;
-    let cs = state.context(ctx_name).cloned().unwrap_or_default();
-    let tip = cs.tips.get(&cs.branch).copied();
-    let working_set = effective_working_set(&store, &cipher, tip, &cs.staged)?;
+    let bs = state.branch(&key).cloned().unwrap_or_default();
+    let working_set = effective_working_set(&obj_store, &cipher, bs.tip, &bs.staged)?;
 
     let contents = match format {
         ExportFormat::Dotenv => render_dotenv(&working_set)?,
@@ -1431,68 +1638,62 @@ pub async fn export(
 }
 
 // =====================================================================================
-// Phase 5a: sharing, revocation, and DEK rotation.
+// Sharing, revocation, and DEK rotation.
 //
 // `share` is O(1) — it wraps a COPY of the already-cached DEK for a new recipient, no value
-// re-encryption. `revoke` and `key rotate` both run `perform_rotation`: a fresh DEK is generated
-// in the agent, the committed history is re-encrypted under it, the new DEK is re-wrapped for
-// every *remaining* member, and everything is applied in one atomic server-side rotate batch. A
-// revoked user, holding only the retired DEK, can no longer decrypt anything committed afterward.
+// re-encryption. Sharing also auto-joins the target's org membership server-side (see
+// `handlers::add_member`). `revoke` and `key rotate` both run `perform_rotation`: a fresh DEK is
+// generated in the agent, the committed history is re-encrypted under it, the new DEK is
+// re-wrapped for every *remaining* member, and everything is applied in one atomic server-side
+// rotate batch. A revoked user, holding only the retired DEK, can no longer decrypt anything
+// committed afterward.
 // =====================================================================================
 
-/// `wonton share <user> --env <ctx> [--role ...]` — grant `target_username` access to the
-/// context's environment by wrapping a copy of the currently-cached DEK for their X25519 public
-/// key. O(1): no value re-encryption, no rotation.
+/// `wonton share <user> [--branch <name>] [--role reader|writer|admin]` (default: current
+/// branch, role `reader`) — grant `target_username` access by wrapping a copy of the
+/// currently-cached DEK for their X25519 public key. O(1): no value re-encryption, no rotation.
 pub async fn share(
     config_path: &Path,
     state_path: &Path,
     socket_path: &Path,
-    ctx_name: &str,
+    cwd: &Path,
+    branch_override: Option<&str>,
     target_username: &str,
     role: Role,
 ) -> anyhow::Result<()> {
-    let config = Config::load_from(config_path)?;
-    // Needs its own cached DEK (via `wonton use`) to wrap a copy for the target.
-    let (ctx, identity) = ready_context(&config, socket_path, ctx_name).await?;
-    let client = authed_client(&identity);
+    let mut ws = resolve_workspace(config_path, cwd, None)?;
+    if let Some(b) = branch_override {
+        ws.branch = b.to_string();
+    }
+    ready_workspace(state_path, socket_path, &ws).await?;
+    let client = authed_client(&ws.identity);
 
-    // Resolve the target's public keys (any valid actor may look a user up).
     let target = client.get_user(target_username).await.map_err(|e| match e {
         SyncError::NotFound(_) => anyhow!("no such user '{target_username}'"),
         other => anyhow!("could not look up user '{target_username}': {other}"),
     })?;
 
-    // The version currently cached in the agent for this context is the version we grant under.
+    let key = ws.key();
     let state = LocalState::load_from(state_path)?;
-    let dek_version = state.context(ctx_name).map(|cs| cs.dek_version).unwrap_or(0);
+    let dek_version = state.branch(&key).map(|b| b.dek_version).unwrap_or(0);
     if dek_version == 0 {
-        bail!("no known DEK version for context '{ctx_name}'; run `wonton use {ctx_name}` again");
+        bail!("no known DEK version for branch '{}'; push it first so it exists server-side", ws.branch);
     }
 
-    // Best-effort membership upsert (server-side `ON CONFLICT DO UPDATE`, always safe to call —
-    // a no-op if the target already holds this role or higher isn't distinguished here).
     client
-        .add_member(
-            &ctx.store,
-            &ctx.environment,
-            &MemberRequest {
-                user_id: target.user_id.clone(),
-                role,
-            },
-        )
+        .add_member(&ws.org, &ws.store, &ws.branch, &MemberRequest { user_id: target.user_id.clone(), role })
         .await
-        .context("could not add the target as a member of the environment")?;
+        .context("could not add the target as a member of the branch")?;
 
-    // Wrap a copy of the cached DEK for the target — the raw DEK never leaves the agent.
-    let sealed_box =
-        agent::wrap_dek_for_recipient(socket_path, ctx.name.clone(), target.x25519_pubkey.clone())
-            .await
-            .context("agent could not wrap the DEK for the target")?;
+    let sealed_box = agent::wrap_dek_for_recipient(socket_path, key, target.x25519_pubkey.clone())
+        .await
+        .context("agent could not wrap the DEK for the target")?;
 
     client
         .grant_key(
-            &ctx.store,
-            &ctx.environment,
+            &ws.org,
+            &ws.store,
+            &ws.branch,
             &GrantKeyRequest {
                 user_id: target.user_id.clone(),
                 dek_version,
@@ -1503,27 +1704,25 @@ pub async fn share(
         .context("could not upload the wrapped-DEK grant")?;
 
     println!(
-        "Shared {}@{} with '{target_username}' as {} (DEK v{dek_version}).",
-        ctx.store,
-        ctx.environment,
+        "Shared {}/{}/{} with '{target_username}' as {} (DEK v{dek_version}).",
+        ws.org,
+        ws.store,
+        ws.branch,
         role_label(role)
     );
     Ok(())
 }
 
-/// `wonton revoke <user> --env <ctx>` — remove the target's membership, then rotate the DEK.
-/// Revocation *is* rotation: the target may have cached the old DEK, so the only
-/// way to actually deny them is to move to a new one they don't hold.
-pub async fn revoke(
-    config_path: &Path,
-    state_path: &Path,
-    socket_path: &Path,
-    ctx_name: &str,
-    target_username: &str,
-) -> anyhow::Result<()> {
-    let config = Config::load_from(config_path)?;
-    let (ctx, identity) = ready_context(&config, socket_path, ctx_name).await?;
-    let client = authed_client(&identity);
+/// `wonton revoke <user> [--branch <name>]` — remove the target's membership, then rotate the
+/// DEK. Revocation *is* rotation: the target may have cached the old DEK, so the only way to
+/// actually deny them is to move to a new one they don't hold.
+pub async fn revoke(config_path: &Path, state_path: &Path, socket_path: &Path, cwd: &Path, branch_override: Option<&str>, target_username: &str) -> anyhow::Result<()> {
+    let mut ws = resolve_workspace(config_path, cwd, None)?;
+    if let Some(b) = branch_override {
+        ws.branch = b.to_string();
+    }
+    ready_workspace(state_path, socket_path, &ws).await?;
+    let client = authed_client(&ws.identity);
 
     let target = client.get_user(target_username).await.map_err(|e| match e {
         SyncError::NotFound(_) => anyhow!("no such user '{target_username}'"),
@@ -1531,100 +1730,79 @@ pub async fn revoke(
     })?;
 
     client
-        .remove_member(&ctx.store, &ctx.environment, &target.user_id)
+        .remove_member(&ws.org, &ws.store, &ws.branch, &target.user_id)
         .await
         .context("could not remove the target's membership")?;
-    println!(
-        "Removed '{target_username}' from {}@{}; rotating the DEK...",
-        ctx.store, ctx.environment
-    );
+    println!("Removed '{target_username}' from {}/{}/{}; rotating the DEK...", ws.org, ws.store, ws.branch);
 
-    perform_rotation(state_path, socket_path, &ctx, &identity).await
+    perform_rotation(state_path, socket_path, &ws).await
 }
 
-/// `wonton key rotate --env <ctx>` — rotate the environment's DEK with no membership change
+/// `wonton key rotate [--branch <name>]` — rotate the branch's DEK with no membership change
 /// (re-encrypt history under a fresh DEK and re-wrap for the current members).
-pub async fn rotate(
-    config_path: &Path,
-    state_path: &Path,
-    socket_path: &Path,
-    ctx_name: &str,
-) -> anyhow::Result<()> {
-    let config = Config::load_from(config_path)?;
-    let (ctx, identity) = ready_context(&config, socket_path, ctx_name).await?;
-    perform_rotation(state_path, socket_path, &ctx, &identity).await
+pub async fn rotate(config_path: &Path, state_path: &Path, socket_path: &Path, cwd: &Path, branch_override: Option<&str>) -> anyhow::Result<()> {
+    let mut ws = resolve_workspace(config_path, cwd, None)?;
+    if let Some(b) = branch_override {
+        ws.branch = b.to_string();
+    }
+    ready_workspace(state_path, socket_path, &ws).await?;
+    perform_rotation(state_path, socket_path, &ws).await
 }
 
-/// The shared 8-step rotation both `revoke` and `key rotate` run. Assumes the
-/// caller already resolved + guarded the context (old DEK cached under `ctx.name`).
+/// The shared 8-step rotation both `revoke` and `key rotate` run. Assumes the caller already
+/// resolved + guarded the workspace (old DEK cached under `ws.key()`).
 ///
 /// Known edge case (not specially handled): if `revoke` removed the last *other* member, the
 /// member list may contain only the rotator (or, if the rotator revoked themselves, be empty).
-/// The rotation still proceeds; an env with zero members afterward is unusual but not this
+/// The rotation still proceeds; a branch with zero members afterward is unusual but not this
 /// phase's problem to prevent — the code simply doesn't crash on it.
-async fn perform_rotation(
-    state_path: &Path,
-    socket_path: &Path,
-    ctx: &Context,
-    identity: &Identity,
-) -> anyhow::Result<()> {
-    let client = authed_client(identity);
-    let store = open_object_store(&object_store_dir_for(state_path))?;
+async fn perform_rotation(state_path: &Path, socket_path: &Path, ws: &Workspace) -> anyhow::Result<()> {
+    let client = authed_client(&ws.identity);
+    let obj_store = open_object_store(&object_store_dir_for(state_path))?;
+    let key = ws.key();
 
     // 2. The members to re-wrap for (reflects any just-applied `remove_member`).
     let members = client
-        .list_members(&ctx.store, &ctx.environment)
+        .list_members(&ws.org, &ws.store, &ws.branch)
         .await
-        .context("could not list environment members")?;
+        .context("could not list branch members")?;
 
     // 3. The next DEK version.
     let details = client
-        .get_env_details(&ctx.store, &ctx.environment)
+        .get_branch_details(&ws.org, &ws.store, &ws.branch)
         .await
-        .context("could not read the environment's current DEK version")?;
+        .context("could not read the branch's current DEK version")?;
     let new_version = details.active_dek_version + 1;
 
-    // 4. Stage a fresh DEK in the agent under a temp context (distinct from `ctx.name`, whose DEK
-    //    is still the OLD one we need to decrypt the current history with).
-    let temp_ctx = format!("{}::rotate::{new_version}", ctx.name);
+    // 4. Stage a fresh DEK in the agent under a temp context (distinct from `key`, whose DEK is
+    //    still the OLD one we need to decrypt the current history with).
+    let temp_ctx = format!("{key}::rotate::{new_version}");
     agent::generate_dek(socket_path, temp_ctx.clone())
         .await
         .context("agent could not generate a new DEK")?;
 
     // 5. Re-encrypt the CURRENT TIP's committed tree (no staged overlay) under the new DEK. The
     //    new commit's parent is the old tip; sign via either cipher (signing ignores context).
-    let mut state = LocalState::load_from(state_path)?;
-    let cs = state.context(&ctx.name).cloned().unwrap_or_default();
-    let branch = cs.branch.clone();
-    let old_tip = cs.tips.get(&branch).copied();
+    let state = LocalState::load_from(state_path)?;
+    let bs = state.branch(&key).cloned().unwrap_or_default();
+    let old_tip = bs.tip;
 
-    let old_cipher = AgentCipher::new(socket_path, ctx.name.clone());
+    let old_cipher = AgentCipher::new(socket_path, key.clone());
     let new_cipher = AgentCipher::new(socket_path, temp_ctx.clone());
-    let working_set = effective_working_set(&store, &old_cipher, old_tip, &BTreeMap::new())?;
+    let working_set = effective_working_set(&obj_store, &old_cipher, old_tip, &BTreeMap::new())?;
 
-    let author_id = Uuid::parse_str(&identity.user_id)
-        .with_context(|| format!("identity user_id '{}' is not a valid UUID", identity.user_id))?;
-    let new_hash = wonton_vcs::commit(
-        &store,
-        &new_cipher,
-        &old_cipher,
-        author_id,
-        old_tip,
-        &working_set,
-        "key rotation",
-    )?;
+    let author_id = Uuid::parse_str(&ws.identity.user_id)
+        .with_context(|| format!("identity user_id '{}' is not a valid UUID", ws.identity.user_id))?;
+    let new_hash = wonton_vcs::commit(&obj_store, &new_cipher, &old_cipher, author_id, old_tip, &working_set, "key rotation")?;
 
     // 6. Wrap the new DEK for every remaining member; remember our own sealed box for the hot-swap.
     let mut wrapped_deks = Vec::with_capacity(members.len());
     let mut own_sealed: Option<String> = None;
     for member in &members {
-        let sealed =
-            agent::wrap_dek_for_recipient(socket_path, temp_ctx.clone(), member.x25519_pubkey.clone())
-                .await
-                .with_context(|| {
-                    format!("could not wrap the new DEK for member {}", member.user_id)
-                })?;
-        if member.user_id == identity.user_id {
+        let sealed = agent::wrap_dek_for_recipient(socket_path, temp_ctx.clone(), member.x25519_pubkey.clone())
+            .await
+            .with_context(|| format!("could not wrap the new DEK for member {}", member.user_id))?;
+        if member.user_id == ws.identity.user_id {
             own_sealed = Some(sealed.clone());
         }
         wrapped_deks.push(GrantKeyRequest {
@@ -1636,12 +1814,13 @@ async fn perform_rotation(
 
     // 7. Collect the re-encrypted object batch (new commit back to the old tip) and apply the
     //    rotation atomically server-side (objects + new wrapped-DEK map + version bump).
-    let object_hashes = collect_objects_to_push(&store, new_hash, old_tip)?;
-    let objects = objects_for_upload(&store, &object_hashes)?;
+    let object_hashes = collect_objects_to_push(&obj_store, new_hash, old_tip)?;
+    let objects = objects_for_upload(&obj_store, &object_hashes)?;
     client
         .rotate(
-            &ctx.store,
-            &ctx.environment,
+            &ws.org,
+            &ws.store,
+            &ws.branch,
             &RotateRequest {
                 new_dek_version: new_version,
                 objects,
@@ -1651,22 +1830,24 @@ async fn perform_rotation(
         .await
         .context("rotation batch was rejected by the server")?;
 
-    // 8. Advance the local tip, hot-swap the agent's `ctx.name`-cached DEK to the new one (so the
+    // 8. Advance the local tip, hot-swap the agent's `key`-cached DEK to the new one (so the
     //    caller keeps working under the new DEK), and persist the new version.
     if let Some(sealed) = own_sealed {
-        agent::unwrap_dek(socket_path, ctx.name.clone(), sealed)
+        agent::unwrap_dek(socket_path, key.clone(), sealed)
             .await
             .context("could not hot-swap the rotated DEK into the agent")?;
     }
-    let cs = state.context_mut(&ctx.name);
-    cs.tips.insert(branch.clone(), new_hash);
-    cs.dek_version = new_version;
+    let mut state = LocalState::load_from(state_path)?;
+    let bs = state.branch_mut(&key);
+    bs.tip = Some(new_hash);
+    bs.dek_version = new_version;
     state.save_to(state_path)?;
 
     println!(
-        "Rotated {}@{} to DEK v{new_version}; re-encrypted history at {} for {} member(s).",
-        ctx.store,
-        ctx.environment,
+        "Rotated {}/{}/{} to DEK v{new_version}; re-encrypted history at {} for {} member(s).",
+        ws.org,
+        ws.store,
+        ws.branch,
         new_hash.to_hex(),
         members.len()
     );
@@ -1674,20 +1855,6 @@ async fn perform_rotation(
 }
 
 // ---- shared helpers for the VCS porcelain --------------------------------------------------
-
-/// Resolve a context + identity from config without any agent/network check (for pull/push, which
-/// move opaque objects and need no cached DEK).
-fn context_and_identity(config: &Config, ctx_name: &str) -> anyhow::Result<(Context, Identity)> {
-    let ctx = config
-        .find_context(ctx_name)
-        .cloned()
-        .ok_or_else(|| anyhow!("no context named '{ctx_name}'; add one with `wonton context add`"))?;
-    let identity = config
-        .find_identity(&ctx.identity)
-        .cloned()
-        .ok_or_else(|| anyhow!("context '{ctx_name}' references unknown identity '{}'", ctx.identity))?;
-    Ok((ctx, identity))
-}
 
 /// A `SyncClient` for an identity's server, carrying its cached session token.
 fn authed_client(identity: &Identity) -> SyncClient {
@@ -1773,11 +1940,7 @@ fn commit_first_parent(store: &LocalObjectStore, commit_hash: Hash) -> anyhow::R
 }
 
 /// Decrypt one already-stored ciphertext blob via the agent.
-fn decrypt_blob(
-    store: &LocalObjectStore,
-    cipher: &AgentCipher,
-    blob_hash: &Hash,
-) -> anyhow::Result<Vec<u8>> {
+fn decrypt_blob(store: &LocalObjectStore, cipher: &AgentCipher, blob_hash: &Hash) -> anyhow::Result<Vec<u8>> {
     let bytes = store
         .get(blob_hash)?
         .ok_or_else(|| anyhow!("blob {} missing from the local store", blob_hash.to_hex()))?;
@@ -1792,12 +1955,7 @@ fn decrypt_blob(
 /// Build the effective decrypted [`WorkingSet`] = the tip tree decrypted, with `staged` overlaid
 /// (`Set` → replace/add the decrypted staged blob, `Unset` → drop the key). Used by `commit`,
 /// `run`, and `export`. Every value is decrypted through the agent; nothing is written to disk.
-fn effective_working_set(
-    store: &LocalObjectStore,
-    cipher: &AgentCipher,
-    tip: Option<Hash>,
-    staged: &BTreeMap<String, StagedEntry>,
-) -> anyhow::Result<WorkingSet> {
+fn effective_working_set(store: &LocalObjectStore, cipher: &AgentCipher, tip: Option<Hash>, staged: &BTreeMap<String, StagedEntry>) -> anyhow::Result<WorkingSet> {
     let mut working_set = WorkingSet::new();
 
     if let Some(tip) = tip {
@@ -1824,16 +1982,12 @@ fn effective_working_set(
 
 /// Collect every local commit/tree/blob hash reachable from `tip`, stopping a given path at
 /// `stop` (the remote's current tip), a root, an object the local store lacks, or a
-/// previously-visited hash. Walks **every** parent of a merge commit (Phase 5b), not just the
-/// first — unlike `log`'s mainline-only walk, `push` must upload objects reachable via a merge
-/// commit's second parent too (e.g. a side branch merged in but never separately pushed on this
-/// ref). Uploading is idempotent server-side, so visiting a shared ancestor from two paths and
-/// (thanks to `seen`) collecting it only once is an optimization, not a correctness requirement.
-fn collect_objects_to_push(
-    store: &LocalObjectStore,
-    tip: Hash,
-    stop: Option<Hash>,
-) -> anyhow::Result<Vec<Hash>> {
+/// previously-visited hash. Walks **every** parent of a merge commit, not just the first —
+/// unlike `log`'s mainline-only walk, `push` must upload objects reachable via a merge commit's
+/// second parent too. Uploading is idempotent server-side, so visiting a shared ancestor from two
+/// paths and (thanks to `seen`) collecting it only once is an optimization, not a correctness
+/// requirement.
+fn collect_objects_to_push(store: &LocalObjectStore, tip: Hash, stop: Option<Hash>) -> anyhow::Result<Vec<Hash>> {
     let mut hashes = Vec::new();
     let mut seen = HashSet::new();
     let mut worklist = vec![tip];
@@ -1873,10 +2027,7 @@ fn collect_objects_to_push(
 /// reading each object's bytes from the store and sniffing its kind. Used by `perform_rotation`
 /// (the `rotate` route takes an explicit object batch rather than reusing `wonton_sync::push`,
 /// which moves a ref instead of applying a wrapped-DEK map).
-fn objects_for_upload(
-    store: &LocalObjectStore,
-    hashes: &[Hash],
-) -> anyhow::Result<Vec<ObjectUploadRequest>> {
+fn objects_for_upload(store: &LocalObjectStore, hashes: &[Hash]) -> anyhow::Result<Vec<ObjectUploadRequest>> {
     let mut out = Vec::with_capacity(hashes.len());
     for h in hashes {
         let bytes = store
@@ -2017,7 +2168,7 @@ mod merge_prompt_tests {
         assert!(display_conflict_value(Some(&[0xff, 0xfe, 0x00])).starts_with("<binary"));
     }
 
-    // ---- resolve_conflicts_interactively (needs a real store + agent-cached DEK) --------------
+    // ---- resolve_conflicts_interactively (needs a real store + agent-cached DEKs) -------------
 
     fn unique_path(tag: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2072,11 +2223,12 @@ mod merge_prompt_tests {
         conflicts.insert("B".to_string(), ConflictHashes { ours: Some(ours_b), theirs: Some(theirs_b) });
         let mut resolved = BTreeMap::new();
 
-        // "A" resolved via ours; "B" is skipped, stopping the loop.
+        // "A" resolved via ours; "B" is skipped, stopping the loop. Same cipher used for both
+        // sides here — a single-DEK scenario is a special case of the general two-cipher path.
         let mut reader = Cursor::new(b"o\ns\n".to_vec());
         let mut writer = Vec::new();
         let mut persist_calls = 0u32;
-        resolve_conflicts_interactively(&store, &cipher, &mut reader, &mut writer, &mut conflicts, &mut resolved, |_c, _r| {
+        resolve_conflicts_interactively(&store, &cipher, &cipher, &mut reader, &mut writer, &mut conflicts, &mut resolved, |_c, _r| {
             persist_calls += 1;
             Ok(())
         })
@@ -2104,7 +2256,7 @@ mod merge_prompt_tests {
         // Resolve "DELETED" manually to a brand-new value.
         let mut reader = Cursor::new(b"m\nmanual-resolution\n".to_vec());
         let mut writer = Vec::new();
-        resolve_conflicts_interactively(&store, &cipher, &mut reader, &mut writer, &mut conflicts, &mut resolved, |_c, _r| Ok(()))
+        resolve_conflicts_interactively(&store, &cipher, &cipher, &mut reader, &mut writer, &mut conflicts, &mut resolved, |_c, _r| Ok(()))
             .unwrap();
 
         assert!(conflicts.is_empty());
@@ -2130,9 +2282,43 @@ mod merge_prompt_tests {
 
         let mut reader = Cursor::new(b"t\n".to_vec());
         let mut writer = Vec::new();
-        resolve_conflicts_interactively(&store, &cipher, &mut reader, &mut writer, &mut conflicts, &mut resolved, |_c, _r| Ok(()))
+        resolve_conflicts_interactively(&store, &cipher, &cipher, &mut reader, &mut writer, &mut conflicts, &mut resolved, |_c, _r| Ok(()))
             .unwrap();
 
         assert_eq!(resolved.get("KEY"), Some(&ResolvedEntry::Delete));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn theirs_choice_across_two_different_deks_reencrypts_under_ours() {
+        // The cross-DEK correctness case: "theirs" is encrypted under a DIFFERENT DEK than
+        // "ours". Choosing "theirs" must decrypt with theirs_cipher and re-encrypt with
+        // ours_cipher — reusing theirs' blob hash as-is would leave a blob in the merge result
+        // that ours' own DEK can never decrypt.
+        let (ours_sock, store) = agent_with_dek_and_store("ours-ctx").await;
+        // A second, independent agent+DEK simulates "theirs" — a genuinely different key.
+        let (theirs_sock, _theirs_store) = agent_with_dek_and_store("theirs-ctx").await;
+        let ours_cipher = AgentCipher::new(ours_sock, "ours-ctx");
+        let theirs_cipher = AgentCipher::new(theirs_sock, "theirs-ctx");
+
+        let theirs_hash = encrypt_and_store(&store, &theirs_cipher, b"theirs-cross-dek-value").unwrap();
+        let mut conflicts = BTreeMap::new();
+        conflicts.insert("KEY".to_string(), ConflictHashes { ours: None, theirs: Some(theirs_hash) });
+        let mut resolved = BTreeMap::new();
+
+        let mut reader = Cursor::new(b"t\n".to_vec());
+        let mut writer = Vec::new();
+        resolve_conflicts_interactively(&store, &ours_cipher, &theirs_cipher, &mut reader, &mut writer, &mut conflicts, &mut resolved, |_c, _r| Ok(()))
+            .unwrap();
+
+        match resolved.get("KEY") {
+            Some(ResolvedEntry::Set(hash)) => {
+                assert_ne!(*hash, theirs_hash, "must be re-encrypted, not the reused theirs blob hash");
+                // Decryptable under OURS' cipher (the merge result's own DEK) — this would fail
+                // if the code had wrongly reused theirs' ciphertext hash as-is.
+                let plaintext = decrypt_blob(&store, &ours_cipher, hash).unwrap();
+                assert_eq!(plaintext, b"theirs-cross-dek-value");
+            }
+            other => panic!("expected a re-encrypted Set entry, got {other:?}"),
+        }
     }
 }
