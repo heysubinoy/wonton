@@ -23,7 +23,7 @@ use clap::{Parser, Subcommand};
     about = "Wonton — an end-to-end encrypted, git-like secrets manager",
     long_about = "Wonton — an end-to-end encrypted, git-like secrets manager.\n\n\
         The server only ever stores ciphertext and public keys; every value is encrypted and \
-        decrypted on your machine. Projects are organized like GitHub: an org owns stores \
+        decrypted on your machine. Projects are org → repo → branch: an org owns stores \
         (repos), and every branch within a store is its own encryption/access-control boundary \
         with its own key, just like `git checkout -b` but for secrets.",
     after_help = "EXAMPLES:\n    \

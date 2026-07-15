@@ -3,10 +3,10 @@
 
   <h1>Wonton</h1>
 
-  <p><strong>A zero-knowledge, GitHub-shaped secrets manager built for agentic development.</strong></p>
+  <p><strong>A zero-knowledge, Git-like secrets manager built for agentic development.</strong></p>
 
   <p>
-    Org → repo → branch, exactly like GitHub — except every branch is its own encryption
+    Org → repo → branch, Git-like — except every branch is its own encryption
     boundary (its own key, its own access list, its own history), and the server that stores and
     syncs it never holds a key that can read a single value. Grant an AI agent exactly the branch
     it needs, hand it secrets without ever putting them in a prompt or a `.env` file, and revoke
@@ -74,7 +74,7 @@ model is built around.
 - **Zero-knowledge by construction** — the server never depends on the crypto crate at all
   (enforced by Cargo *and* a compile-time test); there is no code path that could receive a key
   even by accident.
-- **Org → repo → branch, GitHub-shaped** — every user belongs to an org; a store (repo) lives in
+- **Org → repo → branch, Git-like** — every user belongs to an org; a store (repo) lives in
   an org; a branch is the actual encryption/access boundary. Sharing a branch with someone who
   isn't yet in the org adds them to it, scoped by the grant they were actually given.
 - **Local-first, like git** — `wonton init` and `wonton branch -b <name>` are 100% local (zero
