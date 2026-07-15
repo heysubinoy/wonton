@@ -12,7 +12,7 @@
 //! not a `branch -> tip` map: there's nothing left to map over. This cache is global/per-machine
 //! (shared across every directory bound to the same `org/store/branch`, harmless since objects
 //! and tips are content-addressed ciphertext) — the *current* branch for a given directory lives
-//! in that directory's `.wonton.local` file instead (`crate::config`), not here.
+//! in that directory's `wonton.toml` file instead (`crate::config`), not here.
 //!
 //! ## Object store (`<data_local_dir>/wonton/objects/`)
 //! One shared [`wonton_objects::LocalObjectStore`] across every branch — a single flat,

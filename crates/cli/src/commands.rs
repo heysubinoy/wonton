@@ -1,6 +1,6 @@
 //! `wonton login`, `whoami`, `store create` (advanced/manual), `init`, `branch`
 //! (list/create/switch), and the VCS porcelain (status/set/unset/commit/log/diff/pull/push/run/
-//! export/merge/share/revoke/rotate).
+//! export/expose/merge/grant/revoke/rotate).
 //!
 //! Each command's *logic* is a free function taking explicit `config_path` / `state_path` /
 //! `socket_path` / `cwd` arguments (rather than resolving the real defaults itself), so
@@ -9,9 +9,9 @@
 //! call these.
 //!
 //! ## `Workspace`: the single resolved unit every porcelain command operates on
-//! A directory is bound to a store by a committed `wonton.toml` (`server` + `store = "org/
-//! store"`); the current branch lives in an uncommitted sibling `.wonton.local` (`branch =
-//! "..."`), read fresh on every invocation — see `crate::config`'s module docs. [`resolve_workspace`]
+//! A directory is bound to a store (and branch) by one committed `wonton.toml` (`server` +
+//! `store = "org/store"` + `branch`), read fresh on every invocation — see `crate::config`'s
+//! module docs. [`resolve_workspace`]
 //! combines that with a resolved local [`Identity`] into a [`Workspace`], which every porcelain
 //! command below starts from. There is no more separate "context" concept: a branch **is** the
 //! crypto/ACL unit (it replaced "environment"), and the agent/`LocalState` key for it is simply
@@ -365,7 +365,7 @@ fn resolve_identity_name<'a>(config: &'a Config, given: Option<&'a str>) -> anyh
     }
 }
 
-fn resolve_identity(config: &Config, identity_name: Option<&str>) -> anyhow::Result<Identity> {
+pub(crate) fn resolve_identity(config: &Config, identity_name: Option<&str>) -> anyhow::Result<Identity> {
     let name = resolve_identity_name(config, identity_name)?;
     config
         .find_identity(name)
@@ -440,10 +440,10 @@ pub async fn store_create(
 // The resolved workspace every directory-bound command starts from.
 // =====================================================================================
 
-/// A resolved `wonton.toml`/`.wonton.local` project + the local identity to act as.
+/// A resolved `wonton.toml` project + the local identity to act as.
 #[derive(Debug, Clone)]
 pub struct Workspace {
-    /// The directory `wonton.toml` was found in (where `.wonton.local` lives too).
+    /// The directory `wonton.toml` was found in.
     pub dir: PathBuf,
     pub org: String,
     pub store: String,
@@ -458,9 +458,8 @@ impl Workspace {
     }
 }
 
-/// Resolve the current directory's workspace: walk up for `wonton.toml`, read `.wonton.local`
-/// for the current branch (defaulting to `"main"` if absent — e.g. a fresh `git clone` that
-/// never had one written locally yet), and resolve the identity to act as.
+/// Resolve the current directory's workspace: walk up for `wonton.toml` (org/store/branch all
+/// live in it — see `crate::config`'s module docs) and resolve the identity to act as.
 pub fn resolve_workspace(config_path: &Path, cwd: &Path, identity_name: Option<&str>) -> anyhow::Result<Workspace> {
     let project = config::find_project(cwd).ok_or_else(|| {
         anyhow!(
@@ -468,14 +467,13 @@ pub fn resolve_workspace(config_path: &Path, cwd: &Path, identity_name: Option<&
              start a new project, or `wonton clone <org> <store>` to join an existing one"
         )
     })?;
-    let branch = config::read_local_branch(&project.dir).unwrap_or_else(|| "main".to_string());
     let config = Config::load_from(config_path)?;
     let identity = resolve_identity_for_project(&config, &project.server, identity_name)?;
     Ok(Workspace {
         dir: project.dir,
         org: project.org,
         store: project.store,
-        branch,
+        branch: project.branch,
         identity,
     })
 }
@@ -564,7 +562,7 @@ async fn auto_pull(state_path: &Path, org: &str, store: &str, branch: &str, iden
 
 /// Make sure `(org, store, branch)` is ready to be read/written under `identity`: the agent is
 /// unlocked for them, the DEK is cached (unwrapping it if not — the "just works after `login` +
-/// `share`" path), and — only for a branch that's known to exist server-side
+/// `grant`" path), and — only for a branch that's known to exist server-side
 /// (`dek_version > 0`) but has no local history yet — automatically pulled once. A branch that
 /// only exists locally so far (`dek_version == 0`, e.g. straight after `init`/`branch -b`, never
 /// pushed) is deliberately NOT auto-pulled: there is nothing to pull, and trying would require
@@ -610,8 +608,8 @@ fn default_store_name(cwd: &Path) -> String {
 
 /// `wonton init [ORG] [STORE] [BRANCH] [--identity <identity>]`. Defaults: `ORG` = your username,
 /// `STORE` = the current directory's name, `BRANCH` = `"main"`. Generates a fresh DEK locally
-/// under the resolved key and writes `wonton.toml` (committed) + `.wonton.local` (not
-/// committed). Idempotent if `wonton.toml` already names the same org/store.
+/// under the resolved key and writes `wonton.toml`. Idempotent if `wonton.toml` already names
+/// the same org/store (updating just the branch field if that differs from what's requested).
 pub async fn init(
     config_path: &Path,
     socket_path: &Path,
@@ -631,8 +629,13 @@ pub async fn init(
     let marker_path = cwd.join("wonton.toml");
     if marker_path.exists() {
         match config::read_wonton_toml(&marker_path) {
+            Some(w) if w.store == format!("{org}/{store}") && w.branch == branch => {
+                println!("wonton.toml already tracks '{org}/{store}' on branch '{branch}'.");
+            }
             Some(w) if w.store == format!("{org}/{store}") => {
-                println!("wonton.toml already tracks '{org}/{store}'.");
+                config::write_wonton_toml(&marker_path, &identity.server_url, &org, &store, &branch)
+                    .context("writing wonton.toml")?;
+                println!("wonton.toml already tracks '{org}/{store}'; switched its branch to '{branch}'.");
             }
             Some(w) => bail!(
                 "wonton.toml already exists here and tracks '{}'; refusing to overwrite it \
@@ -649,12 +652,10 @@ pub async fn init(
         agent::generate_dek(socket_path, key)
             .await
             .context("agent could not generate a DEK (are you logged in?)")?;
-        config::write_wonton_toml(&marker_path, &identity.server_url, &org, &store)
+        config::write_wonton_toml(&marker_path, &identity.server_url, &org, &store, &branch)
             .context("writing wonton.toml")?;
-        println!("Initialized '{org}/{store}' in {} (wrote wonton.toml).", cwd.display());
+        println!("Initialized '{org}/{store}' on branch '{branch}' in {} (wrote wonton.toml).", cwd.display());
     }
-    config::write_local_branch(cwd, &branch).context("writing .wonton.local")?;
-    println!("wonton: add `.wonton.local` to .gitignore — it's per-clone local state, not shared.");
     println!("Next: wonton set KEY=value, wonton commit -m \"...\", wonton push");
     Ok(())
 }
@@ -694,13 +695,12 @@ pub fn parse_clone_target(
 
 /// `wonton clone <org> <store> [branch] [--identity <identity>]`. For a directory that isn't a
 /// git checkout carrying a `wonton.toml` already (access was communicated out-of-band): first
-/// confirms the target actually EXISTS on the server (a hard failure — no markers written — if
+/// confirms the target actually EXISTS on the server (a hard failure — no marker written — if
 /// it doesn't, since a typo'd/nonexistent org/store/branch will never start working no matter
-/// how long you wait), then writes the marker + `.wonton.local`, then makes a best-effort
-/// attempt to unwrap the DEK and pull history right away. That last step failing (e.g. shared
-/// with you but the grant hasn't landed yet) is a soft warning, not a hard failure — access
-/// legitimately might arrive shortly, matching the rest of the CLI's "just works once you're
-/// granted access" philosophy.
+/// how long you wait), then writes the marker, then makes a best-effort attempt to unwrap the
+/// DEK and pull history right away. That last step failing (e.g. shared with you but the grant
+/// hasn't landed yet) is a soft warning, not a hard failure — access legitimately might arrive
+/// shortly, matching the rest of the CLI's "just works once you're granted access" philosophy.
 #[allow(clippy::too_many_arguments)]
 pub async fn clone(
     config_path: &Path,
@@ -729,10 +729,9 @@ pub async fn clone(
         );
     }
 
-    config::write_wonton_toml(&marker_path, &identity.server_url, org, store).context("writing wonton.toml")?;
-    config::write_local_branch(cwd, branch).context("writing .wonton.local")?;
+    config::write_wonton_toml(&marker_path, &identity.server_url, org, store, branch).context("writing wonton.toml")?;
     println!(
-        "Cloned '{org}/{store}' (branch '{branch}') into {} (wrote wonton.toml + .wonton.local).",
+        "Cloned '{org}/{store}' (branch '{branch}') into {} (wrote wonton.toml).",
         cwd.display()
     );
 
@@ -754,7 +753,7 @@ pub async fn clone(
 // =====================================================================================
 
 /// `wonton branch` (no args) — list branches known locally for the current store, marking the
-/// current one (read from `.wonton.local`).
+/// current one (read from `wonton.toml`).
 pub async fn branch_list(config_path: &Path, state_path: &Path, cwd: &Path) -> anyhow::Result<()> {
     let ws = resolve_workspace(config_path, cwd, None)?;
     let prefix = format!("{}/{}/", ws.org, ws.store);
@@ -788,14 +787,15 @@ pub async fn branch_list(config_path: &Path, state_path: &Path, cwd: &Path) -> a
     Ok(())
 }
 
-/// `wonton branch <name>` — switch: rewrite `.wonton.local`, making sure the branch's DEK is
-/// ready (unwrapping/auto-pulling as needed via [`ready_branch`]) first.
+/// `wonton branch <name>` — switch: rewrite `wonton.toml`'s `branch` field, making sure the
+/// branch's DEK is ready (unwrapping/auto-pulling as needed via [`ready_branch`]) first.
 pub async fn branch_switch(config_path: &Path, state_path: &Path, socket_path: &Path, cwd: &Path, name: &str) -> anyhow::Result<()> {
     let ws = resolve_workspace(config_path, cwd, None)?;
     ready_branch(state_path, socket_path, &ws.org, &ws.store, name, &ws.identity)
         .await
         .with_context(|| format!("could not switch to branch '{name}'"))?;
-    config::write_local_branch(&ws.dir, name).context("writing .wonton.local")?;
+    config::write_wonton_toml(&ws.dir.join("wonton.toml"), &ws.identity.server_url, &ws.org, &ws.store, name)
+        .context("writing wonton.toml")?;
     println!("Switched to branch '{name}'.");
     Ok(())
 }
@@ -860,7 +860,8 @@ pub async fn branch_create(
     }
     state.save_to(state_path)?;
 
-    config::write_local_branch(&ws.dir, name).context("writing .wonton.local")?;
+    config::write_wonton_toml(&ws.dir.join("wonton.toml"), &ws.identity.server_url, &ws.org, &ws.store, name)
+        .context("writing wonton.toml")?;
     println!("Created branch '{name}' (switched to it).");
     Ok(())
 }
@@ -1324,7 +1325,7 @@ async fn provision_on_first_push(state_path: &Path, socket_path: &Path, ws: &Wor
             bail!(
                 "'{}/{}/{}' already exists on the server (created by someone else) — this local \
                  history was encrypted under a different key and can't be reconciled with it. Ask \
-                 an admin to `wonton share` you, then start a fresh directory with `wonton clone {} \
+                 an admin to `wonton grant` you, then start a fresh directory with `wonton clone {} \
                  {} {}` instead of pushing this one.",
                 ws.org,
                 ws.store,
@@ -1888,10 +1889,10 @@ pub async fn export(
 }
 
 // =====================================================================================
-// Sharing, revocation, and DEK rotation.
+// Granting, revocation, and DEK rotation.
 //
-// `share` is O(1) — it wraps a COPY of the already-cached DEK for a new recipient, no value
-// re-encryption. Sharing also auto-joins the target's org membership server-side (see
+// `grant` is O(1) — it wraps a COPY of the already-cached DEK for a new recipient, no value
+// re-encryption. Granting also auto-joins the target's org membership server-side (see
 // `handlers::add_member`). `revoke` and `key rotate` both run `perform_rotation`: a fresh DEK is
 // generated in the agent, the committed history is re-encrypted under it, the new DEK is
 // re-wrapped for every *remaining* member, and everything is applied in one atomic server-side
@@ -1899,10 +1900,10 @@ pub async fn export(
 // committed afterward.
 // =====================================================================================
 
-/// `wonton share <user> [--branch <name>] [--role reader|writer|admin]` (default: current
+/// `wonton grant <user> [--branch <name>] [--role reader|writer|admin]` (default: current
 /// branch, role `reader`) — grant `target_username` access by wrapping a copy of the
 /// currently-cached DEK for their X25519 public key. O(1): no value re-encryption, no rotation.
-pub async fn share(
+pub async fn grant(
     config_path: &Path,
     state_path: &Path,
     socket_path: &Path,
@@ -1954,11 +1955,11 @@ pub async fn share(
         .context("could not upload the wrapped-DEK grant")?;
 
     println!(
-        "Shared {}/{}/{} with '{target_username}' as {} (DEK v{dek_version}).",
+        "Granted '{target_username}' {} on {}/{}/{} (DEK v{dek_version}).",
+        role_label(role),
         ws.org,
         ws.store,
         ws.branch,
-        role_label(role)
     );
     Ok(())
 }

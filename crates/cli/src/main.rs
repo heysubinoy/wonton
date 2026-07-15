@@ -33,8 +33,8 @@ use clap::{Parser, Subcommand};
         wonton commit -m \"seed prod secrets\"\n    \
         wonton push                        # first push provisions it on the server\n    \
         wonton run -- ./start-server       # inject secrets into a subprocess\n    \
-        eval \"$(wonton export --format shell)\"  # load secrets into THIS shell\n    \
-        wonton share bob --role reader     # bob must have logged in once already\n    \
+        eval \"$(wonton expose)\"           # load secrets into THIS shell\n    \
+        wonton grant bob --role reader     # bob must have logged in once already\n    \
         wonton branch -b feature --from main\n\n\
         Run `wonton <command> --help` for full details on any command."
 )]
@@ -93,15 +93,17 @@ enum Command {
     /// Bootstrap a new project in the current directory.
     ///
     /// Fully local — zero network calls, so this always succeeds instantly and never fails due
-    /// to a name collision with anyone else. It writes `wonton.toml` (committed: server + org/
-    /// store) and `.wonton.local` (gitignored: the current branch) and generates a fresh DEK for
-    /// the starting branch inside the local key agent. Server contact — creating the org/store/
-    /// branch for real, and self-granting the DEK — is deferred to your first `wonton push`.
+    /// to a name collision with anyone else. It writes one `wonton.toml` (server + org/store +
+    /// branch — meant to be committed, so a branch switch is something collaborators pick up
+    /// once you push it, not a per-clone pointer) and generates a fresh DEK for the starting
+    /// branch inside the local key agent. Server contact — creating the org/store/branch for
+    /// real, and self-granting the DEK — is deferred to your first `wonton push`.
     ///
     /// Requires being logged in already (`wonton login`), since a DEK has to be generated for
     /// someone's identity.
     Init {
-        /// The org to bind to. Defaults to your own username.
+        /// The org to bind to. If omitted, you're prompted interactively (default: your own
+        /// username — just hit enter to accept it).
         org: Option<String>,
         /// The store (repo) name. Defaults to the current directory's name.
         store: Option<String>,
@@ -115,8 +117,8 @@ enum Command {
     ///
     /// Use this for a directory that isn't a git checkout already carrying a `wonton.toml` — for
     /// example an empty directory someone shared a store with you into. Confirms the org/store/
-    /// branch actually exists first (a hard failure, no markers written, if it doesn't — a typo
-    /// will never start working no matter how long you wait), then writes the same markers
+    /// branch actually exists first (a hard failure, no marker written, if it doesn't — a typo
+    /// will never start working no matter how long you wait), then writes the same `wonton.toml`
     /// `init` would and immediately tries to unwrap the branch's DEK and pull its history, so you
     /// find out right away if you're not shared in *yet* (a soft warning, since that might
     /// resolve itself shortly) rather than on the next unrelated command.
@@ -165,8 +167,8 @@ enum Command {
     },
     /// Show the current workspace, branch, DEK-cache status, ahead/behind, and staged changes.
     ///
-    /// Reads `wonton.toml`/`.wonton.local` fresh, so it always reflects reality even if you
-    /// hand-edited `.wonton.local` or another clone pushed since you last looked.
+    /// Reads `wonton.toml` fresh, so it always reflects reality even if you hand-edited it or
+    /// another clone pushed since you last looked.
     Status,
     /// Stage one or more `KEY=VALUE` secrets on the current branch.
     ///
@@ -283,16 +285,25 @@ enum Command {
         /// for dotenv; stdout, for `eval`/`source`, for shell).
         path: Option<PathBuf>,
     },
+    /// Print the current branch's secrets as `export KEY='VALUE'` statements, for loading into
+    /// THIS shell.
+    ///
+    /// `eval "$(wonton expose)"` is the one way to get secrets into your *current* shell's
+    /// environment — `wonton run` structurally cannot do this (a child process can never mutate
+    /// its parent's environment), and `wonton export` writes to a file instead. Exactly
+    /// `wonton export --format shell` with no path, under a more discoverable name for this
+    /// specific use. Prints an explicit plaintext warning to stderr first, same as `export`.
+    Expose,
     /// Grant a user access to a branch by wrapping a copy of its DEK for them (O(1)).
     ///
-    /// No value re-encryption happens — sharing is instant regardless of history size. Also
+    /// No value re-encryption happens — granting is instant regardless of history size. Also
     /// auto-joins the target to this branch's org server-side, so there's no separate "invite to
-    /// org" step. The target user must have logged in at least once already (sharing looks up
+    /// org" step. The target user must have logged in at least once already (granting looks up
     /// their public key by username), otherwise this fails clearly rather than silently no-op-ing.
-    Share {
-        /// The username to share with.
+    Grant {
+        /// The username to grant access to.
         user: String,
-        /// The branch to share. Defaults to the current directory's branch.
+        /// The branch to grant access to. Defaults to the current directory's branch.
         #[arg(long)]
         branch: Option<String>,
         /// The access level to grant: reader, writer, or admin.
@@ -303,7 +314,7 @@ enum Command {
     ///
     /// Removes them from the branch's membership AND rotates the DEK — their cached copy of the
     /// old key stops decrypting anything committed afterward. This re-encrypts history and
-    /// re-wraps the new DEK for every remaining member, so it's not O(1) like `share`.
+    /// re-wraps the new DEK for every remaining member, so it's not O(1) like `grant`.
     Revoke {
         /// The username to revoke.
         user: String,
@@ -462,6 +473,23 @@ async fn main() -> anyhow::Result<()> {
             let config_path = config::default_config_path()?;
             let socket = agent::client::ensure_running().await?;
             let cwd = current_dir()?;
+
+            // No org given on the command line: ask, rather than silently defaulting to your
+            // username. An empty answer still falls back to your username (shown as the
+            // prompt's default), so hitting enter reproduces the old silent-default behavior.
+            let org = match org {
+                Some(o) => Some(o),
+                None => {
+                    let config = config::Config::load_from(&config_path)?;
+                    let resolved_identity = commands::resolve_identity(&config, identity.as_deref())?;
+                    print!("Org name [{}]: ", resolved_identity.username);
+                    std::io::Write::flush(&mut std::io::stdout())?;
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    let trimmed = line.trim();
+                    Some(if trimmed.is_empty() { resolved_identity.username } else { trimmed.to_string() })
+                }
+            };
             commands::init(&config_path, &socket, &cwd, org, store, branch, identity.as_deref()).await
         }
         Command::Clone { org, store, branch, identity } => {
@@ -615,6 +643,18 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Expose => {
+            let config_path = config::default_config_path()?;
+            let state_path = state::default_state_path()?;
+            let socket = agent::client::ensure_running().await?;
+            let cwd = current_dir()?;
+            if let Some(contents) =
+                commands::export(&config_path, &state_path, &socket, &cwd, commands::ExportFormat::Shell, None).await?
+            {
+                print!("{contents}");
+            }
+            Ok(())
+        }
         Command::Merge { branch, resume, abort } => {
             let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
@@ -638,13 +678,13 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Share { user, branch, role } => {
+        Command::Grant { user, branch, role } => {
             let config_path = config::default_config_path()?;
             let state_path = state::default_state_path()?;
             let socket = agent::client::ensure_running().await?;
             let cwd = current_dir()?;
             let role = parse_role(&role)?;
-            commands::share(&config_path, &state_path, &socket, &cwd, branch.as_deref(), &user, role).await
+            commands::grant(&config_path, &state_path, &socket, &cwd, branch.as_deref(), &user, role).await
         }
         Command::Revoke { user, branch } => {
             let config_path = config::default_config_path()?;
@@ -666,7 +706,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Parse the `--role` flag for `wonton share` into a [`wonton_shared::Role`]. Mirrors the
+/// Parse the `--role` flag for `wonton grant` into a [`wonton_shared::Role`]. Mirrors the
 /// lowercase serde representation the wire type uses.
 fn parse_role(s: &str) -> anyhow::Result<wonton_shared::Role> {
     match s.to_ascii_lowercase().as_str() {

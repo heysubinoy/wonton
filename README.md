@@ -3,12 +3,14 @@
 
   <h1>Wonton</h1>
 
-  <p><strong>A zero-knowledge, GitHub-shaped secrets manager.</strong></p>
+  <p><strong>A zero-knowledge, GitHub-shaped secrets manager built for agentic development.</strong></p>
 
   <p>
     Org → repo → branch, exactly like GitHub — except every branch is its own encryption
     boundary (its own key, its own access list, its own history), and the server that stores and
-    syncs it never holds a key that can read a single value.
+    syncs it never holds a key that can read a single value. Grant an AI agent exactly the branch
+    it needs, hand it secrets without ever putting them in a prompt or a `.env` file, and revoke
+    it the instant the job is done.
   </p>
 
   <p>
@@ -26,7 +28,7 @@ $ wonton init                      # fully local — zero network calls
 $ wonton set DATABASE_URL=postgres://prod-db/acme API_KEY=sk-live-...
 $ wonton commit -m "seed prod secrets"
 $ wonton push                      # first push provisions org/store/branch on the server
-$ wonton share bob --role reader
+$ wonton grant bob --role reader
 $ wonton run -- ./start-server
 ```
 
@@ -53,6 +55,19 @@ service to hold plaintext on their behalf. Wonton is built around a simpler prem
 storing and relaying your secrets' history should be incapable of reading them, even if fully
 compromised.** The server sees ciphertext, content hashes, and metadata (who pushed what, when)
 — never a decrypted value, a data-encryption key, or a private key.
+
+This matters more, not less, once AI coding agents are doing the work. A `.env` file handed to
+an agent sits in its subprocess environment, shell history, and every tool call it makes — with
+no scoping (it's all-or-nothing) and no revocation short of rotating the secret itself
+everywhere it's used. Wonton gives an agent exactly the branch it needs and nothing else
+(`wonton grant coding-agent --role reader --branch ci`), injects secrets straight into its
+subprocess environment and nowhere else (`wonton run -- <agent's command>` — never a prompt,
+never a file on disk), and cuts it off instantly when the task is done (`wonton revoke
+coding-agent`) by rotating the branch's key, not the secret values. Like any authorized reader,
+an agent that has decrypted a value could still misuse it — that's a property of secrets access
+generally, not something any secrets manager can prevent (see [Security model](#security-model))
+— but scoping *what* it can reach and revoking *when* it's done are exactly the two levers this
+model is built around.
 
 ## Features
 
@@ -106,10 +121,11 @@ commit Ed25519-signed by its author. `push`/`pull` move encrypted objects and co
 a branch's ref; every object is content-hash-verified and every commit's signature is verified
 on the client before it's trusted — the server is never in the trust path.
 
-A project directory is bound to a store by a committed `wonton.toml` (`server` + `store =
-"org/store"`, no branch). Which branch you're on lives in an uncommitted sibling
-`.wonton.local` — the actual git-`.git/HEAD` equivalent, read fresh on every command.
-`wonton.toml`'s `server` field is authoritative for identity selection too: if you have several
+A project directory is bound to a store — and a branch within it — by a single `wonton.toml`
+(`server` + `store = "org/store"` + `branch`), read fresh on every command. It's meant to be
+committed, so switching branches (`wonton branch <name>`) is a change collaborators pick up once
+you push it, not a per-clone-only pointer. `wonton.toml`'s `server` field is authoritative for
+identity selection too: if you have several
 identities logged in on one machine (different servers), a directory-bound command narrows to
 the one matching this project's server automatically — `--identity` is only needed to
 disambiguate two identities on the *same* server. The underlying key agent only ever holds one
@@ -137,8 +153,9 @@ Originating a new project — nothing needs to exist on the server beforehand:
 # Unlock your identity into the local key agent (registers on first use).
 $ wonton login alice --server https://wonton.example.com
 
-# Bootstrap a project in the current directory — org defaults to your username, store to the
-# directory name, branch to "main". Zero network calls; writes wonton.toml + .wonton.local.
+# Bootstrap a project in the current directory. Prompts for the org if you don't pass one
+# (defaults to your username — just hit enter); store defaults to the directory name, branch
+# to "main". Zero network calls; writes wonton.toml.
 $ wonton init
 
 # Stage and commit secrets — fully local, no DEK has ever left your machine.
@@ -147,7 +164,7 @@ $ wonton commit -m "seed prod secrets"
 
 # First push provisions org/store/branch on the server and self-grants the DEK.
 $ wonton push
-$ git add wonton.toml && git commit -m "wonton init" && git push   # .wonton.local stays gitignored
+$ git add wonton.toml && git commit -m "wonton init" && git push   # commit it — it's the whole marker now
 
 # Look at what's on the branch right now (nothing touches disk).
 $ wonton view
@@ -156,13 +173,13 @@ $ wonton view
 $ wonton run -- ./start-server
 
 # Load secrets into the CURRENT shell (a subprocess like `run` can never do this for its parent).
-$ eval "$(wonton export --format shell)"
+$ eval "$(wonton expose)"
 
 # Or materialize them explicitly to a file (prints a plaintext warning first; defaults to .env).
 $ wonton export
 
-# Share access (also adds bob to the org, scoped to this branch — bob must have logged in once).
-$ wonton share bob --role reader
+# Grant access (also adds bob to the org, scoped to this branch — bob must have logged in once).
+$ wonton grant bob --role reader
 
 # Branch off with its own key, seeded from the current branch's values, and merge back.
 $ wonton branch -b feature --from main
@@ -215,7 +232,8 @@ marker directly.
 | `run -- <cmd>` | Run a command with secrets injected as env vars — never written to disk |
 | `view [--keys-only]` | Print the current branch's decrypted secrets to stdout — nothing touches disk |
 | `export --format dotenv <path>` | Export secrets to a file (plaintext — prints a warning) |
-| `share <user> [--branch <name>]` | Grant a user access to a branch (wraps the DEK; O(1)); auto-joins them to the org |
+| `expose` | Print `export KEY='VALUE'` statements for `eval "$(wonton expose)"` — loads secrets into the CURRENT shell |
+| `grant <user> [--branch <name>]` | Grant a user access to a branch (wraps the DEK; O(1)); auto-joins them to the org |
 | `revoke <user> [--branch <name>]` | Revoke a user's access (removes them and rotates the DEK) |
 | `key rotate [--branch <name>]` | Rotate a branch's DEK, re-encrypting history and re-wrapping it |
 
@@ -225,7 +243,7 @@ Run `wonton --help` or `wonton <command> --help` for full details.
 
 A read-only web viewer lives in [`dashboard/`](dashboard/): browse orgs/stores/branches you have
 access to, see verified commit history, and view decrypted current values, all in the browser.
-No `set`/`commit`/`push`/`share` from there yet (v1 is deliberately view-only).
+No `set`/`commit`/`push`/`grant` from there yet (v1 is deliberately view-only).
 
 Two things that differ from the CLI, both by design:
 - **OAuth (Google, currently) gates *registration*, not login.** It proves you control a real
@@ -288,10 +306,10 @@ unlocked key, or a legitimately authorized user exfiltrating values they can alr
 
 Core functionality is complete and tested: crypto primitives, local commit/log/diff, the
 org/store/branch server + sync layer, the full CLI command surface (`init`/`clone`/`branch`
-included), sharing/revocation/key rotation (with automatic org membership on share), three-way
+included), granting/revocation/key rotation (with automatic org membership on grant), three-way
 client-side merge across two independently-keyed branches with conflict resolution, an OAuth
 registration gate, and a read-only web dashboard. Recovery (a lost-passphrase story), deeper
-machine-identity hardening, and a writable dashboard (`set`/`commit`/`push`/`share` from the
+machine-identity hardening, and a writable dashboard (`set`/`commit`/`push`/`grant` from the
 browser) remain intentionally deferred.
 
 ## Testing

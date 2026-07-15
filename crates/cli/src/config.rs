@@ -1,5 +1,5 @@
 //! Local CLI state: known identities (`~/.config/wonton/config.toml`) plus project discovery
-//! via `wonton.toml` / `.wonton.local`.
+//! via `wonton.toml`.
 //!
 //! ## Config file (`~/.config/wonton/config.toml`)
 //! A single TOML file holding the user's known [`Identity`]s. It caches the *ciphertext* wrapped
@@ -7,26 +7,24 @@
 //! file) and a short-lived session bearer token, so most commands avoid a network round-trip. It
 //! never stores the passphrase or any plaintext secret.
 //!
-//! ## `wonton.toml` — committed, minimal, the single source of truth for *where*
-//! A project directory is bound to a store by a `wonton.toml` file at its root, meant to be
-//! checked into git alongside the project:
+//! ## `wonton.toml` — the single source of truth for *where*, including the branch
+//! A project directory is bound to a store (and a branch within it) by one `wonton.toml` file at
+//! its root, meant to be checked into git alongside the project:
 //! ```toml
 //! server = "https://wonton.example.com"
 //! store = "acme/backend"     # "org/store"
+//! branch = "main"
 //! ```
-//! It intentionally does **not** name a branch — see `.wonton.local` below. Discovered by
-//! walking upward from the cwd, exactly like git finds `.git`. Read fresh on every invocation:
-//! there is **no shell-hook `cd` integration** (explicitly out of scope for v1) — the pragmatic
-//! v1 behavior, matching how tools like `.nvmrc` are re-read per invocation rather than via a
-//! resident shell hook.
+//! `wonton branch <name>` rewrites the `branch` field in place; `wonton pull`/`push`/etc. read it
+//! fresh every time, so hand-editing it and running `wonton pull` pulls whatever branch is now
+//! named there. Discovered by walking upward from the cwd, exactly like git finds `.git`. Read
+//! fresh on every invocation: there is **no shell-hook `cd` integration** (explicitly out of
+//! scope for v1) — the pragmatic v1 behavior, matching how tools like `.nvmrc` are re-read per
+//! invocation rather than via a resident shell hook.
 //!
-//! ## `.wonton.local` — uncommitted, per-directory, the current branch (git's `HEAD`)
-//! A sibling file, next to `wonton.toml`, holding just `branch = "<name>"`. This is *not*
-//! committed (should be gitignored) — it's the actual `.git/HEAD` equivalent: which branch
-//! *this particular clone* is looking at. Two clones of the same `org/store` on one machine can
-//! be on different branches simultaneously, exactly like two independent git clones. `wonton
-//! branch <name>` rewrites it; `wonton pull`/`push`/etc. read it fresh every time, so hand-editing
-//! it and running `wonton pull` pulls whatever branch is now named there.
+//! Note this makes `branch` part of the same file as `server`/`store`, tracked by git like
+//! everything else in the project — unlike a `.git/HEAD`-style per-clone pointer, switching
+//! branches here is a change other clones/collaborators will see once committed and pushed.
 
 use std::path::{Path, PathBuf};
 
@@ -201,6 +199,7 @@ pub struct WontonToml {
     pub server: String,
     /// `"org/store"`.
     pub store: String,
+    pub branch: String,
 }
 
 /// A resolved project: the directory `wonton.toml` was found in, plus its parsed fields split
@@ -211,6 +210,7 @@ pub struct Project {
     pub server: String,
     pub org: String,
     pub store: String,
+    pub branch: String,
 }
 
 fn parse_wonton_toml(contents: &str) -> Option<WontonToml> {
@@ -219,8 +219,8 @@ fn parse_wonton_toml(contents: &str) -> Option<WontonToml> {
 
 /// Walk upward from `start` (like git finding `.git`) looking for a `wonton.toml` file. A
 /// `store` field not of the form `"org/store"` (exactly one `/`), or a file that's unreadable /
-/// malformed TOML, is skipped (treated as absent) rather than erroring — same policy as `.git`
-/// discovery ignoring things that aren't really a `.git` dir.
+/// malformed TOML (including one missing `branch`), is skipped (treated as absent) rather than
+/// erroring — same policy as `.git` discovery ignoring things that aren't really a `.git` dir.
 pub fn find_project(start: &Path) -> Option<Project> {
     let mut dir = Some(start);
     while let Some(d) = dir {
@@ -235,6 +235,7 @@ pub fn find_project(start: &Path) -> Option<Project> {
                                 server: w.server,
                                 org: org.to_string(),
                                 store: store.to_string(),
+                                branch: w.branch,
                             });
                         }
                     }
@@ -252,29 +253,12 @@ pub fn read_wonton_toml(path: &Path) -> Option<WontonToml> {
     std::fs::read_to_string(path).ok().and_then(|c| parse_wonton_toml(&c))
 }
 
-/// Write `wonton.toml` at `path` (`server` + `store = "org/store"`).
-pub fn write_wonton_toml(path: &Path, server: &str, org: &str, store: &str) -> std::io::Result<()> {
-    std::fs::write(path, format!("server = \"{server}\"\nstore = \"{org}/{store}\"\n"))
-}
-
-// ---- `.wonton.local` per-directory branch pointer --------------------------------------
-
-#[derive(Deserialize, Serialize)]
-struct LocalMarker {
-    branch: String,
-}
-
-/// Read the current branch from `.wonton.local` next to `wonton.toml` in `project_dir`. `None`
-/// if absent, unreadable, or malformed.
-pub fn read_local_branch(project_dir: &Path) -> Option<String> {
-    let contents = std::fs::read_to_string(project_dir.join(".wonton.local")).ok()?;
-    toml::from_str::<LocalMarker>(&contents).ok().map(|m| m.branch)
-}
-
-/// Write `.wonton.local`'s `branch` field in `project_dir`. Not gitignore-aware itself — callers
-/// (`init`/`branch -b`) print a reminder to gitignore it.
-pub fn write_local_branch(project_dir: &Path, branch: &str) -> std::io::Result<()> {
-    std::fs::write(project_dir.join(".wonton.local"), format!("branch = \"{branch}\"\n"))
+/// Write `wonton.toml` at `path` (`server` + `store = "org/store"` + `branch`). Used both to
+/// create the file (`init`/`clone`) and to rewrite it in place when the branch changes (`wonton
+/// branch <name>`, `branch -b`) — always the full file, since it's the only place any of this
+/// state lives now.
+pub fn write_wonton_toml(path: &Path, server: &str, org: &str, store: &str, branch: &str) -> std::io::Result<()> {
+    std::fs::write(path, format!("server = \"{server}\"\nstore = \"{org}/{store}\"\nbranch = \"{branch}\"\n"))
 }
 
 #[cfg(test)]
@@ -374,13 +358,14 @@ mod tests {
         let root = std::env::temp_dir().join(format!("wonton-project-test-{}", std::process::id()));
         let deep = root.join("a").join("b").join("c");
         std::fs::create_dir_all(&deep).unwrap();
-        write_wonton_toml(&root.join("wonton.toml"), "https://wonton.example.com", "acme", "backend").unwrap();
+        write_wonton_toml(&root.join("wonton.toml"), "https://wonton.example.com", "acme", "backend", "main").unwrap();
 
         let found = find_project(&deep).unwrap();
         assert_eq!(found.dir, root);
         assert_eq!(found.org, "acme");
         assert_eq!(found.store, "backend");
         assert_eq!(found.server, "https://wonton.example.com");
+        assert_eq!(found.branch, "main");
 
         let found_at_root = find_project(&root).unwrap();
         assert_eq!(found_at_root.dir, root);
@@ -397,18 +382,18 @@ mod tests {
     }
 
     #[test]
-    fn local_branch_round_trips_and_defaults_to_absent() {
-        let root = std::env::temp_dir().join(format!("wonton-local-branch-test-{}", std::process::id()));
+    fn branch_field_round_trips_through_a_rewrite() {
+        let root = std::env::temp_dir().join(format!("wonton-branch-field-test-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("wonton.toml");
 
-        assert_eq!(read_local_branch(&root), None);
-        write_local_branch(&root, "feature-x").unwrap();
-        assert_eq!(read_local_branch(&root), Some("feature-x".to_string()));
+        write_wonton_toml(&marker, "https://wonton.example.com", "acme", "backend", "feature-x").unwrap();
+        assert_eq!(find_project(&root).unwrap().branch, "feature-x");
 
         // Hand-editing it (simulating a user directly editing the file) takes effect immediately
-        // — read_local_branch always reads fresh, no caching.
-        write_local_branch(&root, "main").unwrap();
-        assert_eq!(read_local_branch(&root), Some("main".to_string()));
+        // — find_project always reads fresh, no caching.
+        write_wonton_toml(&marker, "https://wonton.example.com", "acme", "backend", "main").unwrap();
+        assert_eq!(find_project(&root).unwrap().branch, "main");
 
         let _ = std::fs::remove_dir_all(&root);
     }

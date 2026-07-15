@@ -5,8 +5,8 @@
 //! `crate::agent::tests`), using a temp config path so nothing touches the real
 //! `~/.config/wonton`.
 //!
-//! `wonton.toml`/`.wonton.local` discovery and config save/load round-trips are covered by unit
-//! tests in `crate::config`; these tests focus on the networked/agent-backed flows.
+//! `wonton.toml` discovery and config save/load round-trips are covered by unit tests in
+//! `crate::config`; these tests focus on the networked/agent-backed flows.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -173,8 +173,8 @@ async fn ready_fixture(user: &str, base: Option<String>) -> Fixture {
 }
 
 /// A logged-in-but-otherwise-fresh "machine": its own agent/config/state, the user registered
-/// but no project directory bound yet. Used for a share/clone *target* who has no DEK until
-/// shared or cloned.
+/// but no project directory bound yet. Used for a grant/clone *target* who has no DEK until
+/// granted or cloned.
 struct Machine {
     config_path: PathBuf,
     state_path: PathBuf,
@@ -441,12 +441,13 @@ async fn branch_create_and_switch_are_local_and_update_the_marker() {
     let base = start_server().await;
     let fx = ready_fixture("brancher", Some(base)).await;
 
-    assert_eq!(crate::config::read_local_branch(&fx.dir), Some("main".to_string()));
+    let branch_of = |dir: &std::path::Path| crate::config::find_project(dir).map(|p| p.branch);
+    assert_eq!(branch_of(&fx.dir), Some("main".to_string()));
 
     commands::branch_create(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "feature", None, None)
         .await
         .expect("creating a branch with no --from is fully local");
-    assert_eq!(crate::config::read_local_branch(&fx.dir), Some("feature".to_string()));
+    assert_eq!(branch_of(&fx.dir), Some("feature".to_string()));
 
     // Creating the same name again must be rejected, not silently overwritten.
     let err = commands::branch_create(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "feature", None, None)
@@ -457,7 +458,7 @@ async fn branch_create_and_switch_are_local_and_update_the_marker() {
     commands::branch_switch(&fx.config_path, &fx.state_path, &fx.socket, &fx.dir, "main")
         .await
         .expect("switching back to main");
-    assert_eq!(crate::config::read_local_branch(&fx.dir), Some("main".to_string()));
+    assert_eq!(branch_of(&fx.dir), Some("main".to_string()));
 }
 
 /// `branch -b <name> --from <source>` seeds the new branch's first commit from the source
@@ -509,7 +510,7 @@ async fn branch_list_succeeds_and_syncs_with_remote() {
     commands::push(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir).await.unwrap();
 
     let bob = login_only("blistbob", &owner.base).await;
-    commands::share(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, None, "blistbob", Role::Reader)
+    commands::grant(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, None, "blistbob", Role::Reader)
         .await
         .unwrap();
     let bob_dir = temp_dir();
@@ -692,7 +693,7 @@ async fn log_shows_each_authors_own_username_across_a_shared_history() {
     commands::push(&alice.config_path, &alice.state_path, &alice.socket, &alice.dir).await.unwrap();
 
     let bob = login_only("p6bob", &alice.base).await;
-    commands::share(&alice.config_path, &alice.state_path, &alice.socket, &alice.dir, None, "p6bob", Role::Writer)
+    commands::grant(&alice.config_path, &alice.state_path, &alice.socket, &alice.dir, None, "p6bob", Role::Writer)
         .await
         .unwrap();
     let bob_dir = temp_dir();
@@ -990,11 +991,11 @@ async fn push_then_fresh_clone_sees_the_same_secrets() {
     let _ = std::fs::remove_file(&out);
 }
 
-/// The join flow: before being `share`d, the target's first command clearly reports "no
-/// access"; after `share`, the very next command (no separate `use`/`pull`) just works —
+/// The join flow: before being `grant`ed, the target's first command clearly reports "no
+/// access"; after `grant`, the very next command (no separate `use`/`pull`) just works —
 /// auto-unwrapping the DEK and auto-pulling the history.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn clone_reports_no_access_then_works_after_share() {
+async fn clone_reports_no_access_then_works_after_grant() {
     let owner = ready_fixture("cloneowner", None).await;
     commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("SHARED".into(), "top-secret".into())])
         .await
@@ -1015,7 +1016,7 @@ async fn clone_reports_no_access_then_works_after_share() {
         .unwrap_err();
     assert!(err.to_string().contains("don't have access"), "got: {err}");
 
-    commands::share(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, None, "cloneBob", Role::Reader)
+    commands::grant(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, None, "cloneBob", Role::Reader)
         .await
         .unwrap();
 
@@ -1029,18 +1030,18 @@ async fn clone_reports_no_access_then_works_after_share() {
         vec!["sh".into(), "-c".into(), format!("printf '%s' \"$SHARED\" > {out_str}")],
     )
     .await
-    .expect("the next command after being shared must just work: auto-unwrap + auto-pull");
+    .expect("the next command after being granted access must just work: auto-unwrap + auto-pull");
     assert_eq!(code, 0);
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "top-secret");
     let _ = std::fs::remove_file(&out);
 }
 
 /// Cloning an org/store/branch that doesn't exist at all must fail immediately and clearly,
-/// without writing `wonton.toml`/`.wonton.local` — a typo will never start working no matter how
-/// long you wait, unlike "shared but access hasn't landed yet" (see
-/// `clone_reports_no_access_then_works_after_share`, which is a soft warning, not a hard error).
+/// without writing `wonton.toml` — a typo will never start working no matter how long you wait,
+/// unlike "granted but access hasn't landed yet" (see
+/// `clone_reports_no_access_then_works_after_grant`, which is a soft warning, not a hard error).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn clone_of_a_nonexistent_store_fails_immediately_and_writes_no_markers() {
+async fn clone_of_a_nonexistent_store_fails_immediately_and_writes_no_marker() {
     let base = start_server().await;
     let machine = login_only("henrietta", &base).await;
     let dir = temp_dir();
@@ -1050,7 +1051,6 @@ async fn clone_of_a_nonexistent_store_fails_immediately_and_writes_no_markers() 
         .unwrap_err();
     assert!(err.to_string().contains("does not exist"), "got: {err}");
     assert!(!dir.join("wonton.toml").exists(), "no marker should be written on a hard failure");
-    assert!(!dir.join(".wonton.local").exists());
 }
 
 /// `parse_clone_target` reinterprets `wonton clone`'s positional args for both the classic
@@ -1361,12 +1361,12 @@ async fn commands_without_a_wonton_toml_error_clearly() {
     assert!(err.to_string().contains("wonton init"), "got: {err}");
 }
 
-// ---- sharing, revocation, key rotation --------------------------------------------------------
+// ---- granting, revocation, key rotation --------------------------------------------------------
 
-/// `share` grants a second user access with NO re-encryption (O(1)): the object count is
-/// unchanged, and the target can then `clone` + read the same secret the sharer committed.
+/// `grant` gives a second user access with NO re-encryption (O(1)): the object count is
+/// unchanged, and the target can then `clone` + read the same secret the granter committed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn share_grants_access_without_re_encryption() {
+async fn grant_gives_access_without_re_encryption() {
     let owner = ready_fixture("p5owner", None).await;
     commands::set(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, vec![("SECRET".into(), "sk-shared".into())])
         .await
@@ -1380,11 +1380,11 @@ async fn share_grants_access_without_re_encryption() {
     let bob_dir = temp_dir();
 
     let before = count_objects(&owner.state_path);
-    commands::share(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, None, "p5bob", Role::Reader)
+    commands::grant(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, None, "p5bob", Role::Reader)
         .await
-        .expect("share should grant access");
+        .expect("grant should give access");
     let after = count_objects(&owner.state_path);
-    assert_eq!(before, after, "share must not re-encrypt / create objects");
+    assert_eq!(before, after, "grant must not re-encrypt / create objects");
 
     commands::clone(&bob.config_path, &bob.state_path, &bob.socket, &bob_dir, "acme", "backend", Some("main"), None)
         .await
@@ -1421,7 +1421,7 @@ async fn log_verifies_a_history_with_more_than_one_real_author() {
     commands::push(&alice.config_path, &alice.state_path, &alice.socket, &alice.dir).await.unwrap();
 
     let bob = login_only("p5xbob", &alice.base).await;
-    commands::share(&alice.config_path, &alice.state_path, &alice.socket, &alice.dir, None, "p5xbob", Role::Writer)
+    commands::grant(&alice.config_path, &alice.state_path, &alice.socket, &alice.dir, None, "p5xbob", Role::Writer)
         .await
         .unwrap();
     let bob_dir = temp_dir();
@@ -1457,7 +1457,7 @@ async fn revoke_denies_the_revoked_users_stale_dek() {
     commands::push(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir).await.unwrap();
 
     let mallory = login_only("p5mallory", &owner.base).await;
-    commands::share(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, None, "p5mallory", Role::Reader)
+    commands::grant(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, None, "p5mallory", Role::Reader)
         .await
         .unwrap();
     let mallory_dir = temp_dir();
@@ -1788,7 +1788,7 @@ fn all_files(root: &std::path::Path) -> Vec<PathBuf> {
 /// named exits (`wonton run`'s child-process environment and `wonton export`'s named file). This
 /// drives a full `set` -> `commit` -> `run` cycle and then scans every file under the state
 /// directory (object store + `state.toml`), the config directory (`config.toml`, cached wrapped
-/// keys), and the project directory (`wonton.toml` + `.wonton.local`) for the literal plaintext
+/// keys), and the project directory (`wonton.toml`) for the literal plaintext
 /// bytes, asserting they never appear — only ciphertext/hashes/non-secret metadata may.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_plaintext_secret_touches_disk_outside_the_named_export_exit() {
