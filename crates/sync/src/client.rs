@@ -13,9 +13,9 @@ use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use wonton_objects::Hash;
 use wonton_shared::{
-    BranchDetails, BranchSummary, CreateBranchRequest, CreateBranchResponse, CreateOrgRequest,
-    CreateOrgResponse, CreateStoreRequest, CreateStoreResponse, GrantKeyRequest, KeysMap,
-    LoginCompleteRequest, LoginCompleteResponse, LoginStartRequest, LoginStartResponse,
+    AuthConfigResponse, BranchDetails, BranchSummary, CreateBranchRequest, CreateBranchResponse,
+    CreateOrgRequest, CreateOrgResponse, CreateStoreRequest, CreateStoreResponse, GrantKeyRequest,
+    KeysMap, LoginCompleteRequest, LoginCompleteResponse, LoginStartRequest, LoginStartResponse,
     MachineTokenRequest, MachineTokenResponse, MemberInfo, MemberRequest, ObjectUploadRequest,
     RefConflict, RefMoveRequest, RefResponse, RegisterRequest, RegisterResponse, RotateRequest,
     UserPublicInfo,
@@ -83,6 +83,14 @@ impl SyncClient {
     }
 
     // ---- Auth (no token required) -----------------------------------------------------
+
+    /// `GET /auth/config`. No authentication. Tells the caller whether this server requires a
+    /// web-verification ticket for new-account registration (hosted mode) and, if so, the
+    /// server-relative path to send a browser to in order to obtain one.
+    pub async fn auth_config(&self) -> Result<AuthConfigResponse, SyncError> {
+        let resp = self.http.get(self.url("/auth/config")).send().await?;
+        json_response(resp).await
+    }
 
     /// `POST /auth/register`. No authentication — this *is* the auth bootstrap (like any signup
     /// endpoint). The caller must have already run `wonton_crypto::generate_identity` locally and

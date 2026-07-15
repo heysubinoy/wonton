@@ -60,6 +60,20 @@ impl OAuthProviders {
     pub fn get(&self, name: &str) -> Option<Arc<dyn OAuthProvider>> {
         self.0.get(name).cloned()
     }
+
+    /// Whether any provider is configured — the signal `handlers::register`/`auth_config` use
+    /// to decide whether this server is in "hosted mode" (web verification required for new
+    /// accounts) or "local mode" (open registration, exactly as before OAuth existed).
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Any one configured provider's name, for building `AuthConfigResponse::verification_uri`.
+    /// Only Google exists today, so "any one" is unambiguous; a second provider would need the
+    /// dashboard to offer a picker rather than this picking arbitrarily — out of scope here.
+    pub fn first_name(&self) -> Option<&'static str> {
+        self.0.keys().next().copied()
+    }
 }
 
 /// Google's OAuth 2.0 / OpenID Connect implementation. Configured from
@@ -191,7 +205,7 @@ async fn verify_google_id_token(http: &reqwest::Client, id_token: &str, audience
     Ok(data.claims)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     //! A provider that always succeeds (or always fails, if constructed with `failing`) without
     //! any network call — what `crate::tests` registers instead of a real `GoogleProvider`, so

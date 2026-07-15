@@ -30,8 +30,8 @@ use crate::auth::{hash_token, mint_nonce, mint_token};
 use crate::error::ApiError;
 use crate::{authorize_branch, authorize_org_member, now_unix, parse_role, resolve_store, role_str, Actor, ActorKind, AppState};
 use wonton_shared::{
-    CreateBranchRequest, CreateBranchResponse, CreateOrgRequest, CreateOrgResponse,
-    CreateStoreRequest, CreateStoreResponse, RegisterRequest, RegisterResponse,
+    AuthConfigResponse, CreateBranchRequest, CreateBranchResponse, CreateOrgRequest,
+    CreateOrgResponse, CreateStoreRequest, CreateStoreResponse, RegisterRequest, RegisterResponse,
 };
 
 /// Login challenges expire quickly — they only need to survive one client sign-and-return.
@@ -196,6 +196,18 @@ pub async fn machine_token(
     }))
 }
 
+/// `GET /auth/config` — no auth. Lets a client (the CLI, in particular) discover *before*
+/// attempting registration whether this server is in "hosted mode" (an OAuth provider is
+/// configured, so `register` requires a web-verification ticket for new accounts) or "local
+/// mode" (no provider configured, registration stays open exactly as it always has).
+pub async fn auth_config(State(st): State<AppState>) -> Json<AuthConfigResponse> {
+    let provider = st.oauth.first_name();
+    Json(AuthConfigResponse {
+        web_verification_required: provider.is_some(),
+        verification_uri: provider.map(|name| format!("/auth/oauth/{name}/authorize")),
+    })
+}
+
 /// `POST /auth/register` — no auth. This *is* the auth bootstrap (like any signup endpoint):
 /// it persists a new user's public identity + opaque wrapped private key. The client must have
 /// already run `wonton_crypto::generate_identity` locally; the server only stores the results.
@@ -216,10 +228,17 @@ pub async fn register(
         .decode(&req.argon2_params.salt)
         .map_err(|_| ApiError::BadRequest("argon2 salt not base64".into()))?;
 
-    // Optional OAuth gate: if a ticket was supplied, it must be a real, unexpired, unused
-    // ticket minted by a completed `/auth/oauth/{provider}/callback` exchange. Consuming it here
-    // (single-use) proves this registration is by someone who verified a real email — but
-    // registration itself stays open when no ticket is given, exactly as before.
+    // OAuth gate: when this server has a provider configured (hosted mode), a valid ticket is
+    // required, not merely accepted — otherwise the gate is decorative (anyone could call this
+    // route directly and skip verification). In local mode (no provider configured), the ticket
+    // stays fully optional, exactly as before hosted mode existed.
+    if !st.oauth.is_empty() && req.oauth_ticket.is_none() {
+        return Err(ApiError::BadRequest(
+            "this server requires a web verification code for new accounts — open the link \
+             `wonton login` printed, sign in, and paste the code it shows you"
+                .into(),
+        ));
+    }
     let verified = match &req.oauth_ticket {
         Some(ticket) => Some(consume_oauth_ticket(&st, ticket).await?),
         None => None,

@@ -3231,6 +3231,7 @@ dependencies = [
  "base64",
  "clap",
  "directories",
+ "reqwest",
  "rpassword",
  "serde",
  "serde_json",

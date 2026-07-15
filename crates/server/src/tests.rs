@@ -1395,3 +1395,61 @@ async fn oauth_callback_with_a_failing_provider_mints_no_ticket() {
         .get("n");
     assert_eq!(row_count, 0, "no ticket may be minted when the provider exchange fails");
 }
+
+// ---- Hosted mode: register() enforces the ticket, /auth/config reports the toggle ---------
+
+/// `GET /auth/config` on a plain server (no OAuth provider registered) must report local mode:
+/// no web verification required, and nothing to point a browser at.
+#[tokio::test]
+async fn auth_config_reports_hosted_mode_off_with_no_providers() {
+    let pool = test_pool().await;
+    let router = build_router(pool);
+    let (status, body) = send_json(&router, "GET", "/auth/config", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["web_verification_required"], json!(false));
+    assert_eq!(body["verification_uri"], Value::Null);
+}
+
+/// `GET /auth/config` with an OAuth provider registered must report hosted mode: web
+/// verification required, with a `verification_uri` a client can join onto its own base URL.
+#[tokio::test]
+async fn auth_config_reports_hosted_mode_on_with_a_provider_registered() {
+    let pool = test_pool().await;
+    let router = router_with_mock_oauth(pool, crate::oauth::test_support::MockProvider::always_succeeds("mock", "subj", "x@example.com"));
+    let (status, body) = send_json(&router, "GET", "/auth/config", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["web_verification_required"], json!(true));
+    assert_eq!(body["verification_uri"], json!("/auth/oauth/mock/authorize"));
+}
+
+/// In hosted mode, `register` without an `oauth_ticket` must be rejected (400) — the whole
+/// point of the gate is that it can't be skipped by calling the route directly.
+#[tokio::test]
+async fn register_without_a_ticket_is_rejected_when_oauth_is_configured() {
+    let pool = test_pool().await;
+    let router = router_with_mock_oauth(pool, crate::oauth::test_support::MockProvider::always_succeeds("mock", "subj", "x@example.com"));
+    let (status, _) = send_json(&router, "POST", "/auth/register", None, Some(register_body("nobody"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// In hosted mode, `register` with a valid ticket still succeeds — the gate blocks unverified
+/// registration, not registration itself.
+#[tokio::test]
+async fn register_with_a_valid_ticket_still_succeeds_when_oauth_is_configured() {
+    let pool = test_pool().await;
+    let router = router_with_mock_oauth(
+        pool.clone(),
+        crate::oauth::test_support::MockProvider::always_succeeds("mock", "subj-verified", "verified@example.com"),
+    );
+
+    let req = Request::builder().method("GET").uri("/auth/oauth/mock/callback?code=whatever").body(Body::empty()).unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    let location = res.headers().get("location").unwrap().to_str().unwrap().to_string();
+    let ticket = location.split("oauth_ticket=").nth(1).unwrap().split('&').next().unwrap().to_string();
+
+    let mut body = register_body("verified-user");
+    body["oauth_ticket"] = json!(ticket);
+    let (status, resp) = send_json(&router, "POST", "/auth/register", None, Some(body)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!resp["user_id"].as_str().unwrap().is_empty());
+}

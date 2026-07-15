@@ -41,6 +41,11 @@ use wonton_shared::Role;
 pub use auth::{Actor, ActorKind};
 pub use error::ApiError;
 pub use oauth::{GoogleProvider, OAuthProvider, OAuthProviders, VerifiedIdentity};
+/// A mock [`OAuthProvider`] for driving the OAuth-gated registration flow from another crate's
+/// tests without real credentials or a network call. Only compiled in when this crate is under
+/// test or a dependent opts in via the `test-support` Cargo feature.
+#[cfg(feature = "test-support")]
+pub use oauth::test_support;
 
 /// Shared application state handed to every handler.
 #[derive(Clone)]
@@ -97,6 +102,7 @@ pub fn build_router_with_oauth(pool: SqlitePool, oauth: OAuthProviders) -> Route
         // machine-token issuance). Machine-token issuance is
         // intentionally unauthenticated for this phase (a known hardening gap: real
         // deployments would gate it behind an authenticated admin).
+        .route("/auth/config", get(handlers::auth_config))
         .route("/auth/register", post(handlers::register))
         .route("/auth/login/start", post(handlers::login_start))
         .route("/auth/login/complete", post(handlers::login_complete))

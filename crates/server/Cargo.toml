@@ -36,6 +36,12 @@ tower-http = { version = "0.6", features = ["fs"] }
 wonton-objects = { version = "0.1.0", path = "../objects" }
 wonton-shared = { version = "0.1.0", path = "../shared" }
 
+[features]
+# Exposes `oauth::test_support::MockProvider` outside this crate (normally `#[cfg(test)]`-only)
+# so a dependent crate's own integration tests (e.g. `wonton-cli`'s) can drive the OAuth-gated
+# registration flow without real credentials. Never enabled in a non-dev build.
+test-support = []
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }  # ServiceExt::oneshot for route-level tests
 toml = "0.8"  # parses Cargo.toml files for the server-blindness dependency-direction test

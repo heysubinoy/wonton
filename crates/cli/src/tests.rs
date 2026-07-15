@@ -52,6 +52,46 @@ async fn start_server() -> String {
     format!("http://{addr}")
 }
 
+/// Start a real `wonton-server` in "hosted mode" — one OAuth provider (`"google"`, so
+/// `auth_config`'s `verification_uri` lines up with what a real deployment would report)
+/// registered via the mock provider, never touching a network. Returns its base URL.
+async fn start_server_with_oauth() -> String {
+    let db = unique("db-oauth");
+    let url = format!("sqlite://{}", db.display());
+    let pool = wonton_server::connect(&url).await.expect("connect + migrate");
+    let providers = wonton_server::OAuthProviders::none()
+        .register(wonton_server::test_support::MockProvider::always_succeeds("google", "subj-123", "verified@example.com"));
+    let router = wonton_server::build_router_with_oauth(pool, providers);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// Drive the mock `google` provider's OAuth callback route to mint a real, valid, single-use
+/// web-verification ticket — the same one a browser would receive after signing in, just
+/// obtained directly over HTTP instead of through a real consent screen.
+async fn mint_web_ticket(base: &str) -> String {
+    let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let res = http
+        .get(format!("{base}/auth/oauth/google/callback?code=whatever"))
+        .send()
+        .await
+        .expect("oauth callback request");
+    let location = res
+        .headers()
+        .get("location")
+        .expect("callback should redirect with a ticket")
+        .to_str()
+        .unwrap()
+        .to_string();
+    location.split("oauth_ticket=").nth(1).unwrap().split('&').next().unwrap().to_string()
+}
+
 /// Bind + spawn an in-process agent daemon; return its socket path.
 async fn spawn_agent() -> PathBuf {
     let path = unique("agent").with_extension("sock");
@@ -105,7 +145,7 @@ async fn ready_fixture(user: &str, base: Option<String>) -> Fixture {
     let state_path = temp_state_path();
     let dir = temp_dir();
 
-    commands::login(&config_path, &socket, Some(base.clone()), user, format!("pw-{user}"))
+    commands::login(&config_path, &socket, Some(base.clone()), user, None, format!("pw-{user}"))
         .await
         .unwrap();
     let id = Config::load_from(&config_path).unwrap().find_identity(user).unwrap().clone();
@@ -145,7 +185,7 @@ async fn login_only(user: &str, base: &str) -> Machine {
     let socket = spawn_agent().await;
     let config_path = temp_config_path();
     let state_path = temp_state_path();
-    commands::login(&config_path, &socket, Some(base.to_string()), user, format!("pw-{user}"))
+    commands::login(&config_path, &socket, Some(base.to_string()), user, None, format!("pw-{user}"))
         .await
         .unwrap();
     Machine {
@@ -353,10 +393,10 @@ async fn store_create_without_identity_defaults_to_the_current_identity() {
     let base = start_server().await;
     let socket = spawn_agent().await;
     let config_path = temp_config_path();
-    commands::login(&config_path, &socket, Some(base.clone()), "multi-a", "pw-a".into())
+    commands::login(&config_path, &socket, Some(base.clone()), "multi-a", None, "pw-a".into())
         .await
         .unwrap();
-    commands::login(&config_path, &socket, Some(base), "multi-b", "pw-b".into())
+    commands::login(&config_path, &socket, Some(base), "multi-b", None, "pw-b".into())
         .await
         .unwrap();
 
@@ -376,10 +416,10 @@ async fn store_create_without_identity_errors_clearly_when_truly_ambiguous() {
     let base = start_server().await;
     let socket = spawn_agent().await;
     let config_path = temp_config_path();
-    commands::login(&config_path, &socket, Some(base.clone()), "multi-a", "pw-a".into())
+    commands::login(&config_path, &socket, Some(base.clone()), "multi-a", None, "pw-a".into())
         .await
         .unwrap();
-    commands::login(&config_path, &socket, Some(base), "multi-b", "pw-b".into())
+    commands::login(&config_path, &socket, Some(base), "multi-b", None, "pw-b".into())
         .await
         .unwrap();
 
@@ -526,10 +566,10 @@ async fn identity_resolution_is_scoped_by_the_projects_server() {
     let state_path = temp_state_path();
 
     // Two identities, same local config, but logged into two DIFFERENT servers.
-    commands::login(&config_path, &socket, Some(base_a.clone()), "alice-a", "pw-a".into())
+    commands::login(&config_path, &socket, Some(base_a.clone()), "alice-a", None, "pw-a".into())
         .await
         .unwrap();
-    commands::login(&config_path, &socket, Some(base_b.clone()), "alice-b", "pw-b".into())
+    commands::login(&config_path, &socket, Some(base_b.clone()), "alice-b", None, "pw-b".into())
         .await
         .unwrap();
 
@@ -923,7 +963,7 @@ async fn push_then_fresh_clone_sees_the_same_secrets() {
     let config_path = temp_config_path();
     let state_path = temp_state_path();
     let dir = temp_dir();
-    commands::login(&config_path, &socket, Some(a.base.clone()), "judy", "pw-judy".into())
+    commands::login(&config_path, &socket, Some(a.base.clone()), "judy", None, "pw-judy".into())
         .await
         .unwrap();
     commands::clone(&config_path, &state_path, &socket, &dir, "acme", "backend", Some("main"), None)
@@ -1055,7 +1095,7 @@ async fn login_registers_new_user_and_caches_session() {
     let socket = spawn_agent().await;
     let config_path = temp_config_path();
 
-    commands::login(&config_path, &socket, Some(base.clone()), "alice", "pw-alice".into())
+    commands::login(&config_path, &socket, Some(base.clone()), "alice", None, "pw-alice".into())
         .await
         .expect("first login should register + succeed");
 
@@ -1090,7 +1130,7 @@ async fn whoami_reports_the_sole_identity() {
     let base = start_server().await;
     let socket = spawn_agent().await;
     let config_path = temp_config_path();
-    commands::login(&config_path, &socket, Some(base.clone()), "solo", "pw-solo".into())
+    commands::login(&config_path, &socket, Some(base.clone()), "solo", None, "pw-solo".into())
         .await
         .unwrap();
 
@@ -1109,10 +1149,10 @@ async fn whoami_lists_every_identity_when_there_are_several() {
     let base = start_server().await;
     let socket = spawn_agent().await;
     let config_path = temp_config_path();
-    commands::login(&config_path, &socket, Some(base.clone()), "first", "pw-first".into())
+    commands::login(&config_path, &socket, Some(base.clone()), "first", None, "pw-first".into())
         .await
         .unwrap();
-    commands::login(&config_path, &socket, Some(base), "second", "pw-second".into())
+    commands::login(&config_path, &socket, Some(base), "second", None, "pw-second".into())
         .await
         .unwrap();
 
@@ -1132,12 +1172,12 @@ async fn login_existing_user_does_not_reregister() {
     let socket = spawn_agent().await;
     let config_path = temp_config_path();
 
-    commands::login(&config_path, &socket, Some(base.clone()), "bob", "pw-bob".into())
+    commands::login(&config_path, &socket, Some(base.clone()), "bob", None, "pw-bob".into())
         .await
         .expect("initial login registers bob");
 
     agent::lock(&socket).await.unwrap();
-    commands::login(&config_path, &socket, None, "bob", "pw-bob".into())
+    commands::login(&config_path, &socket, None, "bob", None, "pw-bob".into())
         .await
         .expect("second login on an existing user should succeed without re-registering");
 
@@ -1158,7 +1198,7 @@ async fn login_falls_back_to_the_configured_default_server() {
     let config_path = temp_config_path();
 
     commands::config_set_server(&config_path, &base).unwrap();
-    commands::login(&config_path, &socket, None, "dana", "pw-dana".into())
+    commands::login(&config_path, &socket, None, "dana", None, "pw-dana".into())
         .await
         .expect("login should fall back to the configured default server");
 
@@ -1174,10 +1214,64 @@ async fn login_without_any_server_source_errors_clearly() {
     let socket = spawn_agent().await;
     let config_path = temp_config_path();
 
-    let err = commands::login(&config_path, &socket, None, "erin", "pw-erin".into())
+    let err = commands::login(&config_path, &socket, None, "erin", None, "pw-erin".into())
         .await
         .unwrap_err();
     assert!(err.to_string().contains("wonton config set-server"), "got: {err}");
+}
+
+/// On a hosted-mode server (an OAuth provider configured), a first-time `login` with a valid
+/// web-verification ticket registers successfully — the ticket is forwarded and enforced, but
+/// doesn't otherwise change the outcome from the local-mode happy path.
+#[tokio::test]
+async fn login_registers_new_user_with_a_web_token_when_hosted_mode_is_on() {
+    let base = start_server_with_oauth().await;
+    let socket = spawn_agent().await;
+    let config_path = temp_config_path();
+
+    let ticket = mint_web_ticket(&base).await;
+    commands::login(&config_path, &socket, Some(base.clone()), "hosted-alice", Some(ticket), "pw-hosted-alice".into())
+        .await
+        .expect("registration with a valid web token should succeed");
+
+    let config = Config::load_from(&config_path).unwrap();
+    let id = config.find_identity("hosted-alice").expect("identity persisted");
+    assert!(id.session_token.is_some());
+}
+
+/// On a hosted-mode server, a first-time `login` with NO web token must fail clearly (not
+/// silently register unverified) — this exercises `commands::login`'s own defensive check
+/// (the interactive preflight lives in `main.rs`, not reachable from a direct call like this).
+#[tokio::test]
+async fn login_without_a_web_token_fails_clearly_when_hosted_mode_is_on() {
+    let base = start_server_with_oauth().await;
+    let socket = spawn_agent().await;
+    let config_path = temp_config_path();
+
+    let err = commands::login(&config_path, &socket, Some(base), "hosted-bob", None, "pw-hosted-bob".into())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("web verification"), "got: {err}");
+}
+
+/// Hosted mode's ticket requirement is scoped to *registration* — an already-registered user
+/// logging in again needs no web token at all, on a hosted-mode server exactly as on a
+/// local-mode one.
+#[tokio::test]
+async fn login_existing_user_on_hosted_mode_needs_no_web_token() {
+    let base = start_server_with_oauth().await;
+    let socket = spawn_agent().await;
+    let config_path = temp_config_path();
+
+    let ticket = mint_web_ticket(&base).await;
+    commands::login(&config_path, &socket, Some(base.clone()), "hosted-carol", Some(ticket), "pw-hosted-carol".into())
+        .await
+        .expect("initial registration");
+
+    agent::lock(&socket).await.unwrap();
+    commands::login(&config_path, &socket, None, "hosted-carol", None, "pw-hosted-carol".into())
+        .await
+        .expect("repeat login for an existing user needs no web token even in hosted mode");
 }
 
 /// `config set-server` persists across loads, and `config show` reports it; before it's ever
@@ -1206,7 +1300,7 @@ async fn logout_forgets_the_identity_and_locks_the_resident_agent() {
     let base = start_server().await;
     let socket = spawn_agent().await;
     let config_path = temp_config_path();
-    commands::login(&config_path, &socket, Some(base), "gina", "pw-gina".into())
+    commands::login(&config_path, &socket, Some(base), "gina", None, "pw-gina".into())
         .await
         .unwrap();
     assert_eq!(Config::load_from(&config_path).unwrap().current_identity, Some("gina".to_string()));
@@ -1228,10 +1322,10 @@ async fn logout_of_a_non_resident_identity_does_not_lock_the_agent() {
     let base = start_server().await;
     let socket = spawn_agent().await;
     let config_path = temp_config_path();
-    commands::login(&config_path, &socket, Some(base.clone()), "multi-a", "pw-a".into())
+    commands::login(&config_path, &socket, Some(base.clone()), "multi-a", None, "pw-a".into())
         .await
         .unwrap();
-    commands::login(&config_path, &socket, Some(base), "multi-b", "pw-b".into())
+    commands::login(&config_path, &socket, Some(base), "multi-b", None, "pw-b".into())
         .await
         .unwrap(); // agent is now resident as multi-b
 

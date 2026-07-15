@@ -42,10 +42,11 @@ function renderLogin() {
       <h1>wonton dashboard</h1>
       ${
         oauth
-          ? `<p class="note">Verified <strong>${escapeHtml(oauth.email)}</strong> with Google. Dashboard
-             sign-up isn't built yet (read-only viewer, v1) — finish registering from the CLI
-             (<code>wonton login &lt;username&gt; --server ${escapeHtml(SERVER_URL || location.origin)}</code>),
-             then log in below with that username and passphrase.</p>`
+          ? `<p class="note">Verified <strong>${escapeHtml(oauth.email)}</strong> with Google. Copy the code
+             below and paste it when <code>wonton login &lt;username&gt;</code> prompts you for it — the
+             CLI generates and holds your actual encryption key, this code just proves you control this
+             email. Then log in below with that username and passphrase.</p>
+             <pre class="code-box">${escapeHtml(oauth.ticket)}</pre>`
           : ""
       }
       <form id="login-form">

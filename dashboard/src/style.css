@@ -58,6 +58,19 @@ button.link {
   border-radius: 4px;
 }
 
+.code-box {
+  font-family: monospace;
+  font-size: 0.95rem;
+  background: #0002;
+  border: 1px solid #999;
+  border-radius: 4px;
+  padding: 0.75rem;
+  margin: 0.5rem 0 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: all;
+}
+
 .topbar {
   display: flex;
   justify-content: space-between;

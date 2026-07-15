@@ -93,8 +93,10 @@ pub struct RegisterRequest {
     pub argon2_params: Argon2ParamsDto,
     /// Optional single-use ticket minted by a completed `/auth/oauth/{provider}/callback`
     /// exchange, proving this registration is by someone who verified a real email with that
-    /// provider. Omit for the plain (unverified) registration path, which still works exactly
-    /// as before — this is an additional gate, not a replacement. Never a passphrase or key.
+    /// provider. Omit for the plain (unverified) registration path when this server has no
+    /// OAuth provider configured — see `AuthConfigResponse::web_verification_required`. When a
+    /// provider *is* configured, the server requires and verifies this ticket; omitting it is a
+    /// 400, not a silently-unverified registration. Never a passphrase or key.
     #[serde(default)]
     pub oauth_ticket: Option<String>,
 }
@@ -103,6 +105,19 @@ pub struct RegisterRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterResponse {
     pub user_id: String,
+}
+
+/// `GET /auth/config` response. No authentication required — lets a client (the CLI, in
+/// particular) discover *before* attempting registration whether this server requires web
+/// verification (i.e. has an OAuth provider configured) so it knows whether to send a user to
+/// `verification_uri` and prompt for the resulting ticket, or just register directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthConfigResponse {
+    /// Whether `POST /auth/register` requires a valid `oauth_ticket` for new accounts.
+    pub web_verification_required: bool,
+    /// A server-relative path (e.g. `/auth/oauth/google/authorize`) to send a browser to in
+    /// order to obtain a ticket. `Some` iff `web_verification_required` is true.
+    pub verification_uri: Option<String>,
 }
 
 /// `POST /auth/machine/token` request (CI/server identities).

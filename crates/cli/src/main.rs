@@ -384,6 +384,52 @@ async fn main() -> anyhow::Result<()> {
         Command::Login { username, server } => {
             let config_path = config::default_config_path()?;
             let socket = agent::client::ensure_running().await?;
+
+            // Preflight: resolve the same server URL `commands::login` will use, and — only if
+            // the username is unregistered and the server requires web verification for new
+            // accounts (hosted mode) — get the code interactively before touching the
+            // passphrase, so the user isn't asked to unlock/generate a keypair for nothing.
+            let config = config::Config::load_from(&config_path)?;
+            let resolved_server = commands::resolve_login_server_url(&config, server.clone(), &username)?;
+            let preflight_client = wonton_sync::SyncClient::new(&resolved_server);
+            let web_token = match preflight_client
+                .login_start(&wonton_shared::LoginStartRequest {
+                    username: username.clone(),
+                })
+                .await
+            {
+                Ok(_) => None, // already registered — no web verification, ever, on plain login
+                Err(wonton_sync::SyncError::NotFound(_)) => {
+                    let auth_config = preflight_client.auth_config().await?;
+                    if auth_config.web_verification_required {
+                        match std::env::var("WONTON_WEB_TOKEN") {
+                            Ok(t) => Some(t),
+                            Err(_) => {
+                                println!(
+                                    "wonton: '{username}' isn't registered yet, and this server \
+                                     requires web verification for new accounts."
+                                );
+                                println!(
+                                    "Open {resolved_server}{} in a browser, sign in, and paste \
+                                     the code it shows you below.",
+                                    auth_config.verification_uri.as_deref().unwrap_or("/")
+                                );
+                                print!("Verification code: ");
+                                std::io::Write::flush(&mut std::io::stdout())?;
+                                let mut line = String::new();
+                                std::io::stdin().read_line(&mut line)?;
+                                Some(line.trim().to_string())
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                }
+                // Any other error (network, etc.) is left for `commands::login` below to hit
+                // and report — no point duplicating that error handling here.
+                Err(_) => None,
+            };
+
             let passphrase = match std::env::var("WONTON_PASSPHRASE") {
                 Ok(p) => {
                     eprintln!(
@@ -394,7 +440,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(_) => rpassword::prompt_password("Passphrase: ")?,
             };
-            commands::login(&config_path, &socket, server, &username, passphrase).await
+            commands::login(&config_path, &socket, server, &username, web_token, passphrase).await
         }
         Command::Whoami => {
             let config_path = config::default_config_path()?;

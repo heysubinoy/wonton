@@ -57,27 +57,49 @@ use crate::state::{
 /// `passphrase` is consumed (moved into the agent login call and dropped there); it is never
 /// cached. `server_url` may be omitted if the identity already exists in config with a stored
 /// server URL.
-pub async fn login(
-    config_path: &Path,
-    socket_path: &Path,
+///
+/// `web_token` is the pasted code from a server's web-verification flow (see `GET
+/// /auth/config`'s doc comment in `wonton-shared`): required only when this is a first-time
+/// registration *and* the server has an OAuth provider configured ("hosted mode"). Ignored for
+/// an existing username (no re-verification on every login) and for a local-mode server (open
+/// registration, exactly as before hosted mode existed). `main.rs` resolves this interactively
+/// before calling in; a direct/scripted caller that omits it when it turns out to be required
+/// gets a clear error below rather than a silent registration.
+/// Resolve the server URL a `login <username>` call should use: the explicit `--server`, else
+/// the already-known identity's stored URL, else the configured default. Shared between
+/// [`login`] itself and `main.rs`'s preflight (which needs the *same* URL before `login` runs,
+/// to check `GET /auth/config` and prompt for a web-verification code if required — the two
+/// resolving independently could disagree about which server is being logged into).
+pub fn resolve_login_server_url(
+    config: &Config,
     server_url: Option<String>,
     username: &str,
-    passphrase: String,
-) -> anyhow::Result<()> {
-    let mut config = Config::load_from(config_path)?;
-
-    // Local nickname == username in this v1 (no separate `--name` flag).
-    let name = username;
-    let existing = config.find_identity(name).cloned();
-    let server_url = server_url
-        .or_else(|| existing.as_ref().map(|i| i.server_url.clone()))
+) -> anyhow::Result<String> {
+    let existing = config.find_identity(username);
+    server_url
+        .or_else(|| existing.map(|i| i.server_url.clone()))
         .or_else(|| config.default_server.clone())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "--server <url> is required the first time you log in as '{username}' (or set a \
                  default with `wonton config set-server <url>`)"
             )
-        })?;
+        })
+}
+
+pub async fn login(
+    config_path: &Path,
+    socket_path: &Path,
+    server_url: Option<String>,
+    username: &str,
+    web_token: Option<String>,
+    passphrase: String,
+) -> anyhow::Result<()> {
+    let mut config = Config::load_from(config_path)?;
+
+    // Local nickname == username in this v1 (no separate `--name` flag).
+    let name = username;
+    let server_url = resolve_login_server_url(&config, server_url, username)?;
 
     let client = SyncClient::new(&server_url);
 
@@ -91,6 +113,23 @@ pub async fn login(
     {
         Ok(start) => (start.wrapped_privkey, start.argon2_params, start.challenge_nonce),
         Err(SyncError::NotFound(_)) => {
+            // First-time registration: check whether this server requires a web-verification
+            // ticket before generating anything (avoids generating a keypair we'd have to
+            // discard if the server rejects the registration below).
+            let auth_config = client
+                .auth_config()
+                .await
+                .context("could not reach the server to check its auth requirements")?;
+            if auth_config.web_verification_required && web_token.is_none() {
+                bail!(
+                    "'{username}' isn't registered yet, and this server requires web \
+                     verification for new accounts. Open {}{} in a browser, sign in, and re-run \
+                     this command pasting the code it shows you (or set WONTON_WEB_TOKEN).",
+                    server_url,
+                    auth_config.verification_uri.as_deref().unwrap_or("/"),
+                );
+            }
+
             // First-time registration: generate a fresh identity locally and frame the blob.
             eprintln!(
                 "wonton: registering a new identity for '{username}'. There is no passphrase \
@@ -113,7 +152,7 @@ pub async fn login(
                     x25519_pubkey: STANDARD.encode(public.x25519_pubkey),
                     wrapped_privkey: wrapped_b64.clone(),
                     argon2_params: params_dto.clone(),
-                    oauth_ticket: None,
+                    oauth_ticket: web_token,
                 })
                 .await
                 .context("registration failed")?;

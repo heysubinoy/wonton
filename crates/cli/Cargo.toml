@@ -30,4 +30,5 @@ wonton-vcs = { version = "0.1.0", path = "../vcs" }
 # logic can be driven end-to-end against a genuine backend, mirroring `wonton-sync`'s own
 # integration tests. Not in `[dependencies]`, so this doesn't widen the shipped CLI graph.
 axum = "0.8.9"
-wonton-server = { version = "0.1.0", path = "../server" }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+wonton-server = { version = "0.1.0", path = "../server", features = ["test-support"] }
