@@ -1666,7 +1666,7 @@ async fn merge_unknown_branch_errors() {
     let err = commands::merge(&owner.config_path, &owner.state_path, &owner.socket, &owner.dir, "nonexistent")
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("wrapped-DEK map"), "got: {err}");
+    assert!(err.to_string().contains("does not exist"), "got: {err}");
 }
 
 // ---- no-plaintext-on-disk ------------------------------------------------------------------
